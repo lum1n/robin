@@ -58,6 +58,12 @@ class Enrollment:
         self._persist(pending["account_id"])
         return dict(ready)
 
+    def forget(self, account_id: str) -> None:
+        self._ready.pop(account_id, None)
+        self._drop_pending(account_id)
+        if self.store is not None:
+            self.store.delete_instance(account_id)
+
     def discard(self, token: str) -> None:
         pending = self._pending.pop(token, None)
         if pending is None:

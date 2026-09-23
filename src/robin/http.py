@@ -12,7 +12,7 @@ from robin.enroll import EnrollRejected, Enrollment
 from robin.loop import PendingMissing, converse, resume
 from robin.model import Model
 from robin.policy import Task
-from robin.provision import create_private_instance
+from robin.provision import create_private_instance, delete_private_instance
 from robin.session import Assistant
 
 
@@ -248,6 +248,8 @@ def _post_private(service: Service, headers: dict[str, str], body: dict[str, Any
         return denied
     if service.enrollment is None or not service.joint_url or service.exe_post is None:
         return 400, {"error": "private instances are not configured"}
+    if body.get("delete") is True:
+        return _delete_private(service, account_id, body)
     confirmed = body.get("confirm") is True
     api_token = ""
     if confirmed:
@@ -271,6 +273,38 @@ def _post_private(service: Service, headers: dict[str, str], body: dict[str, Any
         if text in {"exe token is missing", "exe.dev did not return an https url"}:
             status = 400 if text == "exe token is missing" else 502
             return status, {"error": text}
+        raise
+    return 200, {"status": result.status, "https_url": result.https_url, "ready": result.ready}
+
+
+def _delete_private(service: Service, account_id: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if service.enrollment is None or service.exe_post is None:
+        return 400, {"error": "private instances are not configured"}
+    confirmed = body.get("confirm") is True
+    api_token = ""
+    if confirmed:
+        try:
+            api_token = service.assistant.broker.reveal("household", "exe")
+        except KeyError:
+            return 400, {"error": "exe token is missing"}
+    try:
+        result = delete_private_instance(
+            enrollment=service.enrollment,
+            account_id=account_id,
+            confirmed=confirmed,
+            post=service.exe_post,
+            api_token=api_token,
+        )
+    except LookupError:
+        return 404, {"error": "not found"}
+    except ValueError:
+        return 400, {"error": "account id must be a lowercase slug"}
+    except RuntimeError as exc:
+        text = str(exc)
+        if text == "exe token is missing":
+            return 400, {"error": text}
+        if text == "exe.dev delete failed":
+            return 502, {"error": text}
         raise
     return 200, {"status": result.status, "https_url": result.https_url, "ready": result.ready}
 

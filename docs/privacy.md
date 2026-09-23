@@ -16,7 +16,7 @@ Mailbox and other credentials are connected afterward, from the app to the priva
 
 The exe.dev URL is public, so Robin on the VM still requires that person's session. The joint server remembers the VM name and address. It does not receive a copy of the private vault. Nothing is synced across the joint assistant and a private instance unless that person later exports it.
 
-Creating or deleting a VM spends money and starts a machine, so it waits for a confirm.
+Creating a VM spends money and starts a machine, so it waits for a confirm. Deleting one does too. `POST /v1/private` with `"delete": true` waits, then the joint server sends `rm robin-{account} --json` and forgets the address. The exe.dev token stays out of that command.
 
 ## Clients
 

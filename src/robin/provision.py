@@ -70,6 +70,36 @@ def plan_private_instance(
     return ProvisionPlan(status="planned", recorded=exe_command(account_id, enroll_token, joint_url))
 
 
+def delete_command(account_id: str) -> str:
+    return f"rm robin-{account_slug(account_id)} --json"
+
+
+def delete_private_instance(
+    *,
+    enrollment: Enrollment,
+    account_id: str,
+    confirmed: bool,
+    post: Any,
+    api_token: str,
+) -> CreateResult:
+    record = enrollment.get(account_id)
+    if record is None:
+        raise LookupError("private instance is missing")
+    if not confirmed:
+        return CreateResult(status="confirm", https_url=record["https_url"], ready=bool(record["ready"]), command=None)
+    if not api_token:
+        raise RuntimeError("exe token is missing")
+    command = delete_command(account_id)
+    try:
+        post(EXE_EXEC, command, api_token)
+    except Exception as exc:
+        if api_token and api_token in str(exc):
+            raise RuntimeError("exe.dev delete failed") from None
+        raise
+    enrollment.forget(account_id)
+    return CreateResult(status="deleted", https_url=None, ready=False, command=command)
+
+
 def create_private_instance(
     *,
     enrollment: Enrollment,

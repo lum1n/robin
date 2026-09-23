@@ -175,3 +175,72 @@ def test_enrollment_survives_a_restart_without_writing_the_token_in_the_clear(tm
         assert TOKEN not in str(exc)
     else:
         raise AssertionError("token should be dead")
+
+
+def test_delete_waits_for_confirm_and_then_removes_the_instance() -> None:
+    post = Captured()
+    service, enrollment = _service(post)
+    ada = _session(service)
+    created, _created_body = dispatch(
+        service, "POST", "/v1/private", body={"account_id": "ada", "confirm": True}, headers=ada
+    )
+    assert created == 200
+    post.calls.clear()
+
+    held, held_body = dispatch(service, "POST", "/v1/private", body={"account_id": "ada", "delete": True}, headers=ada)
+    assert held == 200
+    assert held_body == {"status": "confirm", "https_url": ADDRESS, "ready": False}
+    assert post.calls == []
+    assert enrollment.get("ada") is not None
+
+    bea = _session(service, "bea")
+    stolen, _stolen_body = dispatch(
+        service,
+        "POST",
+        "/v1/private",
+        body={"account_id": "ada", "delete": True, "confirm": True},
+        headers=bea,
+    )
+    assert stolen == 401
+
+    status, body = dispatch(
+        service,
+        "POST",
+        "/v1/private",
+        body={"account_id": "ada", "delete": True, "confirm": True},
+        headers=ada,
+    )
+    assert status == 200
+    assert body == {"status": "deleted", "https_url": None, "ready": False}
+    assert API_TOKEN not in json.dumps(body)
+    url, command, api_token = post.calls[0]
+    assert url == EXE_EXEC
+    assert command == "rm robin-ada --json"
+    assert api_token == API_TOKEN
+    assert API_TOKEN not in command
+    assert MAILBOX not in command
+    assert enrollment.get("ada") is None
+    missing, _missing_body = dispatch(service, "GET", "/v1/private", query={"account_id": "ada"}, headers=ada)
+    assert missing == 404
+    gone, _gone_body = dispatch(service, "POST", "/v1/private", body={"account_id": "ada", "delete": True}, headers=ada)
+    assert gone == 404
+
+
+def test_a_failed_delete_keeps_the_instance_and_hides_the_token() -> None:
+    post = Captured()
+    service, enrollment = _service(post)
+    ada = _session(service)
+    dispatch(service, "POST", "/v1/private", body={"account_id": "ada", "confirm": True}, headers=ada)
+    post.error = RuntimeError(API_TOKEN)
+    post.calls.clear()
+    status, body = dispatch(
+        service,
+        "POST",
+        "/v1/private",
+        body={"account_id": "ada", "delete": True, "confirm": True},
+        headers=ada,
+    )
+    assert status == 502
+    assert body == {"error": "exe.dev delete failed"}
+    assert API_TOKEN not in json.dumps(body)
+    assert enrollment.get("ada")["https_url"] == ADDRESS
