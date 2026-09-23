@@ -10,6 +10,8 @@ from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
 class Page(Protocol):
     def read(self) -> tuple[str, str]: ...
 
+    def open(self, url: str) -> None: ...
+
     def click(self, target: str) -> None: ...
 
     def type_text(self, target: str, text: str) -> None: ...
@@ -24,6 +26,9 @@ class PlaywrightPage:
 
     def __init__(self, page: Any) -> None:
         self._page = page
+
+    def open(self, url: str) -> None:
+        self._page.goto(url)
 
     def read(self) -> tuple[str, str]:
         text = str(self._page.locator("body").inner_text())
@@ -57,9 +62,37 @@ def open_chromium(url: str) -> PlaywrightPage:
     return opened
 
 
+class Desk:
+    """One page per account. The opener runs only when a task opens a page."""
+
+    def __init__(self, opener: Any) -> None:
+        self.opener = opener
+        self.pages: dict[str, Page] = {}
+
+    def open(self, account_id: str, url: str) -> Page:
+        _web_url(url)
+        current = self.pages.get(account_id)
+        if current is None:
+            current = self.opener(url)
+            self.pages[account_id] = current
+            return current
+        current.open(url)
+        return current
+
+
 class Browser(Capability):
     id = "display"
     tools = [
+        Tool(
+            name="open_page",
+            description="Open an http or https page for this account.",
+            parameters={
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+            effect=Effect.MUTATE,
+        ),
         Tool(
             name="read_screen",
             description="Read the text of this account's screen.",
@@ -101,41 +134,73 @@ class Browser(Capability):
         FieldSpec("password", FieldClass.DROP),
     ]
 
-    def __init__(self, owner: str, page: Page) -> None:
+    def __init__(self, owner: str | None = None, page: Page | None = None, *, desk: Desk | None = None) -> None:
+        if desk is None and (owner is None or page is None):
+            raise ValueError("browser needs a page or a desk")
         self.owner = owner
         self.page = page
+        self.desk = desk
 
     def visible_to(self, account_id: str) -> bool:
+        if self.desk is not None:
+            return True
         return account_id == self.owner
 
     def records(self, account_id: str) -> list[dict[str, str]]:
-        if account_id != self.owner:
+        try:
+            text, password = self._visible(account_id)
+        except RuntimeError:
             return []
-        text, password = self._visible()
         return [{"text": text, "password": password}]
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        if account_id != self.owner:
+        if self.desk is None and account_id != self.owner:
             raise PermissionError(account_id)
+        if tool_name == "open_page":
+            url = str(arguments.get("url", ""))
+            if self.desk is not None:
+                self.desk.open(account_id, url)
+            else:
+                _web_url(url)
+                self._current(account_id).open(url)
+            return "opened"
+        page = self._current(account_id)
         if tool_name == "click":
-            self.page.click(str(arguments.get("target", "")))
+            page.click(str(arguments.get("target", "")))
             return "clicked"
         if tool_name == "type_text":
-            self.page.type_text(str(arguments.get("target", "")), str(arguments.get("text", "")))
+            page.type_text(str(arguments.get("target", "")), str(arguments.get("text", "")))
             return "typed"
         if tool_name == "type_password":
-            self.page.type_password(str(arguments.get("text", "")))
+            page.type_password(str(arguments.get("text", "")))
             return "typed"
         if tool_name == "submit":
-            self.page.submit()
+            page.submit()
             return "submitted"
         if tool_name == "read_screen":
-            text, _password = self._visible()
+            text, _password = self._visible(account_id)
             return text
         raise NotImplementedError(tool_name)
 
-    def _visible(self) -> tuple[str, str]:
-        text, password = self.page.read()
+    def _current(self, account_id: str) -> Page:
+        if self.desk is not None:
+            page = self.desk.pages.get(account_id)
+            if page is None:
+                raise RuntimeError("no page is open")
+            return page
+        if self.page is None or account_id != self.owner:
+            raise PermissionError(account_id)
+        return self.page
+
+    def _visible(self, account_id: str) -> tuple[str, str]:
+        text, password = self._current(account_id).read()
         for secret in password.split():
             text = text.replace(secret, "")
         return text, password
+
+
+def _web_url(url: str) -> None:
+    if not (url.startswith("https://") or url.startswith("http://")) or any(char.isspace() for char in url):
+        raise ValueError("url must be http or https")
+    if not url.split("://", 1)[1]:
+        raise ValueError("url must be http or https")

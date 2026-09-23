@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from robin.capabilities.browser import Browser, PlaywrightPage
+from robin.capabilities.browser import Browser, Desk, PlaywrightPage
 from robin.policy import Task
 from robin.session import Assistant
 
@@ -32,6 +32,9 @@ class MemoryPage:
 
     def submit(self) -> None:
         self.submitted = True
+
+    def open(self, url: str) -> None:
+        self.text = url
 
 
 class Node:
@@ -127,6 +130,38 @@ def test_submit_and_typing_a_password_wait_for_confirm() -> None:
     except KeyError:
         return
     raise AssertionError("other account read the screen")
+
+
+def test_a_task_opens_one_accounts_page_and_does_not_launch_for_a_bad_url() -> None:
+    opened: list[str] = []
+
+    def opener(url: str) -> MemoryPage:
+        opened.append(url)
+        return MemoryPage(text="ada page", password=PASSWORD)
+
+    desk = Desk(opener)
+    assistant = Assistant()
+    assistant.add(Browser(desk=desk))
+    done = assistant.invoke("ada", "display", "open_page", {"url": "https://example.test/ada"})
+    assert done["status"] == "done"
+    assert done["result"] == "opened"
+    assert opened == ["https://example.test/ada"]
+    ada = assistant.decide(Task("ada", "screen", "look"))
+    bea = assistant.decide(Task("bea", "screen", "look"))
+    assert "ada page" in ada.local_text
+    assert PASSWORD not in ada.local_text
+    assert "ada page" not in bea.local_text
+    before = len(opened)
+    try:
+        assistant.invoke("ada", "display", "open_page", {"url": "file:///etc/robin/store.key"})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a file url opened a page")
+    assert len(opened) == before
+    assistant.invoke("ada", "display", "open_page", {"url": "https://example.test/next"})
+    assert opened == ["https://example.test/ada"]
+    assert desk.pages["ada"].text == "https://example.test/next"
 
 
 def test_playwright_reads_text_and_does_not_photograph_the_page() -> None:

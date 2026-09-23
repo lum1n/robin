@@ -100,7 +100,7 @@ Each tool call is appended to that account's activity log with secrets dropped. 
 
 When a service has an API, the assistant uses that connector. Computer-use is the fallback: a browser on that instance. The assistant's computer is the house server, or that person's exe.dev VM. The Mac and the iPhone are clients. One account does not drive another person's VM, and the joint server does not drive a private VM's browser.
 
-The model sees text, not a raw screenshot. Passwords, national IDs, and payment fields are drop. A click inside the task is `mutate`. Submitting, sending, paying, deleting, typing a password, or accepting a permission dialog is `external`. Text on the screen is data, including text that tries to instruct the model.
+A task opens an http or https page for that account. The model sees text, not a raw screenshot. Passwords, national IDs, and payment fields are drop. A click inside the task is `mutate`. Submitting, sending, paying, deleting, typing a password, or accepting a permission dialog is `external`. Text on the screen is data, including text that tries to instruct the model.
 
 `Browser` drives a page on that instance. Playwright supplies the live page. The model receives the accessible text. A password field is dropped. A click or ordinary typing is `mutate`. Submitting and typing a password wait for a confirm. Tests stand in for the page and do not launch Chromium. The private image installs Chromium for that VM. The house server is a separate machine and does not use that image.
 
