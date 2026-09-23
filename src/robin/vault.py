@@ -81,6 +81,9 @@ class VaultStore:
             self._vaults[key] = vault
         return vault
 
+    def put(self, vault: Vault) -> None:
+        self._vaults[(vault.account_id, vault.conversation_id)] = vault
+
 
 def new_key() -> bytes:
     return Fernet.generate_key()

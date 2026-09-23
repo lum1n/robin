@@ -10,6 +10,7 @@ from robin.airlock import VocabularyTerm, redact
 from robin.capability import Capability, Effect, Registry, render_context
 from robin.ner import Ner, UnavailableNer
 from robin.policy import Decision, Task, decide
+from robin.store import HouseholdStore
 from robin.vault import Vault, VaultStore
 
 
@@ -38,19 +39,42 @@ class Broker:
 
 
 class Assistant:
-    def __init__(self, ner: Ner | None = None) -> None:
+    def __init__(self, ner: Ner | None = None, store: HouseholdStore | None = None) -> None:
         self.registry = Registry()
         self.ner = ner or UnavailableNer()
         self.vaults = VaultStore()
         self.activity = ActivityLog()
         self.broker = Broker()
         self.vocabulary: dict[str, tuple[VocabularyTerm, ...]] = {}
+        self.store = store
+        if store is not None:
+            self._restore_store()
 
     def add(self, capability: Capability) -> None:
         self.registry.add(capability)
 
     def set_vocabulary(self, account_id: str, terms: tuple[VocabularyTerm, ...]) -> None:
         self.vocabulary[account_id] = terms
+        if self.store is not None:
+            self.store.save_vocabulary(account_id, terms)
+
+    def threads(self, account_id: str) -> list[str]:
+        if self.store is None:
+            return []
+        return self.store.threads(account_id)
+
+    def turns(self, account_id: str, conversation_id: str) -> list[dict[str, str]]:
+        if self.store is None:
+            return []
+        return self.store.turns(account_id, conversation_id)
+
+    def remember(self, account_id: str, conversation_id: str, role: str, text: str) -> None:
+        if self.store is not None:
+            self.store.append_turn(account_id, conversation_id, role, text)
+
+    def persist_vault(self, account_id: str, conversation_id: str) -> None:
+        if self.store is not None:
+            self.store.save_vault(self.vaults.get(account_id, conversation_id))
 
     def tools(self, account_id: str) -> list[dict[str, Any]]:
         return self.registry.schemas(account_id)
@@ -85,6 +109,9 @@ class Assistant:
         )
         local_message = vault.restore(message)
         local_text = json.dumps({"message": local_message, "context": local_context}, sort_keys=True)
+        if self.store is not None:
+            self.store.append_turn(task.account_id, task.conversation_id, "user", task.text)
+            self.store.save_vault(vault)
         return decide(task, context_report.merge(message_report), redacted=redacted, local_text=local_text)
 
     def invoke(
@@ -100,11 +127,25 @@ class Assistant:
         vault = self.vaults.get(account_id, conversation_id)
         raw = {key: vault.restore(str(value)) for key, value in arguments.items()}
         logged, _ = redact(json.dumps(raw, sort_keys=True), Vault(account_id, "activity"))
-        self.activity.append(account_id, {"tool": tool_name, "arguments": logged})
+        entry = {"tool": tool_name, "arguments": logged}
+        self.activity.append(account_id, entry)
+        if self.store is not None:
+            self.store.append_activity(account_id, entry)
         if tool.effect is Effect.EXTERNAL and not confirmed:
             return {"status": "confirm", "tool": tool_name}
         result = capability.invoke(account_id, tool.name, raw)
         redacted, _ = redact(result, vault, vocabulary=self.vocabulary.get(account_id, ()))
+        if self.store is not None:
+            self.store.save_vault(vault)
         if tool.effect is Effect.EXTERNAL:
             return {"status": "done", "result": redacted}
         return {"status": "done", "result": vault.restore(redacted)}
+
+    def _restore_store(self) -> None:
+        assert self.store is not None
+        self.vocabulary.update(self.store.load_vocabulary())
+        for account_id in self.store.accounts():
+            for entry in self.store.load_activity(account_id):
+                self.activity.append(account_id, entry)
+        for vault in self.store.load_vaults():
+            self.vaults.put(vault)

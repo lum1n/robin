@@ -25,6 +25,13 @@ class Reply:
 
 
 def converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int = 4) -> Reply:
+    reply = _converse(assistant, task, model, max_steps=max_steps)
+    assistant.remember(task.account_id, task.conversation_id, reply.status, reply.text)
+    assistant.persist_vault(task.account_id, task.conversation_id)
+    return reply
+
+
+def _converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int) -> Reply:
     decision = assistant.decide(task)
     vault = assistant.vaults.get(task.account_id, task.conversation_id)
     vocabulary = assistant.vocabulary.get(task.account_id, ())

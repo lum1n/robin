@@ -14,6 +14,8 @@ The local model is the default. A cloud model runs only when the task sets `allo
 
 `converse` is the turn. It shows the model that account's view, runs a tool the registry allows, and stops when the tool is external so the person can confirm. `ChatModel` posts to a local OpenAI-compatible server at `http://127.0.0.1:8080` unless you pass another address. The tests use a stand-in model and do not open a connection.
 
+Pass a `HouseholdStore` when constructing `Assistant` and the house server keeps accounts, threads, vaults, vocabulary, and the activity log across a restart. Those records are encrypted with a key the process holds. Another account cannot read them. The database file does not contain the raw message text.
+
 Details, including the threat model and private VMs, are in [docs/privacy.md](docs/privacy.md). Adding a capability is described in [docs/capabilities.md](docs/capabilities.md).
 
 ## Run the tests
