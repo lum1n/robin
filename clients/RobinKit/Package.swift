@@ -3,6 +3,10 @@ import PackageDescription
 
 let package = Package(
     name: "RobinKit",
+    platforms: [
+        .macOS(.v14),
+        .iOS(.v17),
+    ],
     products: [
         .library(name: "RobinKit", targets: ["RobinKit"]),
     ],
