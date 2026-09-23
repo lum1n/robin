@@ -38,6 +38,11 @@ def main(argv: list[str] | None = None) -> int:
     decide_cmd.add_argument("--allow-cloud", action="store_true")
     decide_cmd.add_argument("--free-text", action="store_true")
 
+    exe_cmd = sub.add_parser("exe-token")
+    exe_cmd.add_argument("--store", required=True)
+    exe_cmd.add_argument("--key", required=True)
+    exe_cmd.add_argument("--token-file", required=True)
+
     tick_cmd = sub.add_parser("tick")
     tick_cmd.add_argument("--store", required=True)
     tick_cmd.add_argument("--key", required=True)
@@ -57,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
         return _boot(args)
     if args.command == "tick":
         return _tick(args)
+    if args.command == "exe-token":
+        return _exe_token(args)
     if args.command == "redact":
         vault = Vault(args.account, args.conversation)
         redacted, _report = redact(args.text, vault)
@@ -88,6 +95,29 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     print(json.dumps({"route": decision.route.value, "reason": decision.reason}))
+    return 0
+
+
+def _exe_token(args: argparse.Namespace) -> int:
+    token_path = Path(args.token_file)
+    if not token_path.is_file():
+        raise SystemExit("exe token file is missing")
+    token = token_path.read_text().strip()
+    if not token:
+        raise SystemExit("exe token file is empty")
+    from robin.store import HouseholdStore
+
+    try:
+        store = HouseholdStore(args.store, Path(args.key).read_bytes().strip())
+        assistant = Assistant(store=store)
+        assistant.broker.put("household", "exe", token)
+        store.close()
+    except Exception as exc:
+        if token in str(exc):
+            raise SystemExit("exe token was rejected") from None
+        raise
+    token_path.unlink()
+    print(json.dumps({"stored": True}))
     return 0
 
 

@@ -54,6 +54,43 @@ def test_redact_restore_and_decide(tmp_path: Path, capsys) -> None:
     )
 
 
+def test_exe_token_is_stored_once_and_the_file_is_removed(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "house.sqlite"
+    key_path = tmp_path / "key"
+    token_path = tmp_path / "exe.token"
+    key = new_key()
+    key_path.write_bytes(key)
+    token = "exe1.SUPERSECRETTOKEN"
+    token_path.write_text(token + "\n")
+    assert main(["exe-token", "--store", str(path), "--key", str(key_path), "--token-file", str(token_path)]) == 0
+    printed = capsys.readouterr().out
+    assert printed.strip() == '{"stored": true}'
+    assert token not in printed
+    assert not token_path.exists()
+    assert token.encode() not in path.read_bytes()
+    revived = Assistant(store=HouseholdStore(path, key))
+    assert revived.broker.reveal("household", "exe") == token
+
+    wrong = tmp_path / "again.token"
+    other = tmp_path / "other.key"
+    wrong.write_text(token)
+    other.write_bytes(new_key())
+    try:
+        main(["exe-token", "--store", str(path), "--key", str(other), "--token-file", str(wrong)])
+    except Exception as exc:
+        assert token not in str(exc)
+    else:
+        raise AssertionError("wrong key stored a token")
+    assert wrong.read_text() == token
+    empty = tmp_path / "empty.token"
+    empty.write_text("\n")
+    try:
+        main(["exe-token", "--store", str(path), "--key", str(key_path), "--token-file", str(empty)])
+    except SystemExit as exc:
+        assert token not in str(exc)
+    assert empty.exists()
+
+
 def test_tick_checks_enabled_accounts_and_prints_no_secret(tmp_path: Path, capsys, monkeypatch) -> None:
     path = tmp_path / "house.sqlite"
     key_path = tmp_path / "key"
