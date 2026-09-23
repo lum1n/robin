@@ -1,0 +1,8 @@
+[Unit]
+Description=Robin scheduled check
+After=robin.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/robin tick --store /var/lib/robin/house.sqlite --key /etc/robin/store.key
+NoNewPrivileges=true

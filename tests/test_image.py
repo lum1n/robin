@@ -25,7 +25,12 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
     assert "ExecStart=/usr/local/bin/robin boot" in unit
     assert "After=network-online.target exe-setup.service" in unit
 
-    assert "sudo systemctl enable --now robin" in script
+    timer = (ROOT / "deploy" / "robin-tick.service").read_text()
+    assert "robin tick" in timer
+    assert "enroll.token" not in timer
+    assert "OnUnitActiveSec=15min" in (ROOT / "deploy" / "robin-tick.timer").read_text()
+    assert "robin-tick.timer" in dockerfile
+    assert "sudo systemctl enable --now robin robin-tick.timer" in script
     assert "/etc/robin/enroll.token" in script
     assert PINNED_IMAGE == "robin/exeuntu:pinned"
     assert ".env" in ignored

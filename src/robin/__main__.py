@@ -38,6 +38,11 @@ def main(argv: list[str] | None = None) -> int:
     decide_cmd.add_argument("--allow-cloud", action="store_true")
     decide_cmd.add_argument("--free-text", action="store_true")
 
+    tick_cmd = sub.add_parser("tick")
+    tick_cmd.add_argument("--store", required=True)
+    tick_cmd.add_argument("--key", required=True)
+    tick_cmd.add_argument("--model", default="http://127.0.0.1:8080")
+
     boot_cmd = sub.add_parser("boot")
     boot_cmd.add_argument("--token", default="/etc/robin/enroll.token")
     boot_cmd.add_argument("--joint", default="/etc/robin/joint.url")
@@ -50,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "boot":
         return _boot(args)
+    if args.command == "tick":
+        return _tick(args)
     if args.command == "redact":
         vault = Vault(args.account, args.conversation)
         redacted, _report = redact(args.text, vault)
@@ -84,7 +91,27 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _tick(args: argparse.Namespace) -> int:
+    from robin.capabilities.install import install
+    from robin.model import ChatModel
+    from robin.schedule import tick
+    from robin.store import HouseholdStore
+
+    store_path = Path(args.store)
+    key_path = Path(args.key)
+    if not store_path.is_file() or not key_path.is_file():
+        print(json.dumps({"checked": 0, "confirm": 0}))
+        return 0
+    store = HouseholdStore(store_path, key_path.read_bytes().strip())
+    assistant = Assistant(store=store)
+    install(assistant)
+    replies = tick(assistant, ChatModel(base_url=args.model))
+    print(json.dumps({"checked": len(replies), "confirm": sum(reply.status == "confirm" for reply in replies)}))
+    return 0
+
+
 def _boot(args: argparse.Namespace) -> int:
+    from robin.capabilities.install import install
     from robin.enroll import Enrollment, enroll_on_boot, urllib_enroll_post
     from robin.http import Service, serve
     from robin.model import ChatModel
@@ -97,9 +124,11 @@ def _boot(args: argparse.Namespace) -> int:
         if not args.key:
             raise SystemExit("boot --store requires --key")
         store = HouseholdStore(args.store, Path(args.key).read_bytes().strip())
+    assistant = Assistant(store=store)
+    install(assistant)
     serve(
         Service(
-            Assistant(store=store),
+            assistant,
             ChatModel(),
             enrollment=Enrollment(store),
             joint_url=args.advertise,

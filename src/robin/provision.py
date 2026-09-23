@@ -40,7 +40,7 @@ def setup_script(enroll_token: str, joint_url: str) -> str:
         f"sudo sh -c \"printf '%s' '{enroll_token}' > /etc/robin/enroll.token\"\n"
         f"sudo sh -c \"printf '%s' '{joint_url}' > /etc/robin/joint.url\"\n"
         "sudo chmod 600 /etc/robin/enroll.token /etc/robin/joint.url\n"
-        "sudo systemctl enable --now robin\n"
+        "sudo systemctl enable --now robin robin-tick.timer\n"
     )
     if len(script.encode()) > _SCRIPT_LIMIT:
         raise ValueError("setup script exceeds 10KiB")

@@ -9,6 +9,14 @@ final class ShellModel: ObservableObject {
     @Published var password = ""
     @Published var conversationID = "home"
     @Published var draft = ""
+    @Published var imapHost = ""
+    @Published var smtpHost = ""
+    @Published var mailUser = ""
+    @Published var mailPassword = ""
+    @Published var calendarURL = ""
+    @Published var calendarUser = ""
+    @Published var calendarPassword = ""
+    @Published var scheduleOn = false
     @Published var failure: String?
 
     private let shell: Shell
@@ -27,6 +35,7 @@ final class ShellModel: ObservableObject {
         password = ""
         do {
             try await shell.signIn(instance: url, accountID: accountID, password: secret)
+            scheduleOn = await shell.scheduleEnabled
             phase = await shell.phase
         } catch let error as RobinFailure {
             failure = error.message
@@ -49,9 +58,39 @@ final class ShellModel: ObservableObject {
         }
     }
 
+    func connectMail() async {
+        let secret = mailPassword
+        mailPassword = ""
+        await perform {
+            try await self.shell.connectMailbox(
+                imapHost: self.imapHost,
+                smtpHost: self.smtpHost,
+                user: self.mailUser,
+                password: secret
+            )
+        }
+    }
+
+    func connectCalendar() async {
+        let secret = calendarPassword
+        calendarPassword = ""
+        await perform {
+            try await self.shell.connectCalendar(url: self.calendarURL, user: self.calendarUser, password: secret)
+        }
+    }
+
+    func saveSchedule() async {
+        await perform {
+            try await self.shell.setSchedule(enabled: self.scheduleOn)
+        }
+    }
+
     func leave() async {
         await shell.leave()
         draft = ""
+        mailPassword = ""
+        calendarPassword = ""
+        scheduleOn = false
         failure = nil
         phase = .signedOut
     }
@@ -130,6 +169,28 @@ private struct ConversationForm: View {
             TextField("Message", text: $model.draft)
             Button("Send") {
                 Task { await model.send() }
+            }
+            TextField("IMAP host", text: $model.imapHost)
+                .robinField()
+            TextField("SMTP host", text: $model.smtpHost)
+                .robinField()
+            TextField("Mail user", text: $model.mailUser)
+                .robinField()
+            SecureField("Mail password", text: $model.mailPassword)
+            Button("Connect mail") {
+                Task { await model.connectMail() }
+            }
+            TextField("Calendar URL", text: $model.calendarURL)
+                .robinField()
+            TextField("Calendar user", text: $model.calendarUser)
+                .robinField()
+            SecureField("Calendar password", text: $model.calendarPassword)
+            Button("Connect calendar") {
+                Task { await model.connectCalendar() }
+            }
+            Toggle("Check mail and calendar", isOn: $model.scheduleOn)
+            Button("Save schedule") {
+                Task { await model.saveSchedule() }
             }
             Button("Leave this instance") {
                 Task { await model.leave() }

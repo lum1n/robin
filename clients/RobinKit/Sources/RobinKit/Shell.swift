@@ -9,6 +9,7 @@ public enum ShellPhase: Equatable, Sendable {
 
 public actor Shell {
     public private(set) var phase: ShellPhase = .signedOut
+    public private(set) var scheduleEnabled = false
     private var client: RobinClient?
     private let transport: any RobinTransport
 
@@ -20,13 +21,31 @@ public actor Shell {
         let next = RobinClient(baseURL: instance, accountID: accountID, transport: transport)
         try await next.login(password: password)
         let threads = try await next.threads()
+        scheduleEnabled = try await next.schedule()
         client = next
         phase = .ready(threads: threads, reply: nil)
     }
 
     public func leave() {
         client = nil
+        scheduleEnabled = false
         phase = .signedOut
+    }
+
+    public func connectMailbox(imapHost: String, smtpHost: String, user: String, password: String) async throws {
+        let current = try signedIn()
+        try await current.connect(name: "mailbox", secret: json(["imap_host": imapHost, "password": password, "smtp_host": smtpHost, "user": user]))
+    }
+
+    public func connectCalendar(url: String, user: String, password: String) async throws {
+        let current = try signedIn()
+        try await current.connect(name: "calendar", secret: json(["password": password, "url": url, "user": user]))
+    }
+
+    public func setSchedule(enabled: Bool) async throws {
+        let current = try signedIn()
+        try await current.setSchedule(enabled: enabled)
+        scheduleEnabled = enabled
     }
 
     public func send(conversationID: String, text: String) async throws {
@@ -46,6 +65,11 @@ public actor Shell {
             throw RobinFailure(status: 401, message: "login required")
         }
         return client
+    }
+
+    private func json(_ fields: [String: String]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func show(_ reply: Reply, on current: RobinClient) async throws {

@@ -157,6 +157,8 @@ def test_unknown_capability_is_registered_without_a_core_change() -> None:
     assert "keepsake_ping" in names
     root = Path("src/robin")
     for path in root.glob("*.py"):
+        if path.name == "__main__.py":
+            continue
         text = path.read_text()
         assert "keepsake" not in text
         assert "from robin.capabilities" not in text

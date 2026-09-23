@@ -1,0 +1,10 @@
+[Unit]
+Description=Run a Robin check for accounts that turned it on
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

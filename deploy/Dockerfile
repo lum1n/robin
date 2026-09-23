@@ -11,6 +11,8 @@ WORKDIR /opt/robin
 COPY pyproject.toml uv.lock LICENSE README.md ./
 COPY src ./src
 COPY deploy/robin.service /etc/systemd/system/robin.service
+COPY deploy/robin-tick.service /etc/systemd/system/robin-tick.service
+COPY deploy/robin-tick.timer /etc/systemd/system/robin-tick.timer
 
 # The unit stays disabled. exe-setup writes the enroll token, then starts it.
 # Shelley and SSH stay off. No mailbox secret and no exe.dev token are baked in.
@@ -19,6 +21,7 @@ RUN uv sync --frozen --no-dev \
     && rm -f /etc/systemd/system/sockets.target.wants/shelley.socket \
     && rm -f /etc/systemd/system/multi-user.target.wants/shelley.service \
     && rm -f /etc/systemd/system/multi-user.target.wants/robin.service \
+    && rm -f /etc/systemd/system/timers.target.wants/robin-tick.timer \
     && rm -f /etc/systemd/system/multi-user.target.wants/ssh.service \
     && rm -f /etc/systemd/system/sockets.target.wants/ssh.socket
 
