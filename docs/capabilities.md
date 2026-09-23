@@ -4,6 +4,8 @@ The core is the airlock, accounts, the model route, and a registry. A new way fo
 
 The mail account secret is stored with `broker.put(account_id, "mailbox", mailbox_secret(...))`. The JSON holds `imap_host`, `smtp_host`, `user`, and `password`. `list_messages` reads the newest messages. `send_message` is external, so it waits for a confirm. A missing or unreadable secret yields no messages and does not connect. Tests pass `open_imap` and `open_smtp`.
 
+The calendar secret is `broker.put(account_id, "calendar", calendar_secret(...))` with an `https` URL, user, and password. `list_events` reads CalDAV. `add_event` waits for a confirm. A missing secret does not connect. Tests pass `fetch` and `put`.
+
 ## Declare one
 
 Subclass `robin.capability.Capability`.

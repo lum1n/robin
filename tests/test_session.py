@@ -4,7 +4,7 @@ from pathlib import Path
 
 from robin.airlock import VocabularyTerm
 from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
-from robin.capabilities.calendar import Calendar
+from robin.capabilities.calendar import Calendar, CalDAV, calendar_secret
 from robin.capabilities.groceries import Groceries
 from robin.capabilities.mail import ImapMailbox, Mail, mailbox_secret
 from robin.capabilities.screen import Screen
@@ -68,7 +68,20 @@ def _assistant() -> tuple[Assistant, Screen]:
         "bea@example.com": [_letter("Sam", "bea-only-note")],
     }
     assistant.add(Mail(ImapMailbox(assistant.broker, open_imap=lambda host: _Inbox(inboxes), open_smtp=_closed)))
-    assistant.add(Calendar({"ada": [{"title": "Oncologist Tuesday", "when": "tomorrow"}]}))
+    assistant.broker.put(
+        "ada",
+        "calendar",
+        calendar_secret(url="https://cal.example/ada", user="ada@example.com", password="calendar-password-ada"),
+    )
+    assistant.add(
+        Calendar(
+            CalDAV(
+                assistant.broker,
+                fetch=lambda url, user, password: "BEGIN:VEVENT\nSUMMARY:Oncologist Tuesday\nDTSTART:tomorrow\nEND:VEVENT\n",
+                put=_closed,
+            )
+        )
+    )
     assistant.add(
         Groceries(
             members={"ada", "bea"},
