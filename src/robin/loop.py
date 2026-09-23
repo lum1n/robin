@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from robin.airlock import redact
-from robin.model import Model
+from robin.model import Model, ToolCall
 from robin.policy import Route, Task
 from robin.session import Assistant
 
@@ -61,7 +62,7 @@ def _converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int)
         if outcome["status"] == "confirm":
             return Reply(
                 "confirm",
-                f"Confirm {call.name} before Robin does it.",
+                _confirm_text(assistant, task, call),
                 decision.route,
                 tool=call.name,
                 arguments=dict(call.arguments),
@@ -71,6 +72,20 @@ def _converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int)
             result, _ = redact(result, vault, vocabulary=vocabulary)
         user = f"{user}\nTool {call.name} returned: {result}"
     return Reply("reply", "Stopped after the step limit.", decision.route)
+
+
+def _confirm_text(assistant: Assistant, task: Task, call: ToolCall) -> str:
+    base = f"Confirm {call.name} before Robin does it."
+    try:
+        _capability, tool = assistant.registry.resolve(task.account_id, call.name)
+    except KeyError:
+        return base
+    logged = {key: "" if key in tool.drop_arguments else value for key, value in call.arguments.items()}
+    if not any(str(value) for value in logged.values()):
+        return base
+    vault = assistant.vaults.get(task.account_id, task.conversation_id)
+    shown, _report = redact(json.dumps(logged, sort_keys=True), vault, vocabulary=assistant.vocabulary.get(task.account_id, ()))
+    return f"{base} {vault.restore(shown)}"
 
 
 def resume(assistant: Assistant, account_id: str, conversation_id: str) -> Reply:

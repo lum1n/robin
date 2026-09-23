@@ -1,6 +1,6 @@
 # Capabilities
 
-The core is the airlock, accounts, the model route, and a registry. A new way for the assistant to help is a new module. Mail is the IMAP and SMTP connector. Calendar is the CalDAV connector. The browser is the computer-use connector on that instance. `open_page` opens an http or https page for that account. Another account does not see it. Groceries is the household list. The screen fixture is an example. They are not imported by the core.
+The core is the airlock, accounts, the model route, and a registry. A new way for the assistant to help is a new module. Mail is the IMAP and SMTP connector. Calendar is the CalDAV connector. The browser is the computer-use connector on that instance. `open_page` opens an http or https page for that account. Another account does not see it. Files live in that account's directory on the instance. `delete_file` waits for a confirm. `run_command` waits too, and the confirm text shows the command after redaction. The working directory is that account's files. Groceries is the household list. The screen fixture is an example. They are not imported by the core.
 
 The mail account secret is stored with `broker.put(account_id, "mailbox", mailbox_secret(...))`. The JSON holds `imap_host`, `smtp_host`, `user`, and `password`. `list_messages` reads the newest messages. `send_message` is external, so it waits for a confirm. A missing or unreadable secret yields no messages and does not connect. Tests pass `open_imap` and `open_smtp`.
 
