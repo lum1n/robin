@@ -36,6 +36,6 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
     assert "robin-tick.timer" in dockerfile
     assert "sudo systemctl enable --now robin robin-tick.timer" in script
     assert "/etc/robin/enroll.token" in script
-    assert PINNED_IMAGE == "robin/exeuntu:pinned"
+    assert PINNED_IMAGE == "nimul/robin:pinned"
     assert ".env" in ignored
     assert "tests" in ignored

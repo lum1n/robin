@@ -1,5 +1,5 @@
 # Private Robin instance. exeuntu supplies systemd and the one-shot /exe.dev/setup hook.
-# Publish the result as robin/exeuntu:pinned. That tag is what a VM is created from.
+# Publish the result as nimul/robin:pinned. That tag is what a VM is created from.
 FROM ghcr.io/boldsoftware/exeuntu:latest
 
 LABEL exe.dev/install-shelley=false

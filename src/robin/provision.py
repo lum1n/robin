@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 
 from robin.enroll import Enrollment, account_slug
 
-PINNED_IMAGE = "robin/exeuntu:pinned"
+PINNED_IMAGE = "nimul/robin:pinned"
 EXE_EXEC = "https://exe.dev/exec"
 _SCRIPT_LIMIT = 10 * 1024
 
