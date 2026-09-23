@@ -54,6 +54,7 @@ class Assistant:
         self.vocabulary: dict[str, tuple[VocabularyTerm, ...]] = {}
         self.store = store
         self._pending: dict[tuple[str, str], dict] = {}
+        self.schedules: dict[str, bool] = {}
         if store is not None:
             self._restore_store()
 
@@ -100,6 +101,17 @@ class Assistant:
         self._pending.pop((account_id, conversation_id), None)
         if self.store is not None:
             self.store.clear_pending(account_id, conversation_id)
+
+    def set_schedule(self, account_id: str, enabled: bool) -> None:
+        self.schedules[account_id] = enabled
+        if self.store is not None:
+            self.store.save_schedule(account_id, enabled)
+
+    def schedule_enabled(self, account_id: str) -> bool:
+        return self.schedules.get(account_id, False)
+
+    def scheduled_accounts(self) -> list[str]:
+        return sorted(account_id for account_id, enabled in self.schedules.items() if enabled)
 
     def tools(self, account_id: str) -> list[dict[str, Any]]:
         return self.registry.schemas(account_id)
@@ -177,3 +189,4 @@ class Assistant:
             self.vaults.put(vault)
         for account_id, name, value in self.store.load_secrets():
             self.broker._secrets[(account_id, name)] = value
+        self.schedules.update(self.store.load_schedules())

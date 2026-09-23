@@ -43,6 +43,27 @@ public actor RobinClient {
         return try await postMessage(body)
     }
 
+    public func setSchedule(enabled: Bool) async throws {
+        let body = try encode(ScheduleBody(accountID: accountID, enabled: enabled))
+        let raw = try await transport.call(
+            url: try url(path: "/v1/schedule"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        _ = try accepted(raw, status: 200)
+    }
+
+    public func schedule() async throws -> Bool {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/schedule", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(ScheduleState.self, from: accepted(raw, status: 200)).enabled
+    }
+
     public func connect(name: String, secret: String) async throws {
         let body = try encode(SecretBody(accountID: accountID, name: name, value: secret))
         let raw = try await transport.call(
@@ -188,6 +209,20 @@ private struct MessageBody: Encodable {
 
 private struct SessionBody: Decodable {
     var token: String
+}
+
+private struct ScheduleBody: Encodable {
+    var accountID: String
+    var enabled: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case enabled
+    }
+}
+
+private struct ScheduleState: Decodable {
+    var enabled: Bool
 }
 
 private struct SecretBody: Encodable {

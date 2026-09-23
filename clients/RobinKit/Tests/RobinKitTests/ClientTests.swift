@@ -76,6 +76,29 @@ struct ClientTests {
         #expect(calls[2].token == "sess-1")
     }
 
+    @Test func scheduleStaysOffUntilThisAccountTurnsItOn() async throws {
+        let transport = ScriptedTransport(responses: [
+            RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"enabled":false}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"enabled":true}"#.utf8)),
+        ])
+        let client = RobinClient(
+            baseURL: URL(string: "http://127.0.0.1:8787")!,
+            accountID: "ada",
+            transport: transport
+        )
+        try await client.login(password: "correct-horse")
+        let before = try await client.schedule()
+        try await client.setSchedule(enabled: true)
+        #expect(before == false)
+        let calls = await transport.calls
+        #expect(calls[1].url.absoluteString == "http://127.0.0.1:8787/v1/schedule?account_id=ada")
+        let posted = String(decoding: calls[2].body ?? Data(), as: UTF8.self)
+        #expect(posted.contains("\"enabled\":true"))
+        #expect(calls[2].token == "sess-1")
+        #expect(!posted.contains("correct-horse"))
+    }
+
     @Test func connectSendsTheSecretOnceAndDoesNotKeepIt() async throws {
         let transport = ScriptedTransport(responses: [
             RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),

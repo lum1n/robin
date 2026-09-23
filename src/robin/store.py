@@ -85,6 +85,7 @@ class HouseholdStore:
             """
         )
         self._db.execute("CREATE TABLE IF NOT EXISTS pantry (id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS schedules (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.commit()
 
     def close(self) -> None:
@@ -289,6 +290,21 @@ class HouseholdStore:
             (self._seal(json.dumps(record, sort_keys=True)),),
         )
         self._db.commit()
+
+    def save_schedule(self, account_id: str, enabled: bool) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO schedules (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps({"enabled": enabled}))),
+        )
+        self._db.commit()
+
+    def load_schedules(self) -> dict[str, bool]:
+        rows = self._db.execute("SELECT account_id, body FROM schedules").fetchall()
+        return {account_id: bool(json.loads(self._open(body))["enabled"]) for account_id, body in rows}
 
     def load_pantry(self) -> dict | None:
         row = self._db.execute("SELECT body FROM pantry WHERE id = 'household'").fetchone()

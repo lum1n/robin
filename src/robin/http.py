@@ -55,6 +55,10 @@ def dispatch(
         return _post_message(service, headers, body)
     if method == "POST" and path == "/v1/enroll":
         return _post_enroll(service, body)
+    if method == "POST" and path == "/v1/schedule":
+        return _post_schedule(service, headers, body)
+    if method == "GET" and path == "/v1/schedule":
+        return _get_schedule(service, headers, query)
     if method == "POST" and path == "/v1/secrets":
         return _post_secret(service, headers, body)
     if method == "GET" and path == "/v1/secrets":
@@ -190,6 +194,26 @@ def _post_enroll(service: Service, body: dict[str, Any]) -> tuple[int, dict[str,
 
 
 _CONNECTABLE = ("calendar", "mailbox")
+
+
+def _post_schedule(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    if not isinstance(body.get("enabled"), bool):
+        return 400, {"error": "enabled is required"}
+    service.assistant.set_schedule(account_id, body["enabled"])
+    return 200, {"enabled": body["enabled"]}
+
+
+def _get_schedule(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    denied = _require(service, headers, query.get("account_id"))
+    if denied is not None:
+        return denied
+    return 200, {"enabled": service.assistant.schedule_enabled(query["account_id"])}
 
 
 def _post_secret(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:

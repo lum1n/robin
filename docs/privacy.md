@@ -106,4 +106,4 @@ The model sees text, not a raw screenshot. Passwords, national IDs, and payment 
 
 ## Proactive work
 
-Scheduled or proactive runs stay off until that account turns them on. Memory stays on the instance, per account, and goes through the airlock before any cloud model.
+A scheduled check stays off until that account turns it on with `POST /v1/schedule`. `tick` then runs a local check of mail and calendar for the accounts that asked. An external action is stored for confirmation and does not run on its own. Memory stays on the instance, per account, and goes through the airlock before any cloud model.
