@@ -72,6 +72,8 @@ class HouseholdStore:
             """
         )
         self._db.execute("CREATE TABLE IF NOT EXISTS instances (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS passwords (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.commit()
 
     def close(self) -> None:
@@ -216,6 +218,41 @@ class HouseholdStore:
     def load_instances(self) -> list[dict]:
         rows = self._db.execute("SELECT body FROM instances").fetchall()
         return [json.loads(self._open(row[0])) for row in rows]
+
+    def save_password(self, account_id: str, salt: bytes, hashed: bytes) -> None:
+        self.ensure_account(account_id)
+        payload = json.dumps({"salt": salt.hex(), "hash": hashed.hex()})
+        self._db.execute(
+            """
+            INSERT INTO passwords (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(payload)),
+        )
+        self._db.commit()
+
+    def load_passwords(self) -> dict[str, tuple[bytes, bytes]]:
+        rows = self._db.execute("SELECT account_id, body FROM passwords").fetchall()
+        loaded: dict[str, tuple[bytes, bytes]] = {}
+        for account_id, body in rows:
+            record = json.loads(self._open(body))
+            loaded[account_id] = (bytes.fromhex(record["salt"]), bytes.fromhex(record["hash"]))
+        return loaded
+
+    def save_session(self, token_hash: str, account_id: str) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO sessions (token_hash, body) VALUES (?, ?)
+            ON CONFLICT (token_hash) DO UPDATE SET body = excluded.body
+            """,
+            (token_hash, self._seal(json.dumps({"account_id": account_id}))),
+        )
+        self._db.commit()
+
+    def load_sessions(self) -> dict[str, str]:
+        rows = self._db.execute("SELECT token_hash, body FROM sessions").fetchall()
+        return {token_hash: json.loads(self._open(body))["account_id"] for token_hash, body in rows}
 
     def delete_instance(self, account_id: str) -> None:
         self._db.execute("DELETE FROM instances WHERE account_id = ?", (account_id,))

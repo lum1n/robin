@@ -30,11 +30,11 @@ Records a capability marks private, plus vocabulary, vault, cloud opt-in, and th
 
 Placeholder maps are keyed by account and conversation. `[PERSON_1]` in one conversation is unrelated to `[PERSON_1]` in another. Sharing something with another account is an external effect and needs a confirm.
 
-Login is later. Every vault, decision, and view already carries an account id.
+A person registers a password once, then logs in. The session token is returned once and is not stored. Later requests send it as a bearer token. The session has to belong to the account on the request. Another account's token is rejected. The one-time VM enroll token is separate and is not a person's session.
 
 On the house server, `HouseholdStore` keeps accounts, threads, vaults, vocabulary, and the activity log. Thread text, vaults, vocabulary, and activity entries are encrypted with a key the process holds. A restart loads only that material. One account's threads and log are not readable as another account. The raw message is not stored in the clear.
 
-The house HTTP service is how the Mac and iPhone apps will send a message. A turn returns a reply or a confirmation. Confirming runs the external tool that was waiting. Thread and activity reads are scoped to the account id on the request. That id is not a login yet, so the service binds to the local machine. A pending confirmation is stored encrypted and is not visible to another account.
+The house HTTP service is how the Mac and iPhone apps will send a message. A turn returns a reply or a confirmation. Confirming runs the external tool that was waiting. Thread, activity, and private-instance routes require that account's session. `serve` still binds to the local machine. A pending confirmation is stored encrypted and is not visible to another account.
 
 ## Trust boundary
 

@@ -37,15 +37,22 @@ def _service(post: Captured, store: HouseholdStore | None = None) -> tuple[Servi
     return service, enrollment
 
 
+def _session(service: Service, account_id: str = "ada") -> dict[str, str]:
+    service.auth.register(account_id, f"password-for-{account_id}")
+    token = service.auth.login(account_id, f"password-for-{account_id}")
+    return {"authorization": f"Bearer {token}"}
+
+
 def test_create_waits_for_confirm_and_enroll_burns_the_token(tmp_path) -> None:
     post = Captured()
     service, _enrollment = _service(post)
-    held, held_body = dispatch(service, "POST", "/v1/private", body={"account_id": "ada"})
+    ada = _session(service)
+    held, held_body = dispatch(service, "POST", "/v1/private", body={"account_id": "ada"}, headers=ada)
     assert held == 200
     assert held_body == {"status": "confirm", "https_url": None, "ready": False}
     assert post.calls == []
 
-    status, body = dispatch(service, "POST", "/v1/private", body={"account_id": "ada", "confirm": True})
+    status, body = dispatch(service, "POST", "/v1/private", body={"account_id": "ada", "confirm": True}, headers=ada)
     assert status == 200
     assert body == {"status": "created", "https_url": ADDRESS, "ready": False}
     assert TOKEN not in json.dumps(body)
@@ -61,11 +68,14 @@ def test_create_waits_for_confirm_and_enroll_burns_the_token(tmp_path) -> None:
     assert JOINT in command
     assert "\n" not in command
 
-    waiting, waiting_body = dispatch(service, "GET", "/v1/private", query={"account_id": "ada"})
+    waiting, waiting_body = dispatch(service, "GET", "/v1/private", query={"account_id": "ada"}, headers=ada)
     assert waiting == 200
     assert waiting_body["ready"] is False
-    missing, _missing_body = dispatch(service, "GET", "/v1/private", query={"account_id": "bea"})
+    bea = _session(service, "bea")
+    missing, _missing_body = dispatch(service, "GET", "/v1/private", query={"account_id": "bea"}, headers=bea)
+    stolen, _stolen_body = dispatch(service, "GET", "/v1/private", query={"account_id": "ada"}, headers=bea)
     assert missing == 404
+    assert stolen == 401
 
     token_path = tmp_path / "enroll.token"
     joint_path = tmp_path / "joint.url"
@@ -87,7 +97,7 @@ def test_create_waits_for_confirm_and_enroll_burns_the_token(tmp_path) -> None:
     assert MAILBOX not in json.dumps(enrolled)
     assert served == ["up"]
 
-    ready, ready_body = dispatch(service, "GET", "/v1/private", query={"account_id": "ada"})
+    ready, ready_body = dispatch(service, "GET", "/v1/private", query={"account_id": "ada"}, headers=ada)
     assert ready == 200
     assert ready_body == {"https_url": ADDRESS, "ready": True}
     again, again_body = dispatch(service, "POST", "/v1/enroll", body={"token": TOKEN})
@@ -99,7 +109,8 @@ def test_create_waits_for_confirm_and_enroll_burns_the_token(tmp_path) -> None:
 def test_a_failed_create_or_enroll_does_not_leave_a_live_token(tmp_path) -> None:
     post = Captured(response={"https_url": "http://insecure.example"})
     service, enrollment = _service(post)
-    status, body = dispatch(service, "POST", "/v1/private", body={"account_id": "ada", "confirm": True})
+    ada = _session(service)
+    status, body = dispatch(service, "POST", "/v1/private", body={"account_id": "ada", "confirm": True}, headers=ada)
     assert status == 502
     assert body == {"error": "exe.dev did not return an https url"}
     assert enrollment.get("ada") is None
