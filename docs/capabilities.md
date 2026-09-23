@@ -1,10 +1,12 @@
 # Capabilities
 
-The core is the airlock, accounts, the model route, and a registry. A new way for the assistant to help is a new module. Mail is the IMAP and SMTP connector. The browser is the computer-use connector on that instance. Calendar, groceries, and the screen fixture are examples. They are not imported by the core.
+The core is the airlock, accounts, the model route, and a registry. A new way for the assistant to help is a new module. Mail is the IMAP and SMTP connector. Calendar is the CalDAV connector. The browser is the computer-use connector on that instance. Groceries is the household list. The screen fixture is an example. They are not imported by the core.
 
 The mail account secret is stored with `broker.put(account_id, "mailbox", mailbox_secret(...))`. The JSON holds `imap_host`, `smtp_host`, `user`, and `password`. `list_messages` reads the newest messages. `send_message` is external, so it waits for a confirm. A missing or unreadable secret yields no messages and does not connect. Tests pass `open_imap` and `open_smtp`.
 
 The calendar secret is `broker.put(account_id, "calendar", calendar_secret(...))` with an `https` URL, user, and password. `list_events` reads CalDAV. `add_event` waits for a confirm. A missing secret does not connect. Tests pass `fetch` and `put`.
+
+The grocery list lives on this server. `add_private` changes only that account's list. `add_shared` and `add_member` wait for a confirm, because another account will see the result. A private item is not in another account's records. Pass a `HouseholdStore` and the list is encrypted across a restart.
 
 ## Declare one
 

@@ -84,6 +84,7 @@ class HouseholdStore:
             )
             """
         )
+        self._db.execute("CREATE TABLE IF NOT EXISTS pantry (id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.commit()
 
     def close(self) -> None:
@@ -278,6 +279,22 @@ class HouseholdStore:
     def load_secrets(self) -> list[tuple[str, str, str]]:
         rows = self._db.execute("SELECT account_id, name, body FROM secrets").fetchall()
         return [(account_id, name, self._open(body)) for account_id, name, body in rows]
+
+    def save_pantry(self, record: dict) -> None:
+        self._db.execute(
+            """
+            INSERT INTO pantry (id, body) VALUES ('household', ?)
+            ON CONFLICT (id) DO UPDATE SET body = excluded.body
+            """,
+            (self._seal(json.dumps(record, sort_keys=True)),),
+        )
+        self._db.commit()
+
+    def load_pantry(self) -> dict | None:
+        row = self._db.execute("SELECT body FROM pantry WHERE id = 'household'").fetchone()
+        if row is None:
+            return None
+        return json.loads(self._open(row[0]))
 
     def delete_instance(self, account_id: str) -> None:
         self._db.execute("DELETE FROM instances WHERE account_id = ?", (account_id,))

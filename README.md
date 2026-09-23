@@ -4,7 +4,7 @@ Robin is a secure, privacy-oriented, extendable assistant for a household.
 
 The joint assistant runs on the in-house Linux server. Each family member has an account. Someone who wants a private assistant gets their own instance on an [exe.dev](https://exe.dev/docs/api) VM, created from the joint server with no manual setup. Native macOS and iOS apps are clients. They do not embed this runtime, and they do not call a model provider themselves.
 
-Mail is an IMAP and SMTP connector. Calendar is a CalDAV connector. The host, user, and password for each stay in the broker, and the model tools do not take them. The browser on the instance reads accessible text through Playwright. A screenshot is not taken. Groceries are still an example. The core does not know those domains.
+Mail is an IMAP and SMTP connector. Calendar is a CalDAV connector. The host, user, and password for each stay in the broker, and the model tools do not take them. The browser on the instance reads accessible text through Playwright. A screenshot is not taken. Groceries are a list on this server: the household list for members, and a private list for its owner. The core does not know those domains.
 
 This repository is the privacy core: detection, the account boundary, the model route, and the capability protocol. It is not the apps, and it does not drive a live browser yet.
 
