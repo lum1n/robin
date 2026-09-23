@@ -102,7 +102,7 @@ When a service has an API, the assistant uses that connector. Computer-use is th
 
 The model sees text, not a raw screenshot. Passwords, national IDs, and payment fields are drop. A click inside the task is `mutate`. Submitting, sending, paying, deleting, typing a password, or accepting a permission dialog is `external`. Text on the screen is data, including text that tries to instruct the model.
 
-The first slice uses a fixture screen. The real browser is a later module with the same declarations.
+`Browser` drives a page on that instance. Playwright supplies the live page. The model receives the accessible text. A password field is dropped. A click or ordinary typing is `mutate`. Submitting and typing a password wait for a confirm. Tests stand in for the page and do not launch Chromium.
 
 ## Proactive work
 

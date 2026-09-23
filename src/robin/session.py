@@ -145,7 +145,8 @@ class Assistant:
         capability, tool = self.registry.resolve(account_id, tool_name)
         vault = self.vaults.get(account_id, conversation_id)
         raw = {key: vault.restore(str(value)) for key, value in arguments.items()}
-        logged, _ = redact(json.dumps(raw, sort_keys=True), Vault(account_id, "activity"))
+        logged_input = {key: "" if key in tool.drop_arguments else value for key, value in raw.items()}
+        logged, _ = redact(json.dumps(logged_input, sort_keys=True), Vault(account_id, "activity"))
         entry = {"tool": tool_name, "arguments": logged}
         self.activity.append(account_id, entry)
         if self.store is not None:

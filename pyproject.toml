@@ -9,6 +9,7 @@ dependencies = ["cryptography>=44"]
 
 [project.optional-dependencies]
 ner = ["gliner>=0.2.22"]
+browser = ["playwright>=1.49"]
 
 [project.scripts]
 robin = "robin.__main__:main"

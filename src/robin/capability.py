@@ -30,6 +30,7 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     effect: Effect
+    drop_arguments: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
