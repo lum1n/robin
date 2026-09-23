@@ -17,7 +17,10 @@ COPY deploy/robin-tick.timer /etc/systemd/system/robin-tick.timer
 
 # The unit stays disabled. exe-setup writes the enroll token, then starts it.
 # Shelley and SSH stay off. No mailbox secret and no exe.dev token are baked in.
-RUN uv sync --frozen --no-dev \
+# Chromium is for computer-use on this VM. The house server does not use this image.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/robin/ms-playwright
+RUN uv sync --frozen --no-dev --extra browser \
+    && /opt/robin/.venv/bin/playwright install --with-deps chromium \
     && ln -sf /opt/robin/.venv/bin/robin /usr/local/bin/robin \
     && rm -f /etc/systemd/system/sockets.target.wants/shelley.socket \
     && rm -f /etc/systemd/system/multi-user.target.wants/shelley.service \

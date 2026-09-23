@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/robin/ms-playwright
 ExecStart=/usr/local/bin/robin boot --host 127.0.0.1 --port 8000
 Restart=on-failure
 NoNewPrivileges=true
