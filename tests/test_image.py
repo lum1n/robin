@@ -25,6 +25,13 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
     assert "enroll.token" not in dockerfile
     assert "COPY src" in dockerfile
 
+    assert "passwd" in dockerfile
+    assert "util-linux" in dockerfile
+    assert "/var/lib/robin/files" in dockerfile
+    assert "chmod 711 /var/lib/robin/files" in dockerfile
+    assert "ExecStartPre=/usr/bin/mkdir -p /var/lib/robin/files" in unit
+    assert "ExecStartPre=/usr/bin/chmod 711 /var/lib/robin/files" in unit
+    assert "\nUser=" not in unit
     assert "EXPOSE 8000" in dockerfile
     assert "ExecStart=/usr/local/bin/robin boot --host 127.0.0.1 --port 8000" in unit
     assert "After=network-online.target exe-setup.service" in unit
@@ -38,6 +45,8 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
     assert "--host 0.0.0.0" in house
     assert "--port 8000" not in house
     assert "--advertise-file /etc/robin/advertise.url" in house
+    assert "ExecStartPre=/usr/bin/mkdir -p /var/lib/robin/files" in house
+    assert "\nUser=" not in house
     assert "0.0.0.0" not in unit
     assert "enroll.token" not in timer
     assert "OnUnitActiveSec=15min" in (ROOT / "deploy" / "robin-tick.timer").read_text()

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from robin.capabilities.identity import claim, give
 from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
 
 _LIMIT = 1_000_000
@@ -38,8 +39,15 @@ class Workspace:
         if len(text.encode()) > _LIMIT:
             raise ValueError("file is too large")
         path = self.locate(account_id, relative)
+        base = self._base(account_id)
+        login = claim(account_id, self.root, base)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+        current = base
+        give(current, login)
+        for part in path.relative_to(base).parts:
+            current = current / part
+            give(current, login)
 
     def delete(self, account_id: str, relative: str) -> str:
         path = self.locate(account_id, relative)

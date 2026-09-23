@@ -7,6 +7,12 @@ LABEL exe.dev/login-user=exedev
 
 USER root
 EXPOSE 8000
+# passwd and util-linux supply useradd and runuser. A confirmed command drops to that account.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends passwd util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/robin/files \
+    && chmod 711 /var/lib/robin/files
 WORKDIR /opt/robin
 
 COPY pyproject.toml uv.lock LICENSE README.md ./
