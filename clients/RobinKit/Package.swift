@@ -11,3 +11,8 @@ let package = Package(
         .testTarget(name: "RobinKitTests", dependencies: ["RobinKit"]),
     ]
 )
+
+#if os(macOS) || os(iOS)
+package.products.append(.executable(name: "RobinApp", targets: ["RobinApp"]))
+package.targets.append(.executableTarget(name: "RobinApp", dependencies: ["RobinKit"]))
+#endif
