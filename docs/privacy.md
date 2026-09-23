@@ -34,6 +34,8 @@ Login is later. Every vault, decision, and view already carries an account id.
 
 On the house server, `HouseholdStore` keeps accounts, threads, vaults, vocabulary, and the activity log. Thread text, vaults, vocabulary, and activity entries are encrypted with a key the process holds. A restart loads only that material. One account's threads and log are not readable as another account. The raw message is not stored in the clear.
 
+The house HTTP service is how the Mac and iPhone apps will send a message. A turn returns a reply or a confirmation. Confirming runs the external tool that was waiting. Thread and activity reads are scoped to the account id on the request. That id is not a login yet, so the service binds to the local machine. A pending confirmation is stored encrypted and is not visible to another account.
+
 ## Trust boundary
 
 Connectors and computer-use see real records for the account that owns them. The cloud model sees placeholders. The local model may see that task's data. Secrets never enter either model: the broker holds them and tools receive them only at execution time.

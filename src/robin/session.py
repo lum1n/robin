@@ -47,6 +47,7 @@ class Assistant:
         self.broker = Broker()
         self.vocabulary: dict[str, tuple[VocabularyTerm, ...]] = {}
         self.store = store
+        self._pending: dict[tuple[str, str], dict] = {}
         if store is not None:
             self._restore_store()
 
@@ -75,6 +76,24 @@ class Assistant:
     def persist_vault(self, account_id: str, conversation_id: str) -> None:
         if self.store is not None:
             self.store.save_vault(self.vaults.get(account_id, conversation_id))
+
+    def set_pending(self, account_id: str, conversation_id: str, tool: str, arguments: dict, route: str) -> None:
+        record = {"tool": tool, "arguments": arguments, "route": route}
+        self._pending[(account_id, conversation_id)] = record
+        if self.store is not None:
+            self.store.save_pending(account_id, conversation_id, record)
+
+    def take_pending(self, account_id: str, conversation_id: str) -> dict | None:
+        record = self._pending.pop((account_id, conversation_id), None)
+        if self.store is None:
+            return record
+        stored = self.store.take_pending(account_id, conversation_id)
+        return record or stored
+
+    def clear_pending(self, account_id: str, conversation_id: str) -> None:
+        self._pending.pop((account_id, conversation_id), None)
+        if self.store is not None:
+            self.store.clear_pending(account_id, conversation_id)
 
     def tools(self, account_id: str) -> list[dict[str, Any]]:
         return self.registry.schemas(account_id)

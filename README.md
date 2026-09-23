@@ -16,6 +16,8 @@ The local model is the default. A cloud model runs only when the task sets `allo
 
 Pass a `HouseholdStore` when constructing `Assistant` and the house server keeps accounts, threads, vaults, vocabulary, and the activity log across a restart. Those records are encrypted with a key the process holds. Another account cannot read them. The database file does not contain the raw message text.
 
+`serve` speaks HTTP on `127.0.0.1:8787`. `POST /v1/messages` runs one turn for an account and a thread. The response is a reply, or a confirmation when the model asked for an external tool. A second post with `"confirm": true` runs that tool. `GET /v1/threads`, `GET /v1/threads/{id}`, and `GET /v1/activity` read only the account named in the query. Login is later: the account id is chosen by the client, so this port stays on the house machine.
+
 Details, including the threat model and private VMs, are in [docs/privacy.md](docs/privacy.md). Adding a capability is described in [docs/capabilities.md](docs/capabilities.md).
 
 ## Run the tests

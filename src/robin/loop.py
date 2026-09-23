@@ -16,12 +16,17 @@ SYSTEM = (
 )
 
 
+class PendingMissing(LookupError):
+    pass
+
+
 @dataclass(frozen=True)
 class Reply:
     status: str
     text: str
     route: Route
     tool: str | None = None
+    arguments: dict | None = None
 
 
 def converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int = 4) -> Reply:
@@ -54,9 +59,33 @@ def _converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int)
             call.arguments,
         )
         if outcome["status"] == "confirm":
-            return Reply("confirm", f"Confirm {call.name} before Robin does it.", decision.route, tool=call.name)
+            return Reply(
+                "confirm",
+                f"Confirm {call.name} before Robin does it.",
+                decision.route,
+                tool=call.name,
+                arguments=dict(call.arguments),
+            )
         result = outcome["result"]
         if decision.route is Route.CLOUD:
             result, _ = redact(result, vault, vocabulary=vocabulary)
         user = f"{user}\nTool {call.name} returned: {result}"
     return Reply("reply", "Stopped after the step limit.", decision.route)
+
+
+def resume(assistant: Assistant, account_id: str, conversation_id: str) -> Reply:
+    pending = assistant.take_pending(account_id, conversation_id)
+    if pending is None:
+        raise PendingMissing(conversation_id)
+    outcome = assistant.invoke(
+        account_id,
+        conversation_id,
+        pending["tool"],
+        pending["arguments"],
+        confirmed=True,
+    )
+    route = Route(pending["route"])
+    reply = Reply("reply", outcome["result"], route, tool=pending["tool"])
+    assistant.remember(account_id, conversation_id, reply.status, reply.text)
+    assistant.persist_vault(account_id, conversation_id)
+    return reply

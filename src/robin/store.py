@@ -61,6 +61,16 @@ class HouseholdStore:
             """
         )
         self._db.execute("CREATE TABLE IF NOT EXISTS vocabulary (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending (
+                account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                body BLOB NOT NULL,
+                PRIMARY KEY (account_id, conversation_id)
+            )
+            """
+        )
         self._db.commit()
 
     def close(self) -> None:
@@ -169,6 +179,34 @@ class HouseholdStore:
             terms = tuple(VocabularyTerm(item["text"], item["label"]) for item in json.loads(self._open(body)))
             loaded[account_id] = terms
         return loaded
+
+    def save_pending(self, account_id: str, conversation_id: str, record: dict) -> None:
+        self.ensure_thread(account_id, conversation_id)
+        self._db.execute(
+            """
+            INSERT INTO pending (account_id, conversation_id, body) VALUES (?, ?, ?)
+            ON CONFLICT (account_id, conversation_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, conversation_id, self._seal(json.dumps(record, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def take_pending(self, account_id: str, conversation_id: str) -> dict | None:
+        row = self._db.execute(
+            "SELECT body FROM pending WHERE account_id = ? AND conversation_id = ?",
+            (account_id, conversation_id),
+        ).fetchone()
+        self.clear_pending(account_id, conversation_id)
+        if row is None:
+            return None
+        return json.loads(self._open(row[0]))
+
+    def clear_pending(self, account_id: str, conversation_id: str) -> None:
+        self._db.execute(
+            "DELETE FROM pending WHERE account_id = ? AND conversation_id = ?",
+            (account_id, conversation_id),
+        )
+        self._db.commit()
 
     def _seal(self, text: str) -> bytes:
         return self._fernet.encrypt(text.encode())
