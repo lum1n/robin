@@ -1,0 +1,14 @@
+[Unit]
+Description=Robin household assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+StateDirectory=robin
+ExecStart=/usr/local/bin/robin boot --store /var/lib/robin/house.sqlite --key /etc/robin/store.key
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
