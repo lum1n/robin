@@ -1,4 +1,4 @@
-"""Inspect redaction from the command line. Nothing here opens a network connection."""
+"""Command line. redact, restore, and decide do not open a network connection. boot enrolls, then serves."""
 
 from __future__ import annotations
 
@@ -38,7 +38,18 @@ def main(argv: list[str] | None = None) -> int:
     decide_cmd.add_argument("--allow-cloud", action="store_true")
     decide_cmd.add_argument("--free-text", action="store_true")
 
+    boot_cmd = sub.add_parser("boot")
+    boot_cmd.add_argument("--token", default="/etc/robin/enroll.token")
+    boot_cmd.add_argument("--joint", default="/etc/robin/joint.url")
+    boot_cmd.add_argument("--store")
+    boot_cmd.add_argument("--key")
+    boot_cmd.add_argument("--advertise", default="")
+    boot_cmd.add_argument("--host", default="127.0.0.1")
+    boot_cmd.add_argument("--port", type=int, default=8787)
+
     args = parser.parse_args(argv)
+    if args.command == "boot":
+        return _boot(args)
     if args.command == "redact":
         vault = Vault(args.account, args.conversation)
         redacted, _report = redact(args.text, vault)
@@ -70,6 +81,33 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     print(json.dumps({"route": decision.route.value, "reason": decision.reason}))
+    return 0
+
+
+def _boot(args: argparse.Namespace) -> int:
+    from robin.enroll import Enrollment, enroll_on_boot, urllib_enroll_post
+    from robin.http import Service, serve
+    from robin.model import ChatModel
+    from robin.provision import urllib_exe_post
+    from robin.store import HouseholdStore
+
+    enroll_on_boot(args.token, args.joint, urllib_enroll_post)
+    store = None
+    if args.store:
+        if not args.key:
+            raise SystemExit("boot --store requires --key")
+        store = HouseholdStore(args.store, Path(args.key).read_bytes().strip())
+    serve(
+        Service(
+            Assistant(store=store),
+            ChatModel(),
+            enrollment=Enrollment(store),
+            joint_url=args.advertise,
+            exe_post=urllib_exe_post if args.advertise else None,
+        ),
+        host=args.host,
+        port=args.port,
+    )
     return 0
 
 

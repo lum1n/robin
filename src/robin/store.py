@@ -71,6 +71,7 @@ class HouseholdStore:
             )
             """
         )
+        self._db.execute("CREATE TABLE IF NOT EXISTS instances (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.commit()
 
     def close(self) -> None:
@@ -200,6 +201,25 @@ class HouseholdStore:
         if row is None:
             return None
         return json.loads(self._open(row[0]))
+
+    def save_instance(self, account_id: str, record: dict) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO instances (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(record, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_instances(self) -> list[dict]:
+        rows = self._db.execute("SELECT body FROM instances").fetchall()
+        return [json.loads(self._open(row[0])) for row in rows]
+
+    def delete_instance(self, account_id: str) -> None:
+        self._db.execute("DELETE FROM instances WHERE account_id = ?", (account_id,))
+        self._db.commit()
 
     def clear_pending(self, account_id: str, conversation_id: str) -> None:
         self._db.execute(

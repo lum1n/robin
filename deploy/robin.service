@@ -1,0 +1,13 @@
+[Unit]
+Description=Robin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=robin boot
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

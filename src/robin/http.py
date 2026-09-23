@@ -7,16 +7,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from robin.enroll import EnrollRejected, Enrollment
 from robin.loop import PendingMissing, converse, resume
 from robin.model import Model
 from robin.policy import Task
+from robin.provision import create_private_instance
 from robin.session import Assistant
 
 
 class Service:
-    def __init__(self, assistant: Assistant, model: Model) -> None:
+    def __init__(
+        self,
+        assistant: Assistant,
+        model: Model,
+        *,
+        enrollment: Enrollment | None = None,
+        joint_url: str = "",
+        exe_post: Any = None,
+    ) -> None:
         self.assistant = assistant
         self.model = model
+        self.enrollment = enrollment
+        self.joint_url = joint_url
+        self.exe_post = exe_post
 
 
 def dispatch(
@@ -31,6 +44,12 @@ def dispatch(
     body = body or {}
     if method == "POST" and path == "/v1/messages":
         return _post_message(service, body)
+    if method == "POST" and path == "/v1/enroll":
+        return _post_enroll(service, body)
+    if method == "POST" and path == "/v1/private":
+        return _post_private(service, body)
+    if method == "GET" and path == "/v1/private":
+        return _get_private(service, query)
     if method == "GET" and path == "/v1/threads":
         account_id = query.get("account_id")
         if not account_id:
@@ -112,6 +131,64 @@ def _post_message(service: Service, body: dict[str, Any]) -> tuple[int, dict[str
             reply.route.value,
         )
     return 200, _public_reply(reply)
+
+
+def _post_enroll(service: Service, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if service.enrollment is None:
+        return 404, {"error": "not found"}
+    token = body.get("token")
+    if not isinstance(token, str) or not token:
+        return 400, {"error": "token is required"}
+    try:
+        ready = service.enrollment.accept(token)
+    except EnrollRejected:
+        return 409, {"error": "token rejected"}
+    return 200, {"account_id": ready["account_id"], "https_url": ready["https_url"], "ready": True}
+
+
+def _post_private(service: Service, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    if service.enrollment is None or not service.joint_url or service.exe_post is None:
+        return 400, {"error": "private instances are not configured"}
+    confirmed = body.get("confirm") is True
+    api_token = ""
+    if confirmed:
+        try:
+            api_token = service.assistant.broker.reveal("household", "exe")
+        except KeyError:
+            return 400, {"error": "exe token is missing"}
+    try:
+        result = create_private_instance(
+            enrollment=service.enrollment,
+            account_id=account_id,
+            confirmed=confirmed,
+            joint_url=service.joint_url,
+            post=service.exe_post,
+            api_token=api_token,
+        )
+    except ValueError:
+        return 400, {"error": "account id must be a lowercase slug"}
+    except RuntimeError as exc:
+        text = str(exc)
+        if text in {"exe token is missing", "exe.dev did not return an https url"}:
+            status = 400 if text == "exe token is missing" else 502
+            return status, {"error": text}
+        raise
+    return 200, {"status": result.status, "https_url": result.https_url, "ready": result.ready}
+
+
+def _get_private(service: Service, query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    account_id = query.get("account_id")
+    if not account_id:
+        return 400, {"error": "account_id is required"}
+    if service.enrollment is None:
+        return 404, {"error": "not found"}
+    record = service.enrollment.get(account_id)
+    if record is None:
+        return 404, {"error": "not found"}
+    return 200, {"https_url": record["https_url"], "ready": record["ready"]}
 
 
 def _public_reply(reply: Any) -> dict[str, Any]:
