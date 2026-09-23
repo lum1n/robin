@@ -99,6 +99,30 @@ struct ClientTests {
         #expect(!posted.contains("correct-horse"))
     }
 
+    @Test func exportSendsThePassphraseOnce() async throws {
+        let transport = ScriptedTransport(responses: [
+            RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"export":"sealed-bundle"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"status":"reply","text":"ok","route":"local","tool":null}"#.utf8)),
+        ])
+        let client = RobinClient(
+            baseURL: URL(string: "http://127.0.0.1:8787")!,
+            accountID: "ada",
+            transport: transport
+        )
+        try await client.login(password: "correct-horse")
+        let bundle = try await client.exportVault(passphrase: "vault-passphrase-ada")
+        #expect(bundle == "sealed-bundle")
+        _ = try await client.send(conversationID: "home", text: "hello")
+        let calls = await transport.calls
+        let posted = String(decoding: calls[1].body ?? Data(), as: UTF8.self)
+        #expect(calls[1].url.absoluteString == "http://127.0.0.1:8787/v1/export")
+        #expect(posted.contains("vault-passphrase-ada"))
+        let sent = String(decoding: calls[2].body ?? Data(), as: UTF8.self)
+        #expect(!sent.contains("vault-passphrase-ada"))
+        #expect(!sent.contains("correct-horse"))
+    }
+
     @Test func connectSendsTheSecretOnceAndDoesNotKeepIt() async throws {
         let transport = ScriptedTransport(responses: [
             RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),

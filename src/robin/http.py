@@ -14,6 +14,7 @@ from robin.model import Model
 from robin.policy import Task
 from robin.provision import create_private_instance, delete_private_instance
 from robin.session import Assistant
+from robin.vault import VaultAccessError
 
 
 class Service:
@@ -59,6 +60,10 @@ def dispatch(
         return _post_schedule(service, headers, body)
     if method == "GET" and path == "/v1/schedule":
         return _get_schedule(service, headers, query)
+    if method == "POST" and path == "/v1/export":
+        return _post_export(service, headers, body)
+    if method == "POST" and path == "/v1/import":
+        return _post_import(service, headers, body)
     if method == "POST" and path == "/v1/secrets":
         return _post_secret(service, headers, body)
     if method == "GET" and path == "/v1/secrets":
@@ -214,6 +219,44 @@ def _get_schedule(service: Service, headers: dict[str, str], query: dict[str, st
     if denied is not None:
         return denied
     return 200, {"enabled": service.assistant.schedule_enabled(query["account_id"])}
+
+
+def _post_export(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    account_id = body.get("account_id")
+    passphrase = body.get("passphrase")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    if not isinstance(passphrase, str) or not passphrase:
+        return 400, {"error": "passphrase is required"}
+    try:
+        blob = service.assistant.export_account(account_id, passphrase)
+    except ValueError:
+        return 400, {"error": "passphrase is required"}
+    return 200, {"export": blob}
+
+
+def _post_import(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    account_id = body.get("account_id")
+    passphrase = body.get("passphrase")
+    blob = body.get("export")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    if not isinstance(passphrase, str) or not passphrase or not isinstance(blob, str) or not blob:
+        return 400, {"error": "passphrase and export are required"}
+    try:
+        count = service.assistant.import_account(account_id, passphrase, blob)
+    except VaultAccessError as exc:
+        text = str(exc)
+        if passphrase in text:
+            text = "export rejected"
+        return 400, {"error": text}
+    return 200, {"imported": count}
 
 
 def _post_secret(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:

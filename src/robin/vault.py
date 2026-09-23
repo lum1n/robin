@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
+from base64 import urlsafe_b64encode
 from dataclasses import dataclass, field
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -68,6 +71,41 @@ class Vault:
             vault._tokens[(label, value)] = placeholder
         return vault
 
+    @classmethod
+    def from_dump(cls, payload: dict) -> Vault:
+        vault = cls(str(payload["account_id"]), str(payload["conversation_id"]))
+        values = {str(key): str(value) for key, value in dict(payload["values"]).items()}
+        vault._values = values
+        vault._counts = {str(label): int(count) for label, count in dict(payload["counts"]).items()}
+        for placeholder, value in values.items():
+            label = placeholder[1 : placeholder.rfind("_")]
+            vault._tokens[(label, value)] = placeholder
+        return vault
+
+
+def seal_export(payload: dict, passphrase: str) -> str:
+    if not passphrase:
+        raise ValueError("passphrase is required")
+    salt = secrets.token_bytes(16)
+    token = Fernet(_export_key(passphrase, salt)).encrypt(json.dumps(payload).encode())
+    return json.dumps({"body": token.decode(), "salt": salt.hex()})
+
+
+def open_export(blob: str, passphrase: str) -> dict:
+    try:
+        wrapper = json.loads(blob)
+        payload = json.loads(Fernet(_export_key(passphrase, bytes.fromhex(wrapper["salt"]))).decrypt(wrapper["body"].encode()))
+    except (KeyError, ValueError, json.JSONDecodeError, InvalidToken) as exc:
+        raise VaultAccessError("export rejected") from exc
+    if not isinstance(payload, dict):
+        raise VaultAccessError("export rejected")
+    return payload
+
+
+def _export_key(passphrase: str, salt: bytes) -> bytes:
+    derived = hashlib.scrypt(passphrase.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return urlsafe_b64encode(derived)
+
 
 class VaultStore:
     def __init__(self) -> None:
@@ -83,6 +121,9 @@ class VaultStore:
 
     def put(self, vault: Vault) -> None:
         self._vaults[(vault.account_id, vault.conversation_id)] = vault
+
+    def belonging(self, account_id: str) -> list[Vault]:
+        return [vault for vault in self._vaults.values() if vault.account_id == account_id]
 
 
 def new_key() -> bytes:

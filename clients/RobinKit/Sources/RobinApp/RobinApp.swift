@@ -17,6 +17,8 @@ final class ShellModel: ObservableObject {
     @Published var calendarUser = ""
     @Published var calendarPassword = ""
     @Published var scheduleOn = false
+    @Published var vaultPassphrase = ""
+    @Published var vaultExport = ""
     @Published var failure: String?
 
     private let shell: Shell
@@ -85,11 +87,36 @@ final class ShellModel: ObservableObject {
         }
     }
 
+    func exportVault() async {
+        let secret = vaultPassphrase
+        vaultPassphrase = ""
+        failure = nil
+        do {
+            vaultExport = try await shell.exportVault(passphrase: secret)
+            phase = await shell.phase
+        } catch let error as RobinFailure {
+            failure = error.message
+        } catch {
+            failure = "Could not reach Robin."
+        }
+    }
+
+    func importVault() async {
+        let secret = vaultPassphrase
+        let bundle = vaultExport
+        vaultPassphrase = ""
+        await perform {
+            try await self.shell.importVault(passphrase: secret, export: bundle)
+        }
+    }
+
     func leave() async {
         await shell.leave()
         draft = ""
         mailPassword = ""
         calendarPassword = ""
+        vaultPassphrase = ""
+        vaultExport = ""
         scheduleOn = false
         failure = nil
         phase = .signedOut
@@ -191,6 +218,14 @@ private struct ConversationForm: View {
             Toggle("Check mail and calendar", isOn: $model.scheduleOn)
             Button("Save schedule") {
                 Task { await model.saveSchedule() }
+            }
+            SecureField("Vault passphrase", text: $model.vaultPassphrase)
+            TextField("Vault export", text: $model.vaultExport)
+            Button("Export vault") {
+                Task { await model.exportVault() }
+            }
+            Button("Import vault") {
+                Task { await model.importVault() }
             }
             Button("Leave this instance") {
                 Task { await model.leave() }

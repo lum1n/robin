@@ -11,7 +11,7 @@ from robin.capability import Capability, Effect, Registry, render_context
 from robin.ner import Ner, UnavailableNer
 from robin.policy import Decision, Task, decide
 from robin.store import HouseholdStore
-from robin.vault import Vault, VaultStore
+from robin.vault import Vault, VaultAccessError, VaultStore, open_export, seal_export
 
 
 @dataclass
@@ -79,6 +79,34 @@ class Assistant:
     def remember(self, account_id: str, conversation_id: str, role: str, text: str) -> None:
         if self.store is not None:
             self.store.append_turn(account_id, conversation_id, role, text)
+
+    def export_account(self, account_id: str, passphrase: str) -> str:
+        if self.store is not None:
+            vaults = [vault.dump() for vault in self.store.load_vaults() if vault.account_id == account_id]
+        else:
+            vaults = [vault.dump() for vault in self.vaults.belonging(account_id)]
+        terms = self.vocabulary.get(account_id, ())
+        payload = {
+            "account_id": account_id,
+            "vaults": vaults,
+            "vocabulary": [{"label": term.label, "text": term.text} for term in terms],
+        }
+        return seal_export(payload, passphrase)
+
+    def import_account(self, account_id: str, passphrase: str, blob: str) -> int:
+        payload = open_export(blob, passphrase)
+        if payload.get("account_id") != account_id:
+            raise VaultAccessError("export belongs to another account")
+        incoming = [Vault.from_dump(item) for item in payload.get("vaults", [])]
+        if any(vault.account_id != account_id for vault in incoming):
+            raise VaultAccessError("export belongs to another account")
+        for vault in incoming:
+            self.vaults.put(vault)
+            if self.store is not None:
+                self.store.save_vault(vault)
+        terms = tuple(VocabularyTerm(str(item["text"]), str(item["label"])) for item in payload.get("vocabulary", []))
+        self.set_vocabulary(account_id, terms)
+        return len(incoming)
 
     def persist_vault(self, account_id: str, conversation_id: str) -> None:
         if self.store is not None:

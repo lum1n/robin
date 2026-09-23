@@ -75,6 +75,28 @@ public actor RobinClient {
         _ = try accepted(raw, status: 200)
     }
 
+    public func exportVault(passphrase: String) async throws -> String {
+        let body = try encode(ExportBody(accountID: accountID, passphrase: passphrase, export: nil))
+        let raw = try await transport.call(
+            url: try url(path: "/v1/export"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(ExportResult.self, from: accepted(raw, status: 200)).export
+    }
+
+    public func importVault(passphrase: String, export: String) async throws {
+        let body = try encode(ExportBody(accountID: accountID, passphrase: passphrase, export: export))
+        let raw = try await transport.call(
+            url: try url(path: "/v1/import"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        _ = try accepted(raw, status: 200)
+    }
+
     public func connections() async throws -> [String] {
         let raw = try await transport.call(
             url: try url(path: "/v1/secrets", query: ["account_id": accountID]),
@@ -223,6 +245,29 @@ private struct ScheduleBody: Encodable {
 
 private struct ScheduleState: Decodable {
     var enabled: Bool
+}
+
+private struct ExportBody: Encodable {
+    var accountID: String
+    var passphrase: String
+    var export: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case passphrase
+        case export
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(accountID, forKey: .accountID)
+        try container.encode(passphrase, forKey: .passphrase)
+        try container.encodeIfPresent(export, forKey: .export)
+    }
+}
+
+private struct ExportResult: Decodable {
+    var export: String
 }
 
 private struct SecretBody: Encodable {

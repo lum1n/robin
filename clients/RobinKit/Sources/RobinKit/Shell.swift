@@ -42,6 +42,14 @@ public actor Shell {
         try await current.connect(name: "calendar", secret: json(["password": password, "url": url, "user": user]))
     }
 
+    public func exportVault(passphrase: String) async throws -> String {
+        try await signedIn().exportVault(passphrase: passphrase)
+    }
+
+    public func importVault(passphrase: String, export: String) async throws {
+        try await signedIn().importVault(passphrase: passphrase, export: export)
+    }
+
     public func setSchedule(enabled: Bool) async throws {
         let current = try signedIn()
         try await current.setSchedule(enabled: enabled)

@@ -14,7 +14,7 @@ The VM starts from a pinned image, `nimul/robin:pinned`. `deploy/Dockerfile` bui
 
 Mailbox and other credentials are connected afterward, from the app to the private instance. They are not placed in the exe.dev create call. The exe.dev API token stays in the broker on the joint server. An operator places it once with `robin exe-token`, which encrypts it into the household store and deletes the file. The app cannot set it. The model never sees it. Support login on the VM stays off.
 
-The exe.dev URL is public, so Robin on the VM still requires that person's session. The joint server remembers the VM name and address. It does not receive a copy of the private vault. Nothing is synced across the joint assistant and a private instance unless that person later exports it.
+The exe.dev URL is public, so Robin on the VM still requires that person's session. The joint server remembers the VM name and address. It does not receive a copy of the private vault. A person can seal their own vault with a passphrase and import that bundle on another instance. The passphrase is not stored. Another account cannot import it. Nothing else is copied between the joint assistant and a private instance.
 
 Creating a VM spends money and starts a machine, so it waits for a confirm. Deleting one does too. `POST /v1/private` with `"delete": true` waits, then the joint server sends `rm robin-{account} --json` and forgets the address. The exe.dev token stays out of that command.
 
