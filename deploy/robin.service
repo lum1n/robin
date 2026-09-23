@@ -1,11 +1,11 @@
 [Unit]
 Description=Robin
-After=network-online.target
+After=network-online.target exe-setup.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=robin boot
+ExecStart=/usr/local/bin/robin boot
 Restart=on-failure
 NoNewPrivileges=true
 

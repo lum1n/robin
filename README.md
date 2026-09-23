@@ -20,6 +20,8 @@ Pass a `HouseholdStore` when constructing `Assistant` and the house server keeps
 
 `POST /v1/private` asks for a private exe.dev instance and does nothing until `"confirm": true`. The exe.dev token stays in the broker. `robin boot` is what the VM service starts: it enrolls with `POST /v1/enroll` when a token file is present, deletes that file, and then serves. `GET /v1/private` reports the address once the instance is ready.
 
+The private image is `deploy/Dockerfile`. It is based on exeuntu, installs this package, and leaves the Robin unit disabled until the setup script starts it. Build it with `docker build -t robin/exeuntu:pinned -f deploy/Dockerfile .` and publish that tag. The create call pulls `robin/exeuntu:pinned` and does not carry registry credentials.
+
 Details, including the threat model and private VMs, are in [docs/privacy.md](docs/privacy.md). Adding a capability is described in [docs/capabilities.md](docs/capabilities.md).
 
 ## Run the tests
