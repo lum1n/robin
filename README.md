@@ -12,6 +12,8 @@ This repository is the privacy core: detection, the account boundary, the model 
 
 The local model is the default. A cloud model runs only when the task sets `allow_cloud` and the redaction report is clean. A clean scan never upgrades a task by itself. Secrets, national IDs, and payment data are dropped and are not restored. Unresolved free text stays on the local model.
 
+`converse` is the turn. It shows the model that account's view, runs a tool the registry allows, and stops when the tool is external so the person can confirm. `ChatModel` posts to a local OpenAI-compatible server at `http://127.0.0.1:8080` unless you pass another address. The tests use a stand-in model and do not open a connection.
+
 Details, including the threat model and private VMs, are in [docs/privacy.md](docs/privacy.md). Adding a capability is described in [docs/capabilities.md](docs/capabilities.md).
 
 ## Run the tests

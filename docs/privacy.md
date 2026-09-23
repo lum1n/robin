@@ -53,6 +53,8 @@ The same airlock runs on the joint server and on a private VM.
 
 Fail closed. A critical value, or free text the local NER pass did not resolve, keeps the task on the local model. The gate is `policy.py`. It is not a second model.
 
+`converse` asks the model only after that decision. On the local route the model sees the account's text with secrets already removed. On the cloud route it sees placeholders. Tool results sent back to a cloud model are redacted again. A reply is restored for the person, and a secret in that reply is dropped. An external tool returns a confirmation and does not run. A tool the account cannot see is refused.
+
 ## What is critical
 
 Three classes:
