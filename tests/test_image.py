@@ -32,6 +32,7 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
     assert "/var/lib/robin/house.sqlite" in house
     assert "/etc/robin/store.key" in house
     assert "--host 0.0.0.0" in house
+    assert "--advertise-file /etc/robin/advertise.url" in house
     assert "0.0.0.0" not in unit
     assert "enroll.token" not in timer
     assert "OnUnitActiveSec=15min" in (ROOT / "deploy" / "robin-tick.timer").read_text()

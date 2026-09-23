@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from robin.__main__ import main
+from robin.__main__ import joint_url, main
 from robin.model import ModelTurn
 from robin.session import Assistant
 from robin.store import HouseholdStore
@@ -52,6 +52,23 @@ def test_redact_restore_and_decide(tmp_path: Path, capsys) -> None:
         )
         == 0
     )
+
+
+def test_the_house_url_comes_from_a_file_and_a_bad_one_is_refused(tmp_path: Path) -> None:
+    missing = joint_url("", str(tmp_path / "advertise.url"))
+    assert missing == ""
+    path = tmp_path / "advertise.url"
+    path.write_text("https://house.example\n")
+    assert joint_url("", str(path)) == "https://house.example"
+    assert joint_url("http://10.0.0.2:8787", str(path)) == "http://10.0.0.2:8787"
+    path.write_text("javascript:alert(1)")
+    try:
+        joint_url("", str(path))
+    except SystemExit as exc:
+        assert "javascript" not in str(exc)
+        assert str(exc) == "advertise url must be http or https"
+    else:
+        raise AssertionError("bad advertise url was accepted")
 
 
 def test_exe_token_is_stored_once_and_the_file_is_removed(tmp_path: Path, capsys) -> None:

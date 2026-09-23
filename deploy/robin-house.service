@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 StateDirectory=robin
-ExecStart=/usr/local/bin/robin boot --store /var/lib/robin/house.sqlite --key /etc/robin/store.key --host 0.0.0.0
+ExecStart=/usr/local/bin/robin boot --store /var/lib/robin/house.sqlite --key /etc/robin/store.key --host 0.0.0.0 --advertise-file /etc/robin/advertise.url
 Restart=on-failure
 NoNewPrivileges=true
 

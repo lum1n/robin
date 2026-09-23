@@ -54,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     boot_cmd.add_argument("--store")
     boot_cmd.add_argument("--key")
     boot_cmd.add_argument("--advertise", default="")
+    boot_cmd.add_argument("--advertise-file", default="")
     boot_cmd.add_argument("--host", default="127.0.0.1")
     boot_cmd.add_argument("--port", type=int, default=8787)
 
@@ -140,6 +141,21 @@ def _tick(args: argparse.Namespace) -> int:
     return 0
 
 
+def joint_url(advertise: str, advertise_file: str) -> str:
+    url = advertise
+    if not url and advertise_file:
+        path = Path(advertise_file)
+        if path.is_file():
+            url = path.read_text().strip()
+    if not url:
+        return ""
+    from robin.provision import _safe_url
+
+    if not _safe_url(url):
+        raise SystemExit("advertise url must be http or https")
+    return url
+
+
 def _boot(args: argparse.Namespace) -> int:
     from robin.capabilities.install import install
     from robin.enroll import Enrollment, enroll_on_boot, urllib_enroll_post
@@ -148,6 +164,7 @@ def _boot(args: argparse.Namespace) -> int:
     from robin.provision import urllib_exe_post
     from robin.store import HouseholdStore
 
+    advertised = joint_url(args.advertise, args.advertise_file)
     enroll_on_boot(args.token, args.joint, urllib_enroll_post)
     store = None
     if args.store:
@@ -161,8 +178,8 @@ def _boot(args: argparse.Namespace) -> int:
             assistant,
             ChatModel(),
             enrollment=Enrollment(store),
-            joint_url=args.advertise,
-            exe_post=urllib_exe_post if args.advertise else None,
+            joint_url=advertised,
+            exe_post=urllib_exe_post if advertised else None,
         ),
         host=args.host,
         port=args.port,

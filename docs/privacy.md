@@ -34,7 +34,7 @@ A person registers a password once, then logs in. The session token is returned 
 
 On the house server, `HouseholdStore` keeps accounts, threads, vaults, vocabulary, and the activity log. Thread text, vaults, vocabulary, and activity entries are encrypted with a key the process holds. A restart loads only that material. One account's threads and log are not readable as another account. The raw message is not stored in the clear.
 
-The house HTTP service is how the Mac and iPhone apps will send a message. A turn returns a reply or a confirmation. Confirming runs the external tool that was waiting. Thread, activity, and private-instance routes require that account's session. `serve` binds to the local machine unless the house unit says otherwise. `deploy/robin-house.service` listens on `0.0.0.0` so a Mac or iPhone on the house network can sign in. A session is still required. A pending confirmation is stored encrypted and is not visible to another account.
+The house HTTP service is how the Mac and iPhone apps will send a message. A turn returns a reply or a confirmation. Confirming runs the external tool that was waiting. Thread, activity, and private-instance routes require that account's session. `serve` binds to the local machine unless the house unit says otherwise. `deploy/robin-house.service` listens on `0.0.0.0` so a Mac or iPhone on the house network can sign in. A session is still required. The same unit reads `/etc/robin/advertise.url` and sends that address to a new private VM as the joint URL. A missing or invalid file does not invent one. A pending confirmation is stored encrypted and is not visible to another account.
 
 ## Trust boundary
 
