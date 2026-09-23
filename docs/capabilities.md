@@ -43,7 +43,7 @@ class Notes(Capability):
 
 Register it on an `Assistant`. The model loop asks the registry which tools this account may use. Adding the module does not require an edit to the airlock or to a handwritten prompt.
 
-Credentials go in the `Broker` (`assistant.broker.put`). Tool code may `reveal` them at execution time. The decide path does not.
+Credentials go in the `Broker` (`assistant.broker.put`). With a `HouseholdStore`, that write is encrypted and comes back after a restart. `POST /v1/secrets` is how a signed-in app connects `mailbox` or `calendar`. The response does not include the secret. Tool code may `reveal` them at execution time. The decide path does not.
 
 External tools return `{"status": "confirm"}` until `invoke(..., confirmed=True)`.
 

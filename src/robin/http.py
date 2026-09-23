@@ -55,6 +55,10 @@ def dispatch(
         return _post_message(service, headers, body)
     if method == "POST" and path == "/v1/enroll":
         return _post_enroll(service, body)
+    if method == "POST" and path == "/v1/secrets":
+        return _post_secret(service, headers, body)
+    if method == "GET" and path == "/v1/secrets":
+        return _get_secrets(service, headers, query)
     if method == "POST" and path == "/v1/private":
         return _post_private(service, headers, body)
     if method == "GET" and path == "/v1/private":
@@ -183,6 +187,32 @@ def _post_enroll(service: Service, body: dict[str, Any]) -> tuple[int, dict[str,
     except EnrollRejected:
         return 409, {"error": "token rejected"}
     return 200, {"account_id": ready["account_id"], "https_url": ready["https_url"], "ready": True}
+
+
+_CONNECTABLE = ("calendar", "mailbox")
+
+
+def _post_secret(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    account_id = body.get("account_id")
+    name = body.get("name")
+    value = body.get("value")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    if name not in _CONNECTABLE or not isinstance(value, str) or not value:
+        return 400, {"error": "name and value are required"}
+    service.assistant.broker.put(account_id, name, value)
+    return 200, {"name": name, "connected": True}
+
+
+def _get_secrets(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    denied = _require(service, headers, query.get("account_id"))
+    if denied is not None:
+        return denied
+    names = [name for name in service.assistant.broker.names(query["account_id"]) if name in _CONNECTABLE]
+    return 200, {"connected": names}
 
 
 def _post_private(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:

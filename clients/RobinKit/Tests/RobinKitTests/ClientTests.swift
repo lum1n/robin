@@ -76,6 +76,30 @@ struct ClientTests {
         #expect(calls[2].token == "sess-1")
     }
 
+    @Test func connectSendsTheSecretOnceAndDoesNotKeepIt() async throws {
+        let transport = ScriptedTransport(responses: [
+            RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"name":"mailbox","connected":true}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"connected":["mailbox"]}"#.utf8)),
+        ])
+        let client = RobinClient(
+            baseURL: URL(string: "http://127.0.0.1:8787")!,
+            accountID: "ada",
+            transport: transport
+        )
+        try await client.login(password: "correct-horse")
+        try await client.connect(name: "mailbox", secret: "mailbox-password-ada")
+        let connected = try await client.connections()
+        #expect(connected == ["mailbox"])
+        let calls = await transport.calls
+        let posted = String(decoding: calls[1].body ?? Data(), as: UTF8.self)
+        #expect(calls[1].token == "sess-1")
+        #expect(posted.contains("mailbox-password-ada"))
+        #expect(calls[2].url.absoluteString == "http://127.0.0.1:8787/v1/secrets?account_id=ada")
+        let listed = String(decoding: calls[2].body ?? Data(), as: UTF8.self)
+        #expect(!listed.contains("mailbox-password-ada"))
+    }
+
     @Test func aMessageBeforeLoginFailsLocally() async throws {
         let transport = ScriptedTransport(responses: [])
         let client = RobinClient(

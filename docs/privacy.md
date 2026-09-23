@@ -94,7 +94,7 @@ Tools declare an effect:
 
 Records coming back from a capability are untrusted. On the cloud path the model does not hold the raw values. On the local path it does hold task data, so external effects still wait for a confirm.
 
-Each tool call is appended to that account's activity log with secrets dropped. Another account cannot read the log.
+Each tool call is appended to that account's activity log with secrets dropped. Another account cannot read the log. Mailbox and calendar secrets live in the broker. With a household store they are encrypted and survive a restart. The app can connect them for the signed-in account. The response does not return the secret.
 
 ## Using the computer
 

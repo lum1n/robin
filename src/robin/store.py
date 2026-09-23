@@ -74,6 +74,16 @@ class HouseholdStore:
         self._db.execute("CREATE TABLE IF NOT EXISTS instances (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS passwords (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS secrets (
+                account_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                body BLOB NOT NULL,
+                PRIMARY KEY (account_id, name)
+            )
+            """
+        )
         self._db.commit()
 
     def close(self) -> None:
@@ -253,6 +263,21 @@ class HouseholdStore:
     def load_sessions(self) -> dict[str, str]:
         rows = self._db.execute("SELECT token_hash, body FROM sessions").fetchall()
         return {token_hash: json.loads(self._open(body))["account_id"] for token_hash, body in rows}
+
+    def save_secret(self, account_id: str, name: str, value: str) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO secrets (account_id, name, body) VALUES (?, ?, ?)
+            ON CONFLICT (account_id, name) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, name, self._seal(value)),
+        )
+        self._db.commit()
+
+    def load_secrets(self) -> list[tuple[str, str, str]]:
+        rows = self._db.execute("SELECT account_id, name, body FROM secrets").fetchall()
+        return [(account_id, name, self._open(body)) for account_id, name, body in rows]
 
     def delete_instance(self, account_id: str) -> None:
         self._db.execute("DELETE FROM instances WHERE account_id = ?", (account_id,))

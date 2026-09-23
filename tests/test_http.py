@@ -1,3 +1,5 @@
+import json
+
 from robin.airlock import VocabularyTerm
 from robin.capabilities.screen import Screen
 from robin.http import Service, dispatch
@@ -120,6 +122,53 @@ def test_cloud_opt_in_sends_placeholders_and_the_reply_restores_them(tmp_path) -
     assert payload["text"] == "hello Jane Doe"
     assert "Jane Doe" not in model.seen[0]
     assert "[PERSON_1]" in model.seen[0]
+
+
+def test_a_session_connects_a_mailbox_and_a_restart_keeps_the_secret(tmp_path) -> None:
+    path = tmp_path / "house.sqlite"
+    key = new_key()
+    assistant = Assistant(store=HouseholdStore(path, key))
+    service = Service(assistant, Scripted([]))
+    service.auth.register("ada", "ada-session-password")
+    service.auth.register("bea", "bea-session-password")
+    ada = {"authorization": f"Bearer {service.auth.login('ada', 'ada-session-password')}"}
+    bea = {"authorization": f"Bearer {service.auth.login('bea', 'bea-session-password')}"}
+    secret = "mailbox-password-ada"
+    stolen, _stolen_body = dispatch(
+        service,
+        "POST",
+        "/v1/secrets",
+        body={"account_id": "ada", "name": "mailbox", "value": secret},
+        headers=bea,
+    )
+    assert stolen == 401
+    status, body = dispatch(
+        service,
+        "POST",
+        "/v1/secrets",
+        body={"account_id": "ada", "name": "mailbox", "value": secret},
+        headers=ada,
+    )
+    assert status == 200
+    assert body == {"name": "mailbox", "connected": True}
+    assert secret not in json.dumps(body)
+    listed, listed_body = dispatch(service, "GET", "/v1/secrets", query={"account_id": "ada"}, headers=ada)
+    assert listed == 200
+    assert listed_body == {"connected": ["mailbox"]}
+    assert secret not in json.dumps(listed_body)
+    rejected, _rejected_body = dispatch(
+        service,
+        "POST",
+        "/v1/secrets",
+        body={"account_id": "ada", "name": "exe", "value": secret},
+        headers=ada,
+    )
+    assert rejected == 400
+    assistant.store.close()
+    assert secret.encode() not in path.read_bytes()
+    revived = Assistant(store=HouseholdStore(path, key))
+    assert revived.broker.reveal("ada", "mailbox") == secret
+    assert revived.broker.names("bea") == []
 
 
 def test_a_request_without_an_account_is_rejected(tmp_path) -> None:

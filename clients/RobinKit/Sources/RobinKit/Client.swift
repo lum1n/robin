@@ -43,6 +43,27 @@ public actor RobinClient {
         return try await postMessage(body)
     }
 
+    public func connect(name: String, secret: String) async throws {
+        let body = try encode(SecretBody(accountID: accountID, name: name, value: secret))
+        let raw = try await transport.call(
+            url: try url(path: "/v1/secrets"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        _ = try accepted(raw, status: 200)
+    }
+
+    public func connections() async throws -> [String] {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/secrets", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(SecretList.self, from: accepted(raw, status: 200)).connected
+    }
+
     public func threads() async throws -> [String] {
         let raw = try await transport.call(
             url: try url(path: "/v1/threads", query: ["account_id": accountID]),
@@ -167,6 +188,22 @@ private struct MessageBody: Encodable {
 
 private struct SessionBody: Decodable {
     var token: String
+}
+
+private struct SecretBody: Encodable {
+    var accountID: String
+    var name: String
+    var value: String
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case name
+        case value
+    }
+}
+
+private struct SecretList: Decodable {
+    var connected: [String]
 }
 
 private struct ThreadList: Decodable {

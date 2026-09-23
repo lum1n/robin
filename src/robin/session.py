@@ -30,12 +30,18 @@ class Broker:
     """Credentials the model is never given. Execution code is the only reader."""
 
     _secrets: dict[tuple[str, str], str] = field(default_factory=dict)
+    store: HouseholdStore | None = None
 
     def put(self, account_id: str, name: str, value: str) -> None:
         self._secrets[(account_id, name)] = value
+        if self.store is not None:
+            self.store.save_secret(account_id, name, value)
 
     def reveal(self, account_id: str, name: str) -> str:
         return self._secrets[(account_id, name)]
+
+    def names(self, account_id: str) -> list[str]:
+        return sorted(name for owner, name in self._secrets if owner == account_id)
 
 
 class Assistant:
@@ -44,7 +50,7 @@ class Assistant:
         self.ner = ner or UnavailableNer()
         self.vaults = VaultStore()
         self.activity = ActivityLog()
-        self.broker = Broker()
+        self.broker = Broker(store=store)
         self.vocabulary: dict[str, tuple[VocabularyTerm, ...]] = {}
         self.store = store
         self._pending: dict[tuple[str, str], dict] = {}
@@ -169,3 +175,5 @@ class Assistant:
                 self.activity.append(account_id, entry)
         for vault in self.store.load_vaults():
             self.vaults.put(vault)
+        for account_id, name, value in self.store.load_secrets():
+            self.broker._secrets[(account_id, name)] = value
