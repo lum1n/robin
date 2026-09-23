@@ -1,6 +1,10 @@
 import RobinKit
 import SwiftUI
 
+#if os(macOS)
+import AppKit
+#endif
+
 @MainActor
 final class ShellModel: ObservableObject {
     @Published private(set) var phase: ShellPhase = .signedOut
@@ -154,12 +158,13 @@ private struct SignInForm: View {
     @ObservedObject var model: ShellModel
 
     var body: some View {
-        Form {
+        RobinFields {
             TextField("Instance", text: $model.instance)
                 .robinField()
             TextField("Account", text: $model.accountID)
                 .robinField()
             SecureField("Password", text: $model.password)
+                .robinField()
             if let failure = model.failure {
                 Text(failure)
             }
@@ -175,7 +180,7 @@ private struct ConversationForm: View {
     @ObservedObject var model: ShellModel
 
     var body: some View {
-        Form {
+        RobinFields {
             switch model.phase {
             case .ready(let threads, let reply):
                 Text(threads.isEmpty ? "No threads yet" : threads.joined(separator: ", "))
@@ -194,6 +199,7 @@ private struct ConversationForm: View {
             TextField("Thread", text: $model.conversationID)
                 .robinField()
             TextField("Message", text: $model.draft)
+                .robinField()
             Button("Send") {
                 Task { await model.send() }
             }
@@ -204,6 +210,7 @@ private struct ConversationForm: View {
             TextField("Mail user", text: $model.mailUser)
                 .robinField()
             SecureField("Mail password", text: $model.mailPassword)
+                .robinField()
             Button("Connect mail") {
                 Task { await model.connectMail() }
             }
@@ -212,6 +219,7 @@ private struct ConversationForm: View {
             TextField("Calendar user", text: $model.calendarUser)
                 .robinField()
             SecureField("Calendar password", text: $model.calendarPassword)
+                .robinField()
             Button("Connect calendar") {
                 Task { await model.connectCalendar() }
             }
@@ -220,7 +228,9 @@ private struct ConversationForm: View {
                 Task { await model.saveSchedule() }
             }
             SecureField("Vault passphrase", text: $model.vaultPassphrase)
+                .robinField()
             TextField("Vault export", text: $model.vaultExport)
+                .robinField()
             Button("Export vault") {
                 Task { await model.exportVault() }
             }
@@ -238,21 +248,62 @@ private struct ConversationForm: View {
     }
 }
 
+private struct RobinFields<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        #if os(macOS)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                content()
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        #else
+        Form {
+            content()
+        }
+        #endif
+    }
+}
+
 private extension View {
     func robinField() -> some View {
         #if os(iOS)
         self.textInputAutocapitalization(.never).autocorrectionDisabled()
         #else
-        self.autocorrectionDisabled()
+        self.textFieldStyle(.roundedBorder)
         #endif
     }
 }
 
+#if os(macOS)
+private final class RobinActivation: NSObject, NSApplicationDelegate {
+    nonisolated func applicationDidFinishLaunching(_ notification: Notification) {
+        Task { @MainActor in
+            NSApplication.shared.setActivationPolicy(.regular)
+            NSApplication.shared.activate()
+            for window in NSApplication.shared.windows {
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+    }
+}
+#endif
+
 @main
 struct RobinApp: App {
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(RobinActivation.self) private var activation
+    #endif
+
     var body: some Scene {
         WindowGroup {
             RobinRootView()
         }
+        #if os(macOS)
+        .defaultSize(width: 480, height: 720)
+        #endif
     }
 }
