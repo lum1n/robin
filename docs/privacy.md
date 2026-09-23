@@ -84,6 +84,8 @@ A Norwegian GLiNER checkpoint can plug into the same `Ner` interface later. Chec
 
 A capability is trusted code on the server. It sees raw records for the accounts that enabled it. It does not call a model provider and it does not redact on its own. The core runs every tool argument and every tool result through the airlock.
 
+The mail connector reads that account's inbox over IMAP and sends over SMTP. The host, user, and password stay in the broker. The tools do not accept them, and a login failure does not repeat the password.
+
 Tools declare an effect:
 
 - `read` looks

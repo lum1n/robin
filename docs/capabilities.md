@@ -1,6 +1,8 @@
 # Capabilities
 
-The core is the airlock, accounts, the model route, and a registry. A new way for the assistant to help is a new module. Mail, calendar, groceries, and the screen fixture are examples. They are not imported by the core.
+The core is the airlock, accounts, the model route, and a registry. A new way for the assistant to help is a new module. Mail is the IMAP and SMTP connector. Calendar, groceries, and the screen fixture are examples. They are not imported by the core.
+
+The mail account secret is stored with `broker.put(account_id, "mailbox", mailbox_secret(...))`. The JSON holds `imap_host`, `smtp_host`, `user`, and `password`. `list_messages` reads the newest messages. `send_message` is external, so it waits for a confirm. A missing or unreadable secret yields no messages and does not connect. Tests pass `open_imap` and `open_smtp`.
 
 ## Declare one
 

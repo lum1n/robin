@@ -1,1 +1,1 @@
-"""Example capabilities. The core does not import this package."""
+"""Capabilities. The core does not import this package."""

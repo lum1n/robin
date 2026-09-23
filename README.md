@@ -4,7 +4,7 @@ Robin is a secure, privacy-oriented, extendable assistant for a household.
 
 The joint assistant runs on the in-house Linux server. Each family member has an account. Someone who wants a private assistant gets their own instance on an [exe.dev](https://exe.dev/docs/api) VM, created from the joint server with no manual setup. Native macOS and iOS apps are clients. They do not embed this runtime, and they do not call a model provider themselves.
 
-Mail, calendar, and groceries are example capabilities. Using the computer is another capability. The core does not know those domains.
+Mail is an IMAP and SMTP connector. The host, user, and password stay in the broker, and the model tools do not take them. Calendar, groceries, and the screen are still examples. The core does not know those domains.
 
 This repository is the privacy core: detection, the account boundary, the model route, and the capability protocol. It is not the apps, and it does not drive a live browser yet.
 
@@ -27,7 +27,7 @@ uv sync --group dev
 uv run pytest
 ```
 
-The tests use fixtures. They do not open a network connection.
+The tests stand in for IMAP, SMTP, and the model. They do not open a network connection.
 
 ## Inspect one string
 
