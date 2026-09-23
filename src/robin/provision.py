@@ -50,12 +50,13 @@ def setup_script(enroll_token: str, joint_url: str) -> str:
 def exe_command(account_id: str, enroll_token: str, joint_url: str) -> str:
     name = account_slug(account_id)
     script = setup_script(enroll_token, joint_url).replace("\\", "\\\\").replace("'", "'\\''").replace("\n", "\\n")
-    return (
+    created = (
         "new --json --no-email "
         f"--name=robin-{name} "
         f"--image={PINNED_IMAGE} "
         f"--setup-script='{script}'"
     )
+    return f"out=$({created}) && share set-public robin-{name} >/dev/null 2>&1 && printf '%s' \"$out\""
 
 
 def plan_private_instance(

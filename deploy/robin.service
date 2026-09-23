@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/robin boot
+ExecStart=/usr/local/bin/robin boot --host 127.0.0.1 --port 8000
 Restart=on-failure
 NoNewPrivileges=true
 

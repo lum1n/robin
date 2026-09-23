@@ -6,6 +6,7 @@ LABEL exe.dev/install-shelley=false
 LABEL exe.dev/login-user=exedev
 
 USER root
+EXPOSE 8000
 WORKDIR /opt/robin
 
 COPY pyproject.toml uv.lock LICENSE README.md ./

@@ -19,6 +19,7 @@ def test_create_is_held_until_confirm_and_the_call_carries_no_secrets() -> None:
     assert "--setup-script" in planned.recorded
     assert "--no-email" in planned.recorded
     assert "--json" in planned.recorded
+    assert "share set-public robin-ada" in planned.recorded
     assert ENROLL in planned.recorded
     assert JOINT in planned.recorded
     assert "\\n" in planned.recorded

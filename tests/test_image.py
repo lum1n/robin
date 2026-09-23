@@ -22,7 +22,8 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
     assert "enroll.token" not in dockerfile
     assert "COPY src" in dockerfile
 
-    assert "ExecStart=/usr/local/bin/robin boot" in unit
+    assert "EXPOSE 8000" in dockerfile
+    assert "ExecStart=/usr/local/bin/robin boot --host 127.0.0.1 --port 8000" in unit
     assert "After=network-online.target exe-setup.service" in unit
 
     timer = (ROOT / "deploy" / "robin-tick.service").read_text()
@@ -32,6 +33,7 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
     assert "/var/lib/robin/house.sqlite" in house
     assert "/etc/robin/store.key" in house
     assert "--host 0.0.0.0" in house
+    assert "--port 8000" not in house
     assert "--advertise-file /etc/robin/advertise.url" in house
     assert "0.0.0.0" not in unit
     assert "enroll.token" not in timer

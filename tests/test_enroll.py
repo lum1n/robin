@@ -64,6 +64,7 @@ def test_create_waits_for_confirm_and_enroll_burns_the_token(tmp_path) -> None:
     assert API_TOKEN not in command
     assert MAILBOX not in command
     assert PRIVATE_SECRET not in command
+    assert "share set-public robin-ada" in command
     assert TOKEN in command
     assert JOINT in command
     assert "\n" not in command
