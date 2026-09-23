@@ -22,6 +22,8 @@ Pass a `HouseholdStore` when constructing `Assistant` and the house server keeps
 
 The private image is `deploy/Dockerfile`. It is based on exeuntu, installs this package, and leaves the Robin unit disabled until the setup script starts it. Build it with `docker build -t robin/exeuntu:pinned -f deploy/Dockerfile .` and publish that tag. The create call pulls `robin/exeuntu:pinned` and does not carry registry credentials.
 
+`clients/RobinKit` is the library the Mac and iPhone shells share. It signs in to one instance for one account and sends that session on later calls. It does not redact, and it does not call a model provider. The screen apps are still to come.
+
 Details, including the threat model and private VMs, are in [docs/privacy.md](docs/privacy.md). Adding a capability is described in [docs/capabilities.md](docs/capabilities.md).
 
 ## Run the tests

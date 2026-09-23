@@ -1,0 +1,190 @@
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+/// Talks to one Robin instance for one account. Text is sent as the person typed it. A model provider is not a destination.
+public actor RobinClient {
+    private let baseURL: URL
+    private let accountID: String
+    private let transport: any RobinTransport
+    private var token: String?
+
+    public init(baseURL: URL, accountID: String, transport: any RobinTransport = HTTPTransport()) {
+        self.baseURL = baseURL
+        self.accountID = accountID
+        self.transport = transport
+    }
+
+    public func register(password: String) async throws {
+        let body = try encode(AccountBody(accountID: accountID, password: password))
+        let raw = try await transport.call(url: try url(path: "/v1/accounts"), method: "POST", body: body, token: nil)
+        _ = try accepted(raw, status: 201)
+    }
+
+    public func login(password: String) async throws {
+        let body = try encode(AccountBody(accountID: accountID, password: password))
+        let raw = try await transport.call(url: try url(path: "/v1/sessions"), method: "POST", body: body, token: nil)
+        let session = try JSONDecoder().decode(SessionBody.self, from: accepted(raw, status: 200))
+        token = session.token
+    }
+
+    public func send(conversationID: String, text: String, allowCloud: Bool = false) async throws -> Reply {
+        let body = try encode(
+            MessageBody(accountID: accountID, conversationID: conversationID, text: text, confirm: nil, allowCloud: allowCloud)
+        )
+        return try await postMessage(body)
+    }
+
+    public func confirm(conversationID: String) async throws -> Reply {
+        let body = try encode(
+            MessageBody(accountID: accountID, conversationID: conversationID, text: nil, confirm: true, allowCloud: nil)
+        )
+        return try await postMessage(body)
+    }
+
+    public func threads() async throws -> [String] {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/threads", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(ThreadList.self, from: accepted(raw, status: 200)).threads
+    }
+
+    private func postMessage(_ body: Data) async throws -> Reply {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/messages"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(Reply.self, from: accepted(raw, status: 200))
+    }
+
+    private func url(path: String, query: [String: String] = [:]) throws -> URL {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw RobinFailure(status: 0, message: "bad instance url")
+        }
+        components.path = path
+        if !query.isEmpty {
+            components.queryItems = query.keys.sorted().map { URLQueryItem(name: $0, value: query[$0]) }
+        }
+        guard let built = components.url else {
+            throw RobinFailure(status: 0, message: "bad instance url")
+        }
+        return built
+    }
+
+    private func sessionToken() throws -> String {
+        guard let token else {
+            throw RobinFailure(status: 401, message: "login required")
+        }
+        return token
+    }
+}
+
+public struct Reply: Decodable, Sendable, Equatable {
+    public let status: String
+    public let text: String
+    public let route: String
+    public let tool: String?
+}
+
+public struct RobinFailure: Error, Equatable, Sendable {
+    public let status: Int
+    public let message: String
+}
+
+public struct RobinRaw: Sendable {
+    public var status: Int
+    public var data: Data
+
+    public init(status: Int, data: Data) {
+        self.status = status
+        self.data = data
+    }
+}
+
+public protocol RobinTransport: Sendable {
+    func call(url: URL, method: String, body: Data?, token: String?) async throws -> RobinRaw
+}
+
+public struct HTTPTransport: RobinTransport {
+    public init() {}
+
+    public func call(url: URL, method: String, body: Data?, token: String?) async throws -> RobinRaw {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        return RobinRaw(status: status, data: data)
+    }
+}
+
+private struct AccountBody: Encodable {
+    var accountID: String
+    var password: String
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case password
+    }
+}
+
+private struct MessageBody: Encodable {
+    var accountID: String
+    var conversationID: String
+    var text: String?
+    var confirm: Bool?
+    var allowCloud: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case conversationID = "conversation_id"
+        case text
+        case confirm
+        case allowCloud = "allow_cloud"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(accountID, forKey: .accountID)
+        try container.encode(conversationID, forKey: .conversationID)
+        try container.encodeIfPresent(text, forKey: .text)
+        try container.encodeIfPresent(confirm, forKey: .confirm)
+        try container.encodeIfPresent(allowCloud, forKey: .allowCloud)
+    }
+}
+
+private struct SessionBody: Decodable {
+    var token: String
+}
+
+private struct ThreadList: Decodable {
+    var threads: [String]
+}
+
+private struct ErrorBody: Decodable {
+    var error: String
+}
+
+private func encode(_ value: some Encodable) throws -> Data {
+    try JSONEncoder().encode(value)
+}
+
+private func accepted(_ raw: RobinRaw, status: Int) throws -> Data {
+    guard raw.status == status else {
+        let message = (try? JSONDecoder().decode(ErrorBody.self, from: raw.data).error) ?? "request failed"
+        throw RobinFailure(status: raw.status, message: message)
+    }
+    return raw.data
+}
