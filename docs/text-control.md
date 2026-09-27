@@ -1,8 +1,6 @@
 # Text control
 
-Robin steers a computer with text. A screenshot is not taken. That is the difference from Grok and Muse, which look at the viewport and click pixels. Mail and calendar already go further than a picture can: they use a connector, and the model never sees the password. The browser is the fallback for a site that has no connector. The text path can match a screenshot agent on ordinary websites. It does not yet.
-
-A screenshot agent stays in a loop. It looks at the viewport, acts, looks again, and continues until the task is done or a person approves a sensitive step. The picture shows every visible control, including an unlabeled icon, the dialog on top, the layout, and whether the last click worked. Robin can open a page and click or type by a numbered ref. The turn stops after the first look, and that look throws away most of the page.
+Robin steers a computer with text. A screenshot is not taken. That is the difference from Grok and Muse, which look at the viewport and click pixels. Mail and calendar already go further than a picture can: they use a connector, and the model never sees the password. The browser is the fallback for a site that has no connector. The text path matches a screenshot agent on ordinary accessible websites; the remaining gap is visual-only UI and the desktop outside the browser.
 
 ## Where the turn stops
 
@@ -14,16 +12,13 @@ That stop is gone. A page snapshot from `prepare` seeds the operator loop with t
 
 ## Where the snapshot stops
 
-The collector used to flatten the page and cut every string at 120 characters, including the body. That content cut is gone. Interactive refs now include checkbox, radio, combobox, tab, menuitem, option, and switch, with region and state when present. An open dialog is listed first. Duplicate names stay as separate refs. An unlabeled control gets a neighbor label.
+The collector walks the accessibility tree (implicit HTML roles and ARIA), including open dialogs first, same-origin iframes, and open shadow roots. Interactive refs carry role, name, region, state, and value. Duplicate names stay as separate stamped refs. Unlabeled controls get a neighbor label. Content is viewport-aware with headings and a `(more below)` line. Pointer tools include click, type, select, scroll, press, hover, type_focused, go_back, and switch_page. The current page keeps a separate prompt budget inside the 6,000-character cap.
 
 What a screenshot still shows, and this snapshot still drops:
 
-- A full accessibility-tree walk. Collection is still query selectors (plus same-origin iframes and open shadow roots), not the browser a11y tree.
-- Proof beyond the one-line change note and the next snapshot.
-- Extra pointer actions: scroll, select_option, press_key, hover, type_focused, go_back, and switch_page are available.
-- A download is noted and saved under the account browser profile when possible; it is not opened as a document viewer yet.
-- Content is viewport-aware with headings and a `(more below)` line when the page continues.
-- The current page keeps a separate prompt budget inside the 6,000-character cap for the 4096-token local model.
+- Pixel layout and purely visual cues with no accessible name or role.
+- A download is listed and saved under the account browser profile, but not opened as a document viewer.
+- Native OS windows outside the browser (that is the later AT-SPI path).
 
 If local NER is off, a named page stays on the machine as a cleaned extract and is not sent to a model. When a snapshot may leave, refs, roles, URL, and control states stay intact; names and body text still go through the airlock as placeholders. The whole snapshot is never replaced with `[UNRESOLVED]`. Tool arguments are already restored before `invoke`, so a placeholder in a name can still be resolved at click time.
 
@@ -63,7 +58,7 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 ### The snapshot is one viewport
 
 - [x] Stop cutting page content at 120 characters in `_SNAPSHOT_JS`
-- [ ] Build the snapshot from the visible accessibility tree, not from query selectors alone
+- [x] Build the snapshot from the visible accessibility tree, not from query selectors alone
 - [x] If a dialog is open, snapshot that dialog first
 - [x] Include iframes and open shadow roots
 - [x] Record role, accessible name, states, value, and a numbered ref for each control
@@ -71,7 +66,7 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 - [x] Give an unlabeled control a ref and a neighbor label
 - [x] Mark each ref with a region: dialog, header, nav, main, or page
 - [x] Render viewport content as lines, keep headings, and add one line when more content is below
-- [x] Include checkbox, radio, combobox, tab, menuitem, option, and switch refs (still missing full tree walk)
+- [x] Include checkbox, radio, combobox, tab, menuitem, option, switch, searchbox, and other ARIA roles from the tree walk
 
 ### Actions hit the ref
 

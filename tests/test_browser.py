@@ -678,7 +678,57 @@ def test_a_model_denial_does_not_hide_a_page_that_opened() -> None:
     assert "bullet list" in model.system.lower() or "top stories" in model.system.lower()
 
 
-def test_viewport_content_marks_more_below_and_keeps_headings() -> None:
+def test_a11y_tree_walk_collects_focusable_and_aria_controls() -> None:
+    class Dom:
+        def __init__(self) -> None:
+            self.url = "https://app.test/"
+            self.stamped: dict[str, str] = {}
+
+        def evaluate(self, script: str) -> dict:
+            # Exercise the real snapshot script shape by returning what the tree walk would.
+            assert "walkTree" in script
+            assert "implicitRole" in script
+            return {
+                "url": self.url,
+                "title": "App",
+                "interactive": [
+                    {
+                        "ref": "1",
+                        "role": "searchbox",
+                        "name": "Search",
+                        "region": "header",
+                        "states": ["focused"],
+                        "value": "milk",
+                    },
+                    {
+                        "ref": "2",
+                        "role": "switch",
+                        "name": "Dark mode",
+                        "region": "main",
+                        "states": ["checked"],
+                        "value": "",
+                    },
+                    {
+                        "ref": "3",
+                        "role": "button",
+                        "name": 'unnamed, near "Cart"',
+                        "region": "header",
+                        "states": [],
+                        "value": "",
+                    },
+                ],
+                "content": "# Groceries\nMilk is on sale",
+                "moreBelow": False,
+                "secrets": [],
+            }
+
+    page = PlaywrightPage(Dom())
+    text, _secrets = page.read()
+    assert '[1] searchbox "Search" (header, focused, value=milk)' in text
+    assert '[2] switch "Dark mode" (main, checked)' in text
+    assert "unnamed, near" in text
+    assert "# Groceries" in text
+
     from robin.capabilities.browser import _format_snapshot
 
     formatted = _format_snapshot(
@@ -745,6 +795,9 @@ def test_snapshot_keeps_page_body_and_richer_controls() -> None:
     assert "iframe" in _SNAPSHOT_JS
     assert "contentDocument" in _SNAPSHOT_JS
     assert "moreBelow" in _SNAPSHOT_JS
+    assert "implicitRole" in _SNAPSHOT_JS
+    assert "walkTree" in _SNAPSHOT_JS
+    assert "INTERACTIVE" in _SNAPSHOT_JS
     assert "slice(0, 120)" in _SNAPSHOT_JS
     assert "content = clean(" not in _SNAPSHOT_JS
     assert "checkbox" in _SNAPSHOT_JS

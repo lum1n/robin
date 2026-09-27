@@ -1333,13 +1333,58 @@ _REF_LINE = re.compile(
 
 _SNAPSHOT_JS = """() => {
   const cleanLabel = (value) => String(value || "").replace(/\\s+/g, " ").trim().slice(0, 120);
+  const INTERACTIVE = new Set([
+    "link", "button", "textbox", "searchbox", "combobox", "listbox", "option",
+    "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
+    "slider", "spinbutton", "treeitem", "tabpanel", "menu", "menubar", "toolbar",
+  ]);
+  const SKIP_ROLE = new Set(["presentation", "none", "generic", "Inline", "paragraph", "text"]);
+  const implicitRole = (node) => {
+    const tag = String(node.tagName || "").toLowerCase();
+    const type = String(node.getAttribute("type") || "text").toLowerCase();
+    if (tag === "a" && node.hasAttribute("href")) return "link";
+    if (tag === "button" || tag === "summary") return "button";
+    if (tag === "input") {
+      if (type === "submit" || type === "button" || type === "reset" || type === "image") return "button";
+      if (type === "checkbox") return "checkbox";
+      if (type === "radio") return "radio";
+      if (type === "range") return "slider";
+      if (type === "number") return "spinbutton";
+      if (type === "search") return "searchbox";
+      if (type === "hidden" || type === "file" || type === "password") return "";
+      return "textbox";
+    }
+    if (tag === "textarea") return "textbox";
+    if (tag === "select") return node.multiple ? "listbox" : "combobox";
+    if (tag === "option") return "option";
+    if (tag === "progress") return "progressbar";
+    if (tag === "meter") return "meter";
+    if (tag === "dialog") return "dialog";
+    if (tag === "nav") return "navigation";
+    if (tag === "main") return "main";
+    if (tag === "header") return "banner";
+    if (tag === "footer") return "contentinfo";
+    if (tag === "aside") return "complementary";
+    if (tag === "form") return "form";
+    if (tag === "img") return "img";
+    if (tag === "h1" || tag === "h2" || tag === "h3" || tag === "h4" || tag === "h5" || tag === "h6") return "heading";
+    if (tag === "li") return "listitem";
+    if (node.isContentEditable) return "textbox";
+    return "";
+  };
+  const roleOf = (node) => {
+    const explicit = cleanLabel(node.getAttribute("role") || "").toLowerCase();
+    if (explicit) return explicit;
+    return implicitRole(node);
+  };
   const visible = (node) => {
     if (!(node instanceof Element)) return false;
+    if (node.getAttribute("aria-hidden") === "true") return false;
     try {
       const style = window.getComputedStyle(node);
       if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
       const rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
+      return rect.width > 0 || rect.height > 0 || node === document.activeElement;
     } catch (err) {
       return true;
     }
@@ -1350,6 +1395,27 @@ _SNAPSHOT_JS = """() => {
     if (node.closest("nav, [role='navigation']")) return "nav";
     if (node.closest("main, article, [role='main']")) return "main";
     return "page";
+  };
+  const labeledBy = (node) => {
+    const ids = String(node.getAttribute("aria-labelledby") || "").trim();
+    if (!ids) return "";
+    const parts = [];
+    for (const id of ids.split(/\\s+/)) {
+      const el = (node.ownerDocument || document).getElementById(id);
+      if (el) parts.push(cleanLabel(el.innerText || el.textContent || ""));
+    }
+    return cleanLabel(parts.filter(Boolean).join(" "));
+  };
+  const associatedLabel = (node) => {
+    if (node.id) {
+      try {
+        const label = (node.ownerDocument || document).querySelector('label[for="' + CSS.escape(node.id) + '"]');
+        if (label) return cleanLabel(label.innerText || label.textContent || "");
+      } catch (err) {}
+    }
+    const parent = node.closest("label");
+    if (parent) return cleanLabel(parent.innerText || parent.textContent || "");
+    return "";
   };
   const neighbor = (node) => {
     const prev = node.previousElementSibling;
@@ -1364,10 +1430,22 @@ _SNAPSHOT_JS = """() => {
     }
     return "";
   };
-  const labelOf = (node, fallbacks) => {
-    for (const value of fallbacks) {
+  const nameOf = (node, role) => {
+    const from = [
+      node.getAttribute("aria-label"),
+      labeledBy(node),
+      associatedLabel(node),
+      node.getAttribute("placeholder"),
+      node.getAttribute("title"),
+      node.getAttribute("alt"),
+      node.value && (role === "button" || role === "link") ? node.value : "",
+      role === "textbox" || role === "searchbox" || role === "combobox" ? "" : (node.innerText || node.textContent || ""),
+      node.getAttribute("name"),
+      node.id,
+    ];
+    for (const value of from) {
       const label = cleanLabel(value);
-      if (label) return label;
+      if (label) return label.slice(0, 120);
     }
     const near = neighbor(node);
     return near ? 'unnamed, near "' + near.replace(/"/g, "'") + '"' : "unnamed";
@@ -1376,21 +1454,40 @@ _SNAPSHOT_JS = """() => {
     const states = [];
     if (node.disabled || node.getAttribute("aria-disabled") === "true") states.push("disabled");
     if (node.checked || node.getAttribute("aria-checked") === "true") states.push("checked");
+    if (node.getAttribute("aria-checked") === "mixed") states.push("mixed");
     if (node.getAttribute("aria-expanded") === "true") states.push("expanded");
+    if (node.getAttribute("aria-expanded") === "false") states.push("collapsed");
     if (node.getAttribute("aria-selected") === "true" || node.selected) states.push("selected");
+    if (node.getAttribute("aria-pressed") === "true") states.push("pressed");
     if (node.getAttribute("aria-invalid") === "true") states.push("invalid");
+    if (node.getAttribute("aria-current")) states.push("current");
+    if (document.activeElement === node) states.push("focused");
     return states;
+  };
+  const valueOf = (node, role) => {
+    if (role === "textbox" || role === "searchbox" || role === "spinbutton" || role === "slider") {
+      return cleanLabel(node.value || node.getAttribute("aria-valuetext") || node.getAttribute("aria-valuenow") || "");
+    }
+    if (role === "combobox" || role === "listbox") {
+      if (node.selectedOptions && node.selectedOptions[0]) return cleanLabel(node.selectedOptions[0].text);
+      return cleanLabel(node.value || "");
+    }
+    return "";
   };
   const interactive = [];
   let nextRef = 1;
   const clearStamps = (root) => {
+    if (!root || !root.querySelectorAll) return;
     for (const node of root.querySelectorAll("[data-robin-ref]")) {
       node.removeAttribute("data-robin-ref");
     }
   };
-  const add = (node, role, name, value) => {
-    if (!visible(node) || interactive.length >= 80) return;
-    if (node.getAttribute && node.getAttribute("data-robin-ref")) return;
+  const add = (node, role) => {
+    if (!(node instanceof Element) || interactive.length >= 80) return;
+    if (!INTERACTIVE.has(role) && !(node.tabIndex >= 0 && role && !SKIP_ROLE.has(role))) return;
+    if (!visible(node)) return;
+    if (node.getAttribute("data-robin-ref")) return;
+    if (role === "textbox" && String(node.getAttribute("type") || "").toLowerCase() === "password") return;
     const ref = String(nextRef++);
     try {
       node.setAttribute("data-robin-ref", ref);
@@ -1398,87 +1495,38 @@ _SNAPSHOT_JS = """() => {
     interactive.push({
       ref,
       role,
-      name: cleanLabel(name) || "unnamed",
+      name: nameOf(node, role),
       region: regionOf(node),
       states: statesOf(node),
-      value: cleanLabel(value || ""),
+      value: valueOf(node, role),
     });
   };
-  const collectIn = (scope) => {
-    for (const node of scope.querySelectorAll("a[href]")) {
-      add(node, "link", labelOf(node, [node.innerText, node.getAttribute("aria-label"), node.getAttribute("title")]));
-    }
-    for (const node of scope.querySelectorAll(
-      "button, [role='button'], input[type='submit'], input[type='button'], summary"
-    )) {
-      add(
-        node,
-        "button",
-        labelOf(node, [node.innerText, node.value, node.getAttribute("aria-label"), node.getAttribute("title")])
-      );
-    }
-    for (const node of scope.querySelectorAll(
-      "input:not([type='hidden']):not([type='password']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio']):not([type='file']), textarea, [role='textbox']"
-    )) {
-      add(
-        node,
-        "textbox",
-        labelOf(node, [
-          node.getAttribute("aria-label"),
-          node.getAttribute("placeholder"),
-          node.getAttribute("name"),
-          node.id,
-        ]),
-        node.value
-      );
-    }
-    for (const node of scope.querySelectorAll("input[type='checkbox'], [role='checkbox']")) {
-      add(
-        node,
-        "checkbox",
-        labelOf(node, [node.getAttribute("aria-label"), node.getAttribute("name"), node.id, node.value])
-      );
-    }
-    for (const node of scope.querySelectorAll("input[type='radio'], [role='radio']")) {
-      add(
-        node,
-        "radio",
-        labelOf(node, [node.getAttribute("aria-label"), node.getAttribute("name"), node.id, node.value])
-      );
-    }
-    for (const node of scope.querySelectorAll("select, [role='combobox'], [role='listbox']")) {
-      const selected = node.selectedOptions && node.selectedOptions[0] ? node.selectedOptions[0].text : node.value;
-      add(
-        node,
-        "combobox",
-        labelOf(node, [node.getAttribute("aria-label"), node.getAttribute("name"), node.id]),
-        selected
-      );
-    }
-    for (const node of scope.querySelectorAll("[role='tab'], [role='menuitem'], [role='option'], [role='switch']")) {
-      const role = node.getAttribute("role") || "button";
-      add(node, role, labelOf(node, [node.innerText, node.getAttribute("aria-label"), node.getAttribute("title")]));
-    }
-  };
-  const walkShadow = (root) => {
-    for (const node of root.querySelectorAll("*")) {
+  const walkTree = (root) => {
+    if (!root) return;
+    const visit = (node) => {
+      if (!(node instanceof Element)) return;
+      const role = roleOf(node);
+      if (role && !SKIP_ROLE.has(role)) add(node, role);
+      else if (node.tabIndex >= 0) add(node, role || "button");
       if (node.shadowRoot) {
         clearStamps(node.shadowRoot);
-        collectIn(node.shadowRoot);
-        walkShadow(node.shadowRoot);
+        walkTree(node.shadowRoot);
       }
+      for (const child of node.children || []) visit(child);
+    };
+    if (root instanceof Element) visit(root);
+    else if (root.body) visit(root.body);
+    else if (root.documentElement) visit(root.documentElement);
+    else if (root.children) {
+      for (const child of root.children) visit(child);
     }
   };
   const walkDocument = (doc) => {
-    if (!doc || !doc.querySelectorAll) return;
+    if (!doc) return;
     clearStamps(doc);
     const dialog = doc.querySelector('[role="dialog"], dialog[open], [aria-modal="true"]');
-    if (dialog) {
-      collectIn(dialog);
-      walkShadow(dialog);
-    }
-    collectIn(doc);
-    walkShadow(doc);
+    if (dialog) walkTree(dialog);
+    walkTree(doc);
     for (const frame of doc.querySelectorAll("iframe")) {
       try {
         const child = frame.contentDocument;
@@ -1522,6 +1570,7 @@ _SNAPSHOT_JS = """() => {
     if (tag.length === 2 && tag[0] === "h") level = Number(tag[1]) || 0;
     const ariaLevel = Number(node.getAttribute("aria-level") || 0);
     if (ariaLevel >= 1 && ariaLevel <= 6) level = ariaLevel;
+    if (roleOf(node) === "heading" && !level) level = 2;
     if (level >= 1 && level <= 6) {
       contentLines.push("#".repeat(level) + " " + text.slice(0, 200));
     } else {
