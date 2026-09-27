@@ -181,6 +181,7 @@ class PlaywrightPage:
                         "title": str(raw.get("title") or ""),
                         "interactive": list(raw.get("interactive") or [])[:_MAX_INTERACTIVE],
                         "content": str(raw.get("content") or ""),
+                        "more_below": bool(raw.get("moreBelow") or raw.get("more_below")),
                         "secrets": list(raw.get("secrets") or []),
                     }
             except Exception:
@@ -299,6 +300,29 @@ class PlaywrightPage:
     def press_key(self, key: str) -> None:
         self._page.keyboard.press(key)
 
+    def hover(self, target: str, role: str = "", ref: str = "") -> None:
+        if ref and self._act_ref(ref, "hover"):
+            return
+        if role:
+            try:
+                control = self._page.get_by_role(role, name=target)
+                if int(control.count()) > 0:
+                    control.first.hover()
+                    return
+            except Exception:
+                pass
+        self._page.get_by_text(target).hover()
+
+    def type_focused(self, text: str) -> None:
+        try:
+            focused = self._page.locator(":focus")
+            if int(focused.count()) > 0:
+                focused.first.fill(text)
+                return
+        except Exception:
+            pass
+        self._page.keyboard.type(text)
+
     def go_back(self) -> None:
         self._page.go_back(wait_until="domcontentloaded", timeout=15000)
 
@@ -316,6 +340,8 @@ class PlaywrightPage:
                     target.click()
                 elif action == "select":
                     target.select_option(text)
+                elif action == "hover":
+                    target.hover()
                 else:
                     target.fill(text)
                 return True
@@ -661,6 +687,26 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
+            name="hover",
+            description="Hover an interactive ref or visible name to reveal menus.",
+            parameters={
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
+            name="type_focused",
+            description="Type into the focused field when it has no useful label or ref.",
+            parameters={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
             name="go_back",
             description="Go back one page in the browser history.",
             parameters={"type": "object", "properties": {}},
@@ -861,6 +907,21 @@ class Browser(Capability):
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"pressed {key}\n{_action_diff(before, after)}\n{after}"
+            if tool_name == "hover":
+                target = str(arguments.get("target", ""))
+                before = self._glance(account_id)
+                role, name, ref = self._resolve(account_id, target, prefer=("link", "button", "menuitem"))
+                self._use(account_id, lambda page: _hover(page, name, role, ref=ref))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"hovered {target}\n{_action_diff(before, after)}\n{after}"
+            if tool_name == "type_focused":
+                text = str(arguments.get("text", ""))
+                before = self._glance(account_id)
+                self._use(account_id, lambda page: _type_focused(page, text))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"typed into focused field\n{_action_diff(before, after)}\n{after}"
             if tool_name == "go_back":
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _go_back(page))
@@ -1431,8 +1492,71 @@ _SNAPSHOT_JS = """() => {
     || document.querySelector("main, article, [role='main']")
     || document.body
     || document.documentElement;
-  let content = contentRoot && contentRoot.innerText ? String(contentRoot.innerText) : "";
-  content = content.replace(/\\r/g, "").slice(0, 3500);
+  const vh = window.innerHeight || 800;
+  const contentLines = [];
+  const contentSeen = new Set();
+  let moreBelow = false;
+  const blocks = contentRoot
+    ? contentRoot.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading'],p,li,td,th,pre,blockquote,label,dt,dd")
+    : [];
+  for (const node of blocks) {
+    if (!visible(node)) continue;
+    let rect;
+    try {
+      rect = node.getBoundingClientRect();
+    } catch (err) {
+      continue;
+    }
+    if (rect.bottom < 0) continue;
+    if (rect.top > vh) {
+      moreBelow = true;
+      continue;
+    }
+    let text = cleanLabel(node.innerText || node.textContent || "");
+    if (!text || text.length < 2) continue;
+    const key = text.toLowerCase();
+    if (contentSeen.has(key)) continue;
+    contentSeen.add(key);
+    const tag = String(node.tagName || "").toLowerCase();
+    let level = 0;
+    if (tag.length === 2 && tag[0] === "h") level = Number(tag[1]) || 0;
+    const ariaLevel = Number(node.getAttribute("aria-level") || 0);
+    if (ariaLevel >= 1 && ariaLevel <= 6) level = ariaLevel;
+    if (level >= 1 && level <= 6) {
+      contentLines.push("#".repeat(level) + " " + text.slice(0, 200));
+    } else {
+      contentLines.push(text.slice(0, 240));
+    }
+    if (contentLines.length >= 60) {
+      moreBelow = true;
+      break;
+    }
+  }
+  if (contentLines.length < 3 && contentRoot && contentRoot.innerText) {
+    for (const raw of String(contentRoot.innerText).split("\\n")) {
+      const text = cleanLabel(raw);
+      if (!text || text.length < 2) continue;
+      const key = text.toLowerCase();
+      if (contentSeen.has(key)) continue;
+      contentSeen.add(key);
+      contentLines.push(text.slice(0, 240));
+      if (contentLines.length >= 60) {
+        moreBelow = true;
+        break;
+      }
+    }
+  }
+  if (!moreBelow) {
+    for (const node of blocks) {
+      try {
+        if (visible(node) && node.getBoundingClientRect().top > vh) {
+          moreBelow = true;
+          break;
+        }
+      } catch (err) {}
+    }
+  }
+  const content = contentLines.join("\\n").slice(0, 3500);
   const secrets = [];
   for (const node of document.querySelectorAll("input[type='password']")) {
     if (node.value) secrets.push(String(node.value));
@@ -1442,6 +1566,7 @@ _SNAPSHOT_JS = """() => {
     title: cleanLabel(document.title || ""),
     interactive: interactive.slice(0, 80),
     content,
+    moreBelow,
     secrets,
   };
 }"""
@@ -1453,9 +1578,11 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     pages = list(data.get("pages") or [])
     downloads = [str(item) for item in (data.get("downloads") or []) if str(item).strip()]
     interactive = list(data.get("interactive") or [])[:_MAX_INTERACTIVE]
-    content = _content_lines(str(data.get("content") or ""))
+    content, truncated = _content_lines(str(data.get("content") or ""))
+    more_below = bool(data.get("more_below") or data.get("moreBelow") or truncated)
     if len(content) > _MAX_CONTENT:
         content = content[:_MAX_CONTENT]
+        more_below = True
     lines = [f"URL: {url or '(unknown)'}"]
     if title:
         lines.append(f"Title: {title}")
@@ -1502,12 +1629,15 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     lines.append("")
     lines.append("Content:")
     lines.append(content or "(empty)")
+    if more_below and content:
+        lines.append("(more below)")
     return "\n".join(lines)
 
 
-def _content_lines(text: str) -> str:
+def _content_lines(text: str) -> tuple[str, bool]:
     lines: list[str] = []
     seen: set[str] = set()
+    truncated = False
     for raw in text.splitlines():
         line = " ".join(raw.split()).strip()
         if len(line) < 2:
@@ -1520,8 +1650,9 @@ def _content_lines(text: str) -> str:
         seen.add(key)
         lines.append(line)
         if len(lines) >= 80:
+            truncated = True
             break
-    return "\n".join(lines)
+    return "\n".join(lines), truncated
 
 
 _SNAPSHOT_NOISE = re.compile(
@@ -1652,6 +1783,26 @@ def _press_key(page: Page, key: str) -> None:
         press(key)
         return
     raise RuntimeError("press_key is not available")
+
+
+def _hover(page: Page, target: str, role: str = "", ref: str = "") -> None:
+    hover = getattr(page, "hover", None)
+    if callable(hover):
+        try:
+            hover(target, role=role, ref=ref)
+            return
+        except TypeError:
+            hover(target)
+            return
+    raise RuntimeError("hover is not available")
+
+
+def _type_focused(page: Page, text: str) -> None:
+    typed = getattr(page, "type_focused", None)
+    if callable(typed):
+        typed(text)
+        return
+    raise RuntimeError("type_focused is not available")
 
 
 def _go_back(page: Page) -> None:

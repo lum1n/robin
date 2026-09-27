@@ -22,7 +22,9 @@ SYSTEM = (
     "open_page returns a text snapshot with URL, Interactive refs, and Content. "
     "To click or type, use Interactive refs (for example target 1) or the visible name. "
     "Use select_option for dropdowns, scroll to reveal more of the page, press_key for Enter or Tab, and go_back to leave a page. "
+    "Use hover to open menus, and type_focused when the caret is already in a field. "
     "When Pages lists more than one entry, switch_page focuses that popup or tab by index. "
+    "If Content ends with (more below), scroll before answering from the page. "
     "Keep using tools until the person's task is done, or you need them to confirm or answer. "
     "When answering from a page, write clear prose or a short bullet list from Content. "
     "For news or a homepage, list the top stories with one line each. "
@@ -144,8 +146,8 @@ def _converse(
     for _ in range(max_steps):
         tools = assistant.tools(task.account_id, task.text)
         allowed = {tool["name"] for tool in tools}
-        notes = _operator_notes(actions, snapshot)
-        prompt = _compose(visible, spoken, history, notes, keep_end=True)
+        notes, page = _operator_parts(actions, snapshot)
+        prompt = _compose(visible, spoken, history, notes, page=page, keep_end=True)
         _show_egress(prompt)
         turn = model.complete(
             system=SYSTEM,
@@ -181,12 +183,13 @@ def _converse(
         if len(result) > 6000:
             result = result[:6000]
         actions, snapshot = _record_result(actions, snapshot, call.name, result)
-    notes = _operator_notes(actions, snapshot)
+    notes, page = _operator_parts(actions, snapshot)
     prompt = _compose(
         visible,
         spoken,
         history,
         notes + "\nAnswer the person now from the results above.",
+        page=page,
         keep_end=True,
     )
     _show_egress(prompt)
@@ -202,8 +205,9 @@ def _converse(
 
 
 _MODEL_CHARS = 6000
-_SNAPSHOT_CHARS = 2200
-_EXTRA_CHARS = 4500
+_SNAPSHOT_CHARS = 1200
+_PAGE_CHARS = 3200
+_EXTRA_CHARS = 1200
 _TURN_CHARS = 800
 _HISTORY_TURNS = 16
 _ACTION_LINES = 24
@@ -321,18 +325,32 @@ def _history(assistant: Assistant, task: Task, vault, vocabulary, ner) -> str:
     return "\n".join(lines)
 
 
-def _compose(account: str, message: str, history: str, extra: str, *, keep_end: bool = False) -> str:
-    """Fit the thread, the current words, and this turn's notes into one local context."""
+def _compose(
+    account: str,
+    message: str,
+    history: str,
+    extra: str,
+    *,
+    page: str = "",
+    keep_end: bool = False,
+) -> str:
+    """Fit the thread, action log, and current page into one local context.
+
+    The current page snapshot gets its own budget so history does not push it out.
+    """
     spoken = " ".join(message.split())
     extra = extra.strip()
+    page = page.strip()
+    if len(page) > _PAGE_CHARS:
+        page = page[:_PAGE_CHARS]
     if len(extra) > _EXTRA_CHARS:
         extra = extra[-_EXTRA_CHARS:] if keep_end else extra[:_EXTRA_CHARS]
     lines = [line for line in history.split("\n") if line]
-    snapshot = account or ""
-    if len(snapshot) > _SNAPSHOT_CHARS:
-        snapshot = _keep_message(snapshot, spoken, _SNAPSHOT_CHARS)
+    account_shot = account or ""
+    if len(account_shot) > _SNAPSHOT_CHARS:
+        account_shot = _keep_message(account_shot, spoken, _SNAPSHOT_CHARS)
 
-    def pack(kept: list[str], shot: str, note: str) -> str:
+    def pack(kept: list[str], shot: str, note: str, current: str) -> str:
         parts: list[str] = []
         if kept:
             parts.append("Conversation:\n" + "\n".join(kept))
@@ -340,24 +358,52 @@ def _compose(account: str, message: str, history: str, extra: str, *, keep_end: 
             parts.append(shot)
         if note:
             parts.append(note)
+        if current:
+            parts.append(current)
         return "\n".join(parts)
 
-    text = pack(lines, snapshot, extra)
+    text = pack(lines, account_shot, extra, page)
     if len(text) <= _MODEL_CHARS:
         return text
-    snapshot = _keep_message(snapshot, spoken, min(len(snapshot), 500))
-    text = pack(lines, snapshot, extra)
+    account_shot = _keep_message(account_shot, spoken, min(len(account_shot), 400))
+    text = pack(lines, account_shot, extra, page)
     while lines and len(text) > _MODEL_CHARS:
         lines = lines[1:]
-        text = pack(lines, snapshot, extra)
+        text = pack(lines, account_shot, extra, page)
     if len(text) <= _MODEL_CHARS:
         return text
-    room = _MODEL_CHARS - len(pack(lines, snapshot, "")) - 1
-    if room > 80 and extra:
-        extra = extra[-room:] if keep_end else extra[:room]
-        return pack(lines, snapshot, extra)
-    note = extra[-1000:] if keep_end else extra[:1000]
-    return pack(lines[-4:], _keep_message(spoken, spoken, 400), note)
+    if extra:
+        room = _MODEL_CHARS - len(pack(lines, account_shot, "", page)) - 1
+        if room > 40:
+            extra = extra[-room:] if keep_end else extra[:room]
+            text = pack(lines, account_shot, extra, page)
+            if len(text) <= _MODEL_CHARS:
+                return text
+        extra = ""
+        text = pack(lines, account_shot, extra, page)
+    if len(text) <= _MODEL_CHARS:
+        return text
+    if page and len(page) > 800:
+        page = page[:800]
+        text = pack(lines[-4:], account_shot, extra, page)
+        if len(text) <= _MODEL_CHARS:
+            return text
+    return pack(lines[-2:], _keep_message(spoken, spoken, 300), extra[:200], page[:600])
+
+
+def _operator_parts(actions: list[str], snapshot: str) -> tuple[str, str]:
+    log = ""
+    if actions:
+        log = "Action log:\n" + "\n".join(actions)
+    page = ""
+    if snapshot:
+        page = "Current page:\n" + snapshot
+    return log, page
+
+
+def _operator_notes(actions: list[str], snapshot: str) -> str:
+    log, page = _operator_parts(actions, snapshot)
+    return "\n\n".join(part for part in (log, page) if part)
 
 
 _DENIAL = re.compile(
@@ -472,15 +518,6 @@ def _record_result(
     if len(line) > 500:
         line = line[:500]
     return [*actions, f"Tool {tool_name} returned: {line}"][-_ACTION_LINES:], snapshot
-
-
-def _operator_notes(actions: list[str], snapshot: str) -> str:
-    parts: list[str] = []
-    if actions:
-        parts.append("Action log:\n" + "\n".join(actions))
-    if snapshot:
-        parts.append("Current page:\n" + snapshot)
-    return "\n\n".join(parts)
 
 
 def _reply_text(message: str, vault, vocabulary, route: Route) -> Reply:

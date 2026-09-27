@@ -20,8 +20,10 @@ What a screenshot still shows, and this snapshot still drops:
 
 - A full accessibility-tree walk. Collection is still query selectors (plus same-origin iframes and open shadow roots), not the browser a11y tree.
 - Proof beyond the one-line change note and the next snapshot.
-- Extra pointer actions: hover is not a tool yet; scroll, select_option, press_key, go_back, and switch_page are.
+- Extra pointer actions: scroll, select_option, press_key, hover, type_focused, go_back, and switch_page are available.
 - A download is noted and saved under the account browser profile when possible; it is not opened as a document viewer yet.
+- Content is viewport-aware with headings and a `(more below)` line when the page continues.
+- The current page keeps a separate prompt budget inside the 6,000-character cap for the 4096-token local model.
 
 If local NER is off, a named page stays on the machine as a cleaned extract and is not sent to a model. When a snapshot may leave, refs, roles, URL, and control states stay intact; names and body text still go through the airlock as placeholders. The whole snapshot is never replaced with `[UNRESOLVED]`. Tool arguments are already restored before `invoke`, so a placeholder in a name can still be resolved at click time.
 
@@ -68,7 +70,7 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 - [x] Keep two controls with the same name as two refs
 - [x] Give an unlabeled control a ref and a neighbor label
 - [x] Mark each ref with a region: dialog, header, nav, main, or page
-- [ ] Render viewport content as lines, keep headings, and add one line when more content is below
+- [x] Render viewport content as lines, keep headings, and add one line when more content is below
 - [x] Include checkbox, radio, combobox, tab, menuitem, option, and switch refs (still missing full tree walk)
 
 ### Actions hit the ref
@@ -77,7 +79,7 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 - [x] After each action, wait until navigation or the DOM settles
 - [x] Return a fresh snapshot plus a one-line diff: URL, dialog opened or closed, text that appeared
 - [x] Add scroll, select, checkbox and radio, key press, hover, and back
-- [ ] Type into the focused ref, including a field that is not a labeled textbox
+- [x] Type into the focused ref, including a field that is not a labeled textbox
 - [x] When a site opens a popup or starts a download, keep that as its own page
 
 ### The browser stays with the account
@@ -95,9 +97,9 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 
 ### The viewport fits the context
 
-- [ ] Budget the current snapshot separately from conversation history
-- [ ] Drop older snapshots once the action log records them
-- [ ] Check the 6,000-character cap against the 4096-token local model before raising it
+- [x] Budget the current snapshot separately from conversation history
+- [x] Drop older snapshots once the action log records them
+- [x] Check the 6,000-character cap against the 4096-token local model before raising it
 
 ### The desktop, later
 

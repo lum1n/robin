@@ -678,6 +678,65 @@ def test_a_model_denial_does_not_hide_a_page_that_opened() -> None:
     assert "bullet list" in model.system.lower() or "top stories" in model.system.lower()
 
 
+def test_viewport_content_marks_more_below_and_keeps_headings() -> None:
+    from robin.capabilities.browser import _format_snapshot
+
+    formatted = _format_snapshot(
+        {
+            "url": "https://news.test/",
+            "title": "News",
+            "interactive": [],
+            "content": "# Storm hits coast\nDetails about schools\n" + "\n".join(f"line {i}" for i in range(100)),
+            "more_below": True,
+        }
+    )
+    assert "# Storm hits coast" in formatted
+    assert "(more below)" in formatted
+
+
+def test_hover_and_type_focused_are_available() -> None:
+    class Controls(MemoryPage):
+        def __init__(self) -> None:
+            super().__init__(text="form")
+            self.hovered = ""
+            self.focused_typed = ""
+            self._refs = {"1": ("button", "Menu")}
+
+        def read(self) -> tuple[str, str]:
+            return (
+                'URL: https://example.test/\n\nInteractive:\n[1] button "Menu"\n\nContent:\nform',
+                "",
+            )
+
+        def location(self) -> str:
+            return "https://example.test/"
+
+        def hover(self, target: str, role: str = "", ref: str = "") -> None:
+            self.hovered = ref or target
+
+        def type_focused(self, text: str) -> None:
+            self.focused_typed = text
+
+    page = Controls()
+    browser = Browser("ada", page)
+    browser.invoke("ada", "read_screen", {})
+    browser.invoke("ada", "hover", {"target": "1"})
+    assert page.hovered == "1"
+    browser.invoke("ada", "type_focused", {"text": "hello"})
+    assert page.focused_typed == "hello"
+
+
+def test_compose_keeps_the_current_page_when_history_is_long() -> None:
+    from robin.loop import _compose
+
+    history = "\n".join(f"person: turn {i} " + ("x" * 200) for i in range(20))
+    page = "Current page:\nURL: https://news.test/\n\nContent:\n" + ("story " * 400)
+    packed = _compose("{}", "what is the news", history, "Action log:\nclick", page=page, keep_end=True)
+    assert "Current page:" in packed
+    assert "https://news.test/" in packed
+    assert len(packed) <= 6000
+
+
 def test_snapshot_keeps_page_body_and_richer_controls() -> None:
     from robin.capabilities.browser import _SNAPSHOT_JS, _format_snapshot, _parse_refs
 
@@ -685,8 +744,8 @@ def test_snapshot_keeps_page_body_and_richer_controls() -> None:
     assert "shadowRoot" in _SNAPSHOT_JS
     assert "iframe" in _SNAPSHOT_JS
     assert "contentDocument" in _SNAPSHOT_JS
+    assert "moreBelow" in _SNAPSHOT_JS
     assert "slice(0, 120)" in _SNAPSHOT_JS
-    assert 'content.replace(/\\r/g, "").slice(0, 3500)' in _SNAPSHOT_JS or "slice(0, 3500)" in _SNAPSHOT_JS
     assert "content = clean(" not in _SNAPSHOT_JS
     assert "checkbox" in _SNAPSHOT_JS
     assert "combobox" in _SNAPSHOT_JS
