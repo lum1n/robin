@@ -1,10 +1,11 @@
-"""A model turn. The default client speaks to a local OpenAI-compatible server."""
+"""A model turn. The client speaks to an OpenAI-compatible server. The airlock decides what it may see."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 
@@ -30,9 +31,17 @@ Transport = Any
 class ChatModel:
     """Posts one chat completion. Pass a transport in tests so nothing is sent."""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8080", *, transport: Transport | None = None, model: str = "local") -> None:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8080",
+        *,
+        transport: Transport | None = None,
+        model: str = "local",
+        api_key: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.transport = transport or urllib_transport
+        self.api_key = api_key
+        self.transport = transport or (lambda url, body: urllib_transport(url, body, api_key=api_key))
         self.model = model
 
     def complete(self, *, system: str, user: str, tools: list[dict[str, Any]]) -> ModelTurn:
@@ -44,18 +53,29 @@ class ChatModel:
             ],
             "tools": [_function(tool) for tool in tools],
         }
-        payload = self.transport(f"{self.base_url}/v1/chat/completions", body)
+        try:
+            payload = self.transport(f"{self.base_url}/v1/chat/completions", body)
+        except TimeoutError:
+            return ModelTurn("The model did not answer in time.")
+        except URLError as exc:
+            reason = str(exc.reason).lower()
+            if isinstance(exc.reason, TimeoutError) or "timed out" in reason:
+                return ModelTurn("The model did not answer in time.")
+            return ModelTurn("The model is not running.")
         return _parse(payload)
 
 
-def urllib_transport(url: str, body: dict[str, Any]) -> dict[str, Any]:
+def urllib_transport(url: str, body: dict[str, Any], api_key: str = "") -> dict[str, Any]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     request = Request(
         url,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
-    with urlopen(request, timeout=60) as response:  # noqa: S310
+    with urlopen(request, timeout=240) as response:  # noqa: S310
         return json.loads(response.read().decode())
 
 

@@ -159,3 +159,125 @@ def test_root_gives_the_directory_to_that_login(tmp_path, monkeypatch) -> None:
         assert SECRET not in str(exc)
     else:
         raise AssertionError("a failed login was ignored")
+
+
+def test_this_user_can_read_their_files_and_not_another_users(tmp_path) -> None:
+    me = 1000
+    other = 1001
+    robin_uid = 2000
+    volume = tmp_path / "machine"
+    root = volume / "files"
+    home = volume / "home" / "vegard"
+    theirs = volume / "home" / "other"
+    owners: dict[Path, int] = {}
+
+    def place(path: Path, uid: int, text: str | None = None) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if text is not None:
+            path.write_text(text)
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+        owners[path.resolve()] = uid
+
+    for path in (volume, volume / "home", volume / "etc", root):
+        place(path, 0)
+    place(home, me)
+    place(theirs, other)
+    place(home / "dog.jpg", me, "pixels")
+    place(home / "notes.txt", me, "buy milk")
+    place(home / "robin.key", me, SECRET)
+    place(home / "link.txt", me, "nope")
+    (home / "link.txt").unlink()
+    (home / "link.txt").symlink_to(theirs / "secret.txt")
+    place(theirs / "secret.txt", other, SECRET)
+    place(theirs / "planted.jpg", me, "hidden pixels")
+    place(volume / "etc" / "passwd", 0, "root:x:0:0")
+    place(root / "ada" / "kept.txt", robin_uid, "kept")
+    place(root / "bea" / "hidden.txt", me, SECRET)
+
+    def owner(path: Path) -> int:
+        return owners.get(path.resolve(), 0)
+
+    workspace = Workspace(root, volume=volume, owner=owner, user=me)
+    found = {path.name for path in workspace.owned_files("ada")}
+    assert found == {"dog.jpg", "notes.txt", "kept.txt"}
+    assert workspace.read("ada", str(home / "notes.txt")) == "buy milk"
+    assert workspace.read("ada", str(theirs / "secret.txt")) == "path belongs to another user"
+    assert workspace.read("ada", str(theirs / "planted.jpg")) == "path belongs to another user"
+    assert workspace.read("ada", str(volume / "etc" / "passwd")) == "path belongs to another user"
+    assert workspace.read("ada", str(home / "robin.key")) == "path belongs to another user"
+    assert workspace.read("ada", str(home / "dog.jpg")).startswith("photo ")
+    assert SECRET not in workspace.read("ada", str(home / "dog.jpg"))
+    try:
+        workspace.write("ada", "../bea/secret.txt", "nope")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a path left the account")
+    assert not (root / "bea" / "secret.txt").exists()
+
+
+def test_root_without_a_person_does_not_read_personal_files(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.delenv("ROBIN_USER", raising=False)
+    volume = tmp_path / "machine"
+    root = volume / "files"
+    (volume / "home").mkdir(parents=True)
+    (volume / "home" / "note.txt").write_text(SECRET)
+    (root / "ada").mkdir(parents=True)
+    (root / "ada" / "mine.txt").write_text("mine")
+    workspace = Workspace(root, volume=volume)
+    assert [path.name for path in workspace.owned_files("ada")] == ["mine.txt"]
+    assert workspace.read("ada", str(volume / "home" / "note.txt")) == "path belongs to another user"
+
+
+def test_a_file_question_answers_from_this_users_files(tmp_path) -> None:
+    me = 1000
+    other = 1001
+    volume = tmp_path / "machine"
+    root = volume / "files"
+    home = volume / "home" / "vegard"
+    theirs = volume / "home" / "other"
+    owners: dict[Path, int] = {}
+
+    def place(path: Path, uid: int, text: str | None = None) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if text is None:
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            path.write_text(text)
+        owners[path.resolve()] = uid
+
+    for path in (volume, volume / "home", root):
+        place(path, 0)
+    place(home, me)
+    place(theirs, other)
+    place(home / "dog.jpg", me, "pixels")
+    place(theirs / "secret.txt", other, SECRET)
+
+    workspace = Workspace(root, volume=volume, owner=lambda path: owners.get(path.resolve(), 0), user=me)
+    assistant = Assistant()
+    assistant.add(Files(workspace))
+
+    class Scripted:
+        def __init__(self) -> None:
+            self.user = ""
+            self.tools: list[str] = []
+
+        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
+            self.user = user
+            self.tools = [tool["name"] for tool in tools]
+            return ModelTurn("Here are the files.")
+
+    model = Scripted()
+    reply = converse(assistant, Task("ada", "desk", "what files do I have"), model)
+    assert reply.text == "Here are the files."
+    assert model.tools == []
+    assert "dog.jpg" not in model.user
+    assert "[UNRESOLVED]" in model.user
+    assert "secret.txt" not in model.user
+    assert SECRET not in model.user
+    read = converse(assistant, Task("ada", "desk", f"read {home / 'dog.jpg'}"), model)
+    assert read.text == "Here are the files."
+    assert "[UNRESOLVED]" in model.user
+    assert SECRET not in model.user

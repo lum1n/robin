@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -41,6 +44,33 @@ class FieldSpec:
     free_text: bool = False
 
 
+@dataclass
+class DueWork:
+    account_id: str
+    conversation_id: str
+    text: str
+    finish: Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class ActiveTurn:
+    account_id: str
+    conversation_id: str
+    allow_cloud: bool = False
+    free_text: bool = False
+
+
+current_task: ContextVar[ActiveTurn | None] = ContextVar("robin_task", default=None)
+
+
+@dataclass(frozen=True)
+class SecretAccepted:
+    reply: str = ""
+    resume: str = ""
+    allow_cloud: bool = False
+    free_text: bool = False
+
+
 class Capability:
     id: str
     tools: list[Tool]
@@ -48,6 +78,24 @@ class Capability:
 
     def visible_to(self, account_id: str) -> bool:
         return True
+
+    def offered_tools(self, account_id: str, task: str) -> list[Tool]:
+        return list(self.tools)
+
+    def prepare(self, account_id: str, task: str) -> str:
+        return ""
+
+    def take_direct(self, account_id: str) -> str:
+        return ""
+
+    def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
+        return None
+
+    def peel_secret(self, account_id: str, text: str) -> str | None:
+        return None
+
+    def due(self, now: datetime) -> list[DueWork]:
+        return []
 
     def records(self, account_id: str) -> list[dict[str, str]]:
         return []
@@ -73,10 +121,10 @@ class Registry:
                     return capability, tool
         raise KeyError(tool_name)
 
-    def schemas(self, account_id: str) -> list[dict[str, Any]]:
+    def schemas(self, account_id: str, task: str = "") -> list[dict[str, Any]]:
         schemas: list[dict[str, Any]] = []
         for capability in self.for_account(account_id):
-            for tool in capability.tools:
+            for tool in capability.offered_tools(account_id, task):
                 schemas.append(
                     {
                         "name": tool.name,

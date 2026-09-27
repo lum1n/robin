@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from base64 import b64encode
 from typing import Any, Protocol
 from urllib.request import Request, urlopen
@@ -10,6 +11,7 @@ from urllib.request import Request, urlopen
 from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
 
 _SECRET = ("url", "user", "password")
+_CAL_ASK = re.compile(r"\b(?:calendar|agenda|appointments?|meetings?)\b", re.IGNORECASE)
 
 
 class SecretStore(Protocol):
@@ -25,6 +27,9 @@ class CalDAV:
         self.secrets = secrets
         self._fetch = fetch or urllib_fetch
         self._put = put or urllib_put
+
+    def connected(self, account_id: str) -> bool:
+        return self._credentials(account_id) is not None
 
     def events(self, account_id: str) -> list[dict[str, str]]:
         creds = self._credentials(account_id)
@@ -108,17 +113,61 @@ class Calendar(Capability):
 
     def __init__(self, calendar: CalDAV) -> None:
         self.calendar = calendar
+        self._direct: dict[str, str] = {}
+
+    def prepare(self, account_id: str, task: str) -> str:
+        self._direct.pop(account_id, None)
+        if not _CAL_ASK.search(task):
+            return ""
+        if not self.calendar.connected(account_id):
+            self._direct[account_id] = "The calendar is not connected. Connect it from the app, then ask again."
+            return ""
+        try:
+            rows = self.calendar.events(account_id)
+        except Exception as exc:
+            self._direct[account_id] = _calendar_failure(exc)
+            return ""
+        if not rows:
+            self._direct[account_id] = "The calendar has no events."
+            return ""
+        self._direct[account_id] = _agenda(rows)
+        return ""
+
+    def take_direct(self, account_id: str) -> str:
+        return self._direct.pop(account_id, "")
 
     def records(self, account_id: str) -> list[dict[str, str]]:
-        return self.calendar.events(account_id)
+        try:
+            return self.calendar.events(account_id)
+        except Exception:
+            return []
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
         if tool_name == "list_events":
-            return f"{len(self.records(account_id))} events"
+            if not self.calendar.connected(account_id):
+                return "The calendar is not connected."
+            try:
+                rows = self.calendar.events(account_id)
+            except Exception as exc:
+                return _calendar_failure(exc)
+            if not rows:
+                return "The calendar has no events."
+            return _agenda(rows)
         if tool_name == "add_event":
             self.calendar.add(account_id, str(arguments.get("title", "")), str(arguments.get("when", "")))
             return "added"
         raise NotImplementedError(tool_name)
+
+
+def _calendar_failure(exc: Exception) -> str:
+    if "login failed" in str(exc).lower():
+        return "The calendar did not accept the sign-in."
+    return "The calendar did not answer."
+
+
+def _agenda(rows: list[dict[str, str]]) -> str:
+    lines = [f"{row.get('when') or 'unscheduled'}: {row.get('title') or 'event'}" for row in rows]
+    return "Calendar:\n" + "\n".join(lines)
 
 
 def urllib_fetch(url: str, user: str, password: str) -> str:

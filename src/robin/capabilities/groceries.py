@@ -87,7 +87,10 @@ class Groceries(Capability):
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
         if tool_name == "list_items":
-            return f"{len(self.records(account_id))} items"
+            rows = self.records(account_id)
+            if not rows:
+                return "The grocery list is empty."
+            return "Groceries:\n" + "\n".join(row.get("item", "") for row in rows if row.get("item"))
         if tool_name == "add_private":
             self._add(account_id, str(arguments.get("item", "")), shared=False)
             return "added"

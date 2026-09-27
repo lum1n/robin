@@ -1,3 +1,5 @@
+import threading
+
 from robin.airlock import VocabularyTerm
 from robin.capabilities.groceries import Groceries
 from robin.model import ModelTurn
@@ -13,6 +15,23 @@ SECRET = "sk-abcdefghijklmnopqrstuvwxyz123456"
 class Scripted:
     def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
         return ModelTurn("Noted, Jane Doe.")
+
+
+def test_a_request_thread_can_store_an_account(tmp_path) -> None:
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    errors: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            store.ensure_account("ada")
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    thread.join()
+    assert errors == []
+    assert store.accounts() == ["ada"]
 
 
 def test_a_restart_keeps_one_accounts_thread_and_hides_it_from_the_other(tmp_path) -> None:

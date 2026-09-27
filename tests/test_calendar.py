@@ -1,6 +1,9 @@
 import json
 
 from robin.capabilities.calendar import Calendar, CalDAV, calendar_secret
+from robin.loop import converse
+from robin.model import ModelTurn
+from robin.policy import Task
 from robin.session import Assistant
 
 PASSWORD = "calendar-password-ada"
@@ -92,3 +95,26 @@ def test_a_login_failure_does_not_repeat_the_password() -> None:
         raise AssertionError("login should fail")
     broker.put("ada", "calendar", calendar_secret(url="http://cal.example/ada", user="ada@example.com", password=PASSWORD))
     assert CalDAV(broker, fetch=boom, put=lambda *args: None).events("ada") == []
+
+
+def test_asking_for_the_calendar_fetches_events_before_the_model_speaks() -> None:
+    assistant = Assistant()
+    directory = Directory()
+    assistant.broker.put("ada", "calendar", calendar_secret(url="https://cal.example/ada", user="ada@example.com", password=PASSWORD))
+    assistant.add(Calendar(CalDAV(assistant.broker, fetch=directory.fetch, put=directory.put)))
+
+    class Scripted:
+        def __init__(self) -> None:
+            self.user = ""
+
+        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
+            self.user = user
+            return ModelTurn("I cannot read your calendar.")
+
+    model = Scripted()
+    reply = converse(assistant, Task("ada", "home", "what is on my calendar"), model)
+    assert "Oncologist Tuesday" in reply.text
+    assert model.user == ""
+    assert PASSWORD not in reply.text
+    missing = converse(assistant, Task("bea", "home", "show my calendar"), model)
+    assert missing.text == "The calendar is not connected. Connect it from the app, then ask again."

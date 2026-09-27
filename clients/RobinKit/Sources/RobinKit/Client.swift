@@ -188,6 +188,7 @@ public struct HTTPTransport: RobinTransport {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = body
         }
+        request.timeoutInterval = 300
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         return RobinRaw(status: status, data: data)

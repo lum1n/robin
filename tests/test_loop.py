@@ -1,3 +1,6 @@
+from urllib.error import URLError
+from urllib.request import Request
+
 from robin.airlock import VocabularyTerm
 from robin.capabilities.groceries import Groceries
 from robin.capabilities.screen import Screen
@@ -6,6 +9,8 @@ from robin.ner import UnavailableNer
 from robin.policy import Route, Task
 from robin.loop import converse
 from robin.session import Assistant
+from robin.store import HouseholdStore
+from robin.vault import new_key
 
 FODSELSNUMMER = "01010000110"
 SECRET = "sk-abcdefghijklmnopqrstuvwxyz123456"
@@ -33,7 +38,8 @@ def test_local_model_sees_the_name_and_a_cloud_model_sees_the_placeholder() -> N
     local_model = Scripted([ModelTurn("hello [PERSON_1]")])
     local_reply = converse(local, Task("ada", "t", "hello Jane Doe", allow_cloud=False), local_model)
     assert local_reply.route is Route.LOCAL
-    assert "Jane Doe" in local_model.seen[0][0]
+    assert "Jane Doe" not in local_model.seen[0][0]
+    assert "[PERSON_1]" in local_model.seen[0][0]
     assert local_reply.text == "hello Jane Doe"
 
     cloud = Assistant(ner=StubNer())
@@ -102,10 +108,28 @@ def test_the_loop_stops_after_the_step_limit() -> None:
     groceries = Groceries(members={"ada"}, shared=[{"item": "milk", "loyalty": ""}], private={})
     assistant = Assistant()
     assistant.add(groceries)
-    model = Scripted([ModelTurn("", (ToolCall("list_items", {}),)) for _ in range(6)])
+    model = Scripted(
+        [ModelTurn("", (ToolCall("list_items", {}),)) for _ in range(4)] + [ModelTurn("Milk is on the list.")]
+    )
     reply = converse(assistant, Task("ada", "t", "again"), model, max_steps=4)
-    assert reply.text == "Stopped after the step limit."
-    assert len(model.seen) == 4
+    assert reply.text == "Milk is on the list."
+    assert len(model.seen) == 5
+    assert model.seen[-1][1] == []
+
+
+def test_reading_the_page_is_followed_by_an_answer() -> None:
+    assistant = Assistant()
+    assistant.add(Screen(owner="ada", text="Astrid's funeral leads the front page.", password=""))
+    model = Scripted(
+        [
+            ModelTurn("", (ToolCall("read_screen", {}),)),
+            ModelTurn("Astrid's funeral leads the front page."),
+        ]
+    )
+    reply = converse(assistant, Task("ada", "t", "what is the news"), model)
+    assert reply.text == "Astrid's funeral leads the front page."
+    assert model.seen[1][1] == []
+    assert len(model.seen) == 2
 
 
 def test_chat_model_posts_to_the_local_completions_url() -> None:
@@ -137,3 +161,74 @@ def test_chat_model_posts_to_the_local_completions_url() -> None:
     assert seen[0][1]["tools"][0]["function"]["name"] == "list_items"
     assert "effect" not in seen[0][1]["tools"][0]["function"]
     assert turn.tool_calls[0].arguments == {"aisle": "dairy"}
+
+
+def test_a_quiet_local_model_becomes_a_reply() -> None:
+    def down(url: str, body: dict) -> dict:
+        raise URLError("connection refused")
+
+    def slow(url: str, body: dict) -> dict:
+        raise TimeoutError("timed out")
+
+    missed = ChatModel("http://127.0.0.1:8080", transport=down)
+    assert missed.complete(system="", user="hello", tools=[]).message == "The model is not running."
+    late = ChatModel("http://127.0.0.1:8080", transport=slow)
+    assert late.complete(system="", user="hello", tools=[]).message == "The model did not answer in time."
+
+
+def test_a_remote_model_gets_a_bearer_token_outside_the_prompt(monkeypatch) -> None:
+    captured: dict[str, Request] = {}
+
+    class Response:
+        def read(self) -> bytes:
+            return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_open(request: Request, timeout: int = 0) -> Response:
+        captured["request"] = request
+        return Response()
+
+    monkeypatch.setattr("robin.model.urlopen", fake_open)
+    reply = ChatModel("https://api.openai.com", model="gpt-4o-mini", api_key="sk-testkey").complete(
+        system="stay",
+        user="hello",
+        tools=[],
+    )
+    request = captured["request"]
+    assert request.full_url == "https://api.openai.com/v1/chat/completions"
+    assert request.get_header("Authorization") == "Bearer sk-testkey"
+    raw = request.data.decode()
+    assert "sk-testkey" not in raw
+    assert '"model": "gpt-4o-mini"' in raw
+    assert reply.message == "ok"
+
+
+def test_hello_does_not_send_the_whole_account_context() -> None:
+    screen = Screen(owner="ada", text="z" * 80_000, password="")
+    assistant = Assistant()
+    assistant.add(screen)
+    model = Scripted([ModelTurn("Hi.")])
+    reply = converse(assistant, Task("ada", "home", "hello"), model)
+    assert reply.text == "Hi."
+    sent = model.seen[0][0]
+    assert "hello" in sent
+    assert len(sent) <= 6000
+    assert "z" * 4000 not in sent
+
+
+def test_the_model_sees_the_recent_conversation(tmp_path) -> None:
+    assistant = Assistant(store=HouseholdStore(tmp_path / "house.sqlite", new_key()))
+    model = Scripted([ModelTurn("Ada."), ModelTurn("Your dog is Ada."), ModelTurn("I only know this thread.")])
+    converse(assistant, Task("ada", "home", "my dog is named Ada"), model)
+    converse(assistant, Task("ada", "other", "the codeword is plum"), model)
+    converse(assistant, Task("ada", "home", "what is my dog's name?"), model)
+    sent = model.seen[2][0]
+    assert "what is my dog's name?" in sent
+    assert "my dog is named Ada" not in sent
+    assert "plum" not in sent
+    assert "[UNRESOLVED]" in sent

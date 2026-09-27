@@ -26,7 +26,7 @@ Apps talk only to the instance they are using. Connector credentials and model A
 
 ## Accounts
 
-Records a capability marks private, plus vocabulary, vault, cloud opt-in, and the activity log, belong to one account. A task's model context contains that account's data plus shared resources the account is a member of. The local model process starts a fresh context per task.
+Records a capability marks private, plus vocabulary, vault, cloud opt-in, and the activity log, belong to one account. A task's model context contains that account's data plus shared resources the account is a member of. Each model call is a new request. Robin sends the recent turns of that conversation with it, so the thread continues. An open page contributes an excerpt. The prompt stays within about 6,000 characters, which fits a 4096-token local context together with the tool list and the reply. Another conversation is left out. On the cloud route those turns are redacted the same way as the current message.
 
 Placeholder maps are keyed by account and conversation. `[PERSON_1]` in one conversation is unrelated to `[PERSON_1]` in another. Sharing something with another account is an external effect and needs a confirm.
 
@@ -38,7 +38,7 @@ The house HTTP service is how the Mac and iPhone apps will send a message. A tur
 
 ## Trust boundary
 
-Connectors and computer-use see real records for the account that owns them. The cloud model sees placeholders. The local model may see that task's data. Secrets never enter either model: the broker holds them and tools receive them only at execution time.
+Connectors and computer-use see real records for the account that owns them. The remote model sees placeholders, or `[UNRESOLVED]` when free text did not clear. Secrets never enter the model: the broker holds them and tools receive them only at execution time.
 
 ```mermaid
 flowchart LR
@@ -52,12 +52,15 @@ The same airlock runs on the joint server and on a private VM.
 
 ## Routes
 
-- **Local.** Used unless the task sets `allow_cloud`. The model runs on that instance. No personal data is sent to a model provider.
-- **Cloud.** Requires the opt-in and a clean report. A clean scan never selects the cloud route by itself.
+The model is remote. There is no local generator. Every string sent to it is the airlock view: `release` in `airlock.py`. A clean scan never selects a raw view.
 
-Fail closed. A critical value, or free text the local NER pass did not resolve, keeps the task on the local model. The gate is `policy.py`. It is not a second model.
+- **Drop.** A password, national ID, or payment value is replaced with `[REDACTED]` and is not restored.
+- **Tokenize.** A detected name, email, phone, or street address becomes a placeholder for that conversation.
+- **Withhold.** Mail, page text, file contents, tool results, and earlier turns are free text. If the local NER pass is missing or did not clear them, the model receives `[UNRESOLVED]` and the raw text stays on the machine.
 
-`converse` asks the model only after that decision. On the local route the model sees the account's text with secrets already removed. On the cloud route it sees placeholders. Tool results sent back to a cloud model are redacted again. A reply is restored for the person, and a secret in that reply is dropped. An external tool returns a confirmation and does not run. A tool the account cannot see is refused.
+`allow_cloud` still records that this task may use a provider. It does not reveal records. A critical value or unresolved free text keeps `cloud_payload` empty, and the model is still shown only `redacted`. The gate is `policy.py`. It is not a second model.
+
+`converse` sends that redacted view. Fetched text is released again before it is appended. A reply is restored for the person, and a secret in that reply is dropped. An external tool returns a confirmation and does not run. A tool the account cannot see is refused. The person can still be shown a page or an inbox that the model was not allowed to read.
 
 ## What is critical
 
@@ -94,16 +97,18 @@ Tools declare an effect:
 
 Records coming back from a capability are untrusted. On the cloud path the model does not hold the raw values. On the local path it does hold task data, so external effects still wait for a confirm.
 
-Each tool call is appended to that account's activity log with secrets dropped. Another account cannot read the log. Mailbox and calendar secrets live in the broker. With a household store they are encrypted and survive a restart. The app can connect them for the signed-in account. The response does not return the secret.
+Each tool call is appended to that account's activity log with secrets dropped. Another account cannot read the log. Mailbox, calendar, and website sign-in secrets live in the broker. With a household store they are encrypted and survive a restart. The app can connect a mailbox or calendar for the signed-in account. The response does not return the secret. A website password is taken from the person's reply, stored for that site's host, and filled by Robin on the next visit. The username and password are removed before any model sees the task, including a cloud model. A verification code is asked for on every sign-in. It is not stored and it is not sent to a model. Another account cannot read them.
 
 ## Using the computer
 
 When a service has an API, the assistant uses that connector. Computer-use is the fallback: a browser on that instance. The assistant's computer is the house server, or that person's exe.dev VM. The Mac and the iPhone are clients. One account does not drive another person's VM, and the joint server does not drive a private VM's browser.
 
-A task opens an http or https page for that account. The model sees text, not a raw screenshot. Passwords, national IDs, and payment fields are drop. A click inside the task is `mutate`. Writing a file in that account's directory is `mutate`. Submitting, sending, paying, deleting, typing a password, running a command, or accepting a permission dialog is `external`. The confirm text shows the command with secrets removed. After that confirm, the command runs as that account's login. The login owns that directory and is not allowed to read the store key. Another account's directory is separate. The command's environment is only its path, home, and temporary directory. Text on the screen is data, including text that tries to instruct the model.
+A task opens an http or https page for that account when the person asks for a page. A general question does not start the browser. The model sees a structured accessible-text snapshot (URL, interactive refs, main content), not a raw screenshot. Passwords, national IDs, and payment fields are drop. A click inside the task is `mutate`. Writing a file in that account's directory is `mutate`. Submitting, sending, paying, deleting, typing a password, running a command, or accepting a permission dialog is `external`. The confirm text shows the command with secrets removed. After that confirm, the command runs as that account's login. The login owns that directory and is not allowed to read the store key. Another account's directory is separate. Robin can read files owned by the operating-system user it runs as. A directory owned by another user is not entered, and a file owned by another user is not read. As root, that person is `ROBIN_USER`; with it unset, other people's files stay closed. Photo search uses the same rule. A local vision model turns each picture into a vector stored encrypted for that account. The picture itself is not sent to a model provider. The first search can download the vision weights onto this machine. Without that model, Robin says photo search is unavailable. The command's environment is only its path, home, and temporary directory. Text on the screen is data, including text that tries to instruct the model.
 
-`Browser` drives a page on that instance. Playwright supplies the live page. The model receives the accessible text. A password field is dropped. A click or ordinary typing is `mutate`. Submitting and typing a password wait for a confirm. Tests stand in for the page and do not launch Chromium. The private image installs Chromium for that VM. The house server is a separate machine and does not use that image.
+`Browser` drives a page on that instance. Playwright supplies the live page. Opening or reading the page returns numbered interactive refs so the model can click or type without screenshots. The model receives the airlock view of that snapshot. Uncleared page text stays on the machine. A password field is dropped. A click or ordinary typing is `mutate`. Submitting and typing a password wait for a confirm. Tests stand in for the page and do not launch Chromium. The private image installs Chromium for that VM. The house server is a separate machine and does not use that image. On the house, Chromium is installed with `playwright install chromium` in the Robin environment. A checkout also uses `.ms-playwright` beside the repository when that directory contains Chromium and the home cache does not. Without that binary, opening a page stops and Robin says so.
 
 ## Proactive work
 
-A scheduled check stays off until that account turns it on with `POST /v1/schedule`, from the app. `robin tick` then runs a local check of mail and calendar for the accounts that asked. `deploy/robin-tick.timer` is the house timer. An external action is stored for confirmation and does not run on its own. The timer's output is a count. Memory stays on the instance, per account, and goes through the airlock before any cloud model.
+A scheduled check stays off until that account turns it on with `POST /v1/schedule`, from the app. `robin tick` then runs a local check of mail and calendar for the accounts that asked. `deploy/robin-tick.timer` is the house timer. The running server also checks automations about once a minute.
+
+An automation comes from a sentence, for example a day summary every day at 08:00, a check every hour, or a reminder in 15 minutes. A repeating interval keeps running. A delay such as “in 15 minutes” runs once. It belongs to that account, stays on the instance, and runs on the local model. The result is saved for that account. Another account cannot list, change, or cancel it. An external action during a run is stored for confirmation and does not run on its own. The timer's output is a count. Memory stays on the instance, per account, and goes through the airlock before any cloud model.

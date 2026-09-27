@@ -1,4 +1,4 @@
-"""Route a task. Cloud is opt-in and fail-closed. The gate is code, not a second model."""
+"""Route a task. The model is remote. The airlock decides what it may see. The gate is code, not a second model."""
 
 from __future__ import annotations
 

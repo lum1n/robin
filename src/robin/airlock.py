@@ -219,6 +219,31 @@ def redact(
     return "".join(pieces), Report(entities=entities, unresolved=free_text and not ner_available)
 
 
+def release(
+    text: str,
+    vault: Vault,
+    *,
+    vocabulary: tuple[VocabularyTerm, ...] = (),
+    free_text: bool = False,
+    ner_available: bool = False,
+    extra: tuple[Entity, ...] = (),
+) -> str:
+    """The only form of a string that may be sent to a model."""
+    if not text:
+        return ""
+    redacted, report = redact(
+        text,
+        vault,
+        vocabulary=vocabulary,
+        free_text=free_text,
+        ner_available=ner_available,
+        extra=extra,
+    )
+    if free_text and report.unresolved:
+        return UNRESOLVED
+    return redacted
+
+
 def _select(entities: list[Entity]) -> list[Entity]:
     ordered = sorted(
         entities,

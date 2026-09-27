@@ -106,9 +106,16 @@ def serve(service: Service, host: str = "127.0.0.1", port: int = 8787) -> None:
             query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length else b""
-            payload = json.loads(raw.decode()) if raw else {}
-            headers = {key.lower(): value for key, value in self.headers.items()}
-            status, response = dispatch(service, method, parsed.path, query=query, body=payload, headers=headers)
+            try:
+                payload = json.loads(raw.decode()) if raw else {}
+            except json.JSONDecodeError:
+                status, response = 400, {"error": "json is required"}
+            else:
+                headers = {key.lower(): value for key, value in self.headers.items()}
+                try:
+                    status, response = dispatch(service, method, parsed.path, query=query, body=payload, headers=headers)
+                except Exception:
+                    status, response = 500, {"error": "request failed"}
             data = json.dumps(response).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")

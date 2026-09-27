@@ -1,7 +1,11 @@
-"""Files on this instance. Each account has its own directory."""
+"""Files on this instance. This user can read what they own. Another user's files stay closed."""
 
 from __future__ import annotations
 
+import os
+import pwd
+import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +13,47 @@ from robin.capabilities.identity import claim, give
 from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
 
 _LIMIT = 1_000_000
+_VISIT_CAP = 30_000
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"}
+_BLOCKED_NAMES = {"robin.key", "store.key", "enroll.token"}
+_SKIP_NAMES = {".git", "node_modules", ".venv", "__pycache__", ".ms-playwright"}
+_SYSTEM_ROOTS = {
+    Path("/usr"),
+    Path("/bin"),
+    Path("/sbin"),
+    Path("/lib"),
+    Path("/lib64"),
+    Path("/boot"),
+    Path("/etc"),
+    Path("/proc"),
+    Path("/sys"),
+    Path("/dev"),
+    Path("/run"),
+    Path("/var/log"),
+    Path("/var/cache"),
+    Path("/var/lib/docker"),
+    Path("/var/lib/containerd"),
+}
+_FILE_WORD = re.compile(r"\b(?:files?|folders?|directories|documents?)\b", re.IGNORECASE)
+_FILE_ASK = re.compile(r"\b(?:list|show|find|browse|search|what|which|where)\b", re.IGNORECASE)
+_FILE_READ = re.compile(r"\b(?:read|open|show)\b", re.IGNORECASE)
+_FILE_CHANGE = re.compile(r"\b(?:write|create|save|delete|remove|edit)\b", re.IGNORECASE)
+_FILE_PATH = re.compile(r"(?<![:/])(/(?!/)[^\s\"']+)")
 
 
 class Workspace:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        volume: Path | None = None,
+        owner: Callable[[Path], int] | None = None,
+        user: int | None = None,
+    ) -> None:
         self.root = root
+        self.volume = volume if volume is not None else root
+        self.owner = owner or _owner_uid
+        self.user = user
 
     def names(self, account_id: str) -> list[str]:
         base = self._base(account_id)
@@ -29,11 +69,56 @@ class Workspace:
             found.append(resolved.relative_to(base).as_posix())
         return sorted(found)
 
+    def owned_files(self, account_id: str, *, suffixes: set[str] | None = None) -> list[Path]:
+        found: list[Path] = []
+        seen: set[Path] = set()
+        visits = 0
+        starts = [self._base(account_id)]
+        home = Path.home()
+        if _within(home, self.volume.resolve()):
+            starts.insert(0, home)
+        starts.append(self.volume)
+        for start in starts:
+            visits = self._walk(start, account_id, found, seen, visits, suffixes)
+        return sorted(found)
+
     def read(self, account_id: str, relative: str) -> str:
-        path = self.locate(account_id, relative)
+        try:
+            path = self.readable(account_id, relative)
+        except ValueError as exc:
+            return str(exc)
         if not path.is_file():
             return "file is missing"
+        if path.suffix.lower() in IMAGE_SUFFIXES:
+            return f"photo {path}"
         return path.read_text(errors="replace")[:_LIMIT]
+
+    def readable(self, account_id: str, text: str) -> Path:
+        if text.startswith("/"):
+            path = Path(text).resolve()
+            if not self.allowed_file(account_id, path):
+                raise ValueError("path belongs to another user")
+            return path
+        return self.locate(account_id, text)
+
+    def allowed_file(self, account_id: str, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        if resolved.name in _BLOCKED_NAMES or _skipped(resolved):
+            return False
+        if self._in_other_account(account_id, resolved):
+            return False
+        if self._in_account(account_id, resolved) and resolved.is_file():
+            return True
+        if self._behind_foreign_user(account_id, resolved):
+            return False
+        try:
+            uid = self.owner(resolved)
+        except OSError:
+            return False
+        return resolved.is_file() and uid in self._allowed()
 
     def write(self, account_id: str, relative: str, text: str) -> None:
         if len(text.encode()) > _LIMIT:
@@ -72,19 +157,108 @@ class Workspace:
             raise ValueError("account is required")
         return (self.root / account_id).resolve()
 
+    def _walk(
+        self,
+        directory: Path,
+        account_id: str,
+        found: list[Path],
+        seen: set[Path],
+        visits: int,
+        suffixes: set[str] | None,
+    ) -> int:
+        if visits >= _VISIT_CAP:
+            return visits
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            return visits
+        if resolved in seen or _skipped(resolved) or self._in_other_account(account_id, resolved):
+            return visits
+        seen.add(resolved)
+        try:
+            uid = self.owner(resolved)
+            children = list(resolved.iterdir()) if resolved.is_dir() else []
+        except OSError:
+            return visits
+        visits += 1
+        if self._foreign(uid) and not self._in_account(account_id, resolved):
+            return visits
+        for child in children:
+            if visits >= _VISIT_CAP:
+                return visits
+            if child.is_symlink() or child.name in _BLOCKED_NAMES:
+                continue
+            try:
+                child_uid = self.owner(child)
+            except OSError:
+                continue
+            if child.is_dir():
+                visits = self._walk(child, account_id, found, seen, visits, suffixes)
+                continue
+            if not child.is_file():
+                continue
+            if suffixes is not None and child.suffix.lower() not in suffixes:
+                continue
+            if child_uid in self._allowed() or self._in_account(account_id, child):
+                if not self._in_other_account(account_id, child):
+                    found.append(child.resolve())
+        return visits
+
+    def _allowed(self) -> set[int]:
+        if self.user is not None:
+            return {self.user}
+        uid = os.geteuid()
+        if uid != 0:
+            return {uid}
+        name = os.environ.get("ROBIN_USER", "").strip()
+        if not name:
+            return set()
+        try:
+            return {pwd.getpwnam(name).pw_uid}
+        except KeyError:
+            return set()
+
+    def _foreign(self, uid: int) -> bool:
+        return uid >= 1000 and uid not in self._allowed()
+
+    def _behind_foreign_user(self, account_id: str, path: Path) -> bool:
+        for ancestor in [path, *path.parents]:
+            if self._in_account(account_id, ancestor):
+                return False
+            try:
+                uid = self.owner(ancestor)
+            except OSError:
+                return True
+            if self._foreign(uid):
+                return True
+        return False
+
+    def _in_account(self, account_id: str, path: Path) -> bool:
+        base = self._base(account_id)
+        resolved = path if path.is_absolute() else path.resolve()
+        return resolved == base or base in resolved.parents
+
+    def _in_other_account(self, account_id: str, path: Path) -> bool:
+        root = self.root.resolve()
+        resolved = path.resolve()
+        if resolved == root or root not in resolved.parents:
+            return False
+        top = root / resolved.relative_to(root).parts[0]
+        return top != self._base(account_id) and top.is_dir()
+
 
 class Files(Capability):
     id = "files"
     tools = [
         Tool(
             name="list_files",
-            description="List files in this account's directory.",
+            description="List files owned by this user on this machine. Another user's files are left out.",
             parameters={"type": "object", "properties": {}},
             effect=Effect.READ,
         ),
         Tool(
             name="read_file",
-            description="Read a file in this account's directory.",
+            description="Read a file this user owns. Another user's path is refused.",
             parameters={
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -118,12 +292,29 @@ class Files(Capability):
     def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
 
+    def prepare(self, account_id: str, task: str) -> str:
+        if _FILE_CHANGE.search(task):
+            return ""
+        named = _FILE_PATH.search(task)
+        if named and _FILE_READ.search(task):
+            return self.workspace.read(account_id, named.group(1).rstrip(".,"))
+        if _FILE_WORD.search(task) and _FILE_ASK.search(task):
+            return self.invoke(account_id, "list_files", {})
+        return ""
+
     def records(self, account_id: str) -> list[dict[str, str]]:
         return [{"name": name} for name in self.workspace.names(account_id)]
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
         if tool_name == "list_files":
-            return f"{len(self.records(account_id))} files"
+            paths = self.workspace.owned_files(account_id)
+            if not paths:
+                return "no files"
+            shown = [str(path) for path in paths[:100]]
+            body = "\n".join(shown)
+            if len(paths) > len(shown):
+                body += f"\n{len(shown)} of {len(paths)}"
+            return body
         if tool_name == "read_file":
             return self.workspace.read(account_id, str(arguments.get("path", "")))
         if tool_name == "write_file":
@@ -132,3 +323,21 @@ class Files(Capability):
         if tool_name == "delete_file":
             return self.workspace.delete(account_id, str(arguments.get("path", "")))
         raise NotImplementedError(tool_name)
+
+
+def _owner_uid(path: Path) -> int:
+    return path.stat().st_uid
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved == root or root in resolved.parents
+
+
+def _skipped(path: Path) -> bool:
+    if path in _SYSTEM_ROOTS or any(root in path.parents for root in _SYSTEM_ROOTS):
+        return True
+    return path.name in _SKIP_NAMES

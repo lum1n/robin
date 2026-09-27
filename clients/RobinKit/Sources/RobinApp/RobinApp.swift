@@ -24,6 +24,7 @@ final class ShellModel: ObservableObject {
     @Published var vaultPassphrase = ""
     @Published var vaultExport = ""
     @Published var failure: String?
+    @Published private(set) var waiting = false
 
     private let shell: Shell
 
@@ -37,8 +38,11 @@ final class ShellModel: ObservableObject {
             failure = "Instance, account, and password are required."
             return
         }
+        guard !waiting else { return }
         let secret = password
         password = ""
+        waiting = true
+        defer { waiting = false }
         do {
             try await shell.signIn(instance: url, accountID: accountID, password: secret)
             scheduleOn = await shell.scheduleEnabled
@@ -46,12 +50,13 @@ final class ShellModel: ObservableObject {
         } catch let error as RobinFailure {
             failure = error.message
         } catch {
-            failure = "Could not reach Robin."
+            failure = _reach(error)
         }
     }
 
     func send() async {
-        let text = draft
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !waiting else { return }
         draft = ""
         await perform {
             try await self.shell.send(conversationID: self.conversationID, text: text)
@@ -95,13 +100,16 @@ final class ShellModel: ObservableObject {
         let secret = vaultPassphrase
         vaultPassphrase = ""
         failure = nil
+        guard !waiting else { return }
+        waiting = true
+        defer { waiting = false }
         do {
             vaultExport = try await shell.exportVault(passphrase: secret)
             phase = await shell.phase
         } catch let error as RobinFailure {
             failure = error.message
         } catch {
-            failure = "Could not reach Robin."
+            failure = _reach(error)
         }
     }
 
@@ -127,16 +135,27 @@ final class ShellModel: ObservableObject {
     }
 
     private func perform(_ work: () async throws -> Void) async {
+        guard !waiting else { return }
         failure = nil
+        waiting = true
+        defer { waiting = false }
         do {
             try await work()
             phase = await shell.phase
         } catch let error as RobinFailure {
             failure = error.message
         } catch {
-            failure = "Could not reach Robin."
+            failure = _reach(error)
         }
     }
+}
+
+private func _reach(_ error: Error) -> String {
+    let text = String(describing: error).lowercased()
+    if text.contains("timed out") || text.contains("timeout") {
+        return "Robin took too long to answer."
+    }
+    return "Could not reach Robin."
 }
 
 struct RobinRootView: View {
@@ -165,6 +184,9 @@ private struct SignInForm: View {
                 .robinField()
             SecureField("Password", text: $model.password)
                 .robinField()
+            if model.waiting {
+                Text("Waiting for Robin…")
+            }
             if let failure = model.failure {
                 Text(failure)
             }
@@ -181,6 +203,9 @@ private struct ConversationForm: View {
 
     var body: some View {
         RobinFields {
+            if model.waiting {
+                Text("Waiting for Robin…")
+            }
             switch model.phase {
             case .ready(let threads, let reply):
                 Text(threads.isEmpty ? "No threads yet" : threads.joined(separator: ", "))
@@ -193,6 +218,10 @@ private struct ConversationForm: View {
                 Button("Confirm") {
                     Task { await model.confirm() }
                 }
+                .buttonStyle(.borderedProminent)
+                if let failure = model.failure {
+                    Text(failure)
+                }
             case .signedOut:
                 EmptyView()
             }
@@ -203,9 +232,9 @@ private struct ConversationForm: View {
             Button("Send") {
                 Task { await model.send() }
             }
-            TextField("IMAP host", text: $model.imapHost)
+            TextField("IMAP host, blank for iCloud", text: $model.imapHost)
                 .robinField()
-            TextField("SMTP host", text: $model.smtpHost)
+            TextField("SMTP host, blank for iCloud", text: $model.smtpHost)
                 .robinField()
             TextField("Mail user", text: $model.mailUser)
                 .robinField()

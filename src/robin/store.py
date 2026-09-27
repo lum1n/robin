@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -17,7 +18,8 @@ class HouseholdStore:
         self.path = Path(path)
         self._key = key
         self._fernet = Fernet(key)
-        self._db = sqlite3.connect(self.path)
+        self._local = threading.local()
+        self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY)")
         self._db.execute(
             """
@@ -86,7 +88,20 @@ class HouseholdStore:
         )
         self._db.execute("CREATE TABLE IF NOT EXISTS pantry (id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS schedules (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS jobs (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS photo_index (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        db = getattr(self._local, "db", None)
+        if db is None:
+            db = sqlite3.connect(self.path, timeout=5)
+            self._local.db = db
+        return db
+
+    @property
+    def _db(self) -> sqlite3.Connection:
+        return self._connect()
 
     def close(self) -> None:
         self._db.close()
@@ -281,6 +296,10 @@ class HouseholdStore:
         rows = self._db.execute("SELECT account_id, name, body FROM secrets").fetchall()
         return [(account_id, name, self._open(body)) for account_id, name, body in rows]
 
+    def delete_secret(self, account_id: str, name: str) -> None:
+        self._db.execute("DELETE FROM secrets WHERE account_id = ? AND name = ?", (account_id, name))
+        self._db.commit()
+
     def save_pantry(self, record: dict) -> None:
         self._db.execute(
             """
@@ -305,6 +324,36 @@ class HouseholdStore:
     def load_schedules(self) -> dict[str, bool]:
         rows = self._db.execute("SELECT account_id, body FROM schedules").fetchall()
         return {account_id: bool(json.loads(self._open(body))["enabled"]) for account_id, body in rows}
+
+    def save_jobs(self, account_id: str, jobs: list[dict]) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO jobs (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(jobs, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_jobs(self) -> dict[str, list[dict]]:
+        rows = self._db.execute("SELECT account_id, body FROM jobs").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
+
+    def save_photo_index(self, account_id: str, rows: list[dict]) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO photo_index (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(rows, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_photo_index(self) -> dict[str, list[dict]]:
+        rows = self._db.execute("SELECT account_id, body FROM photo_index").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
 
     def load_pantry(self) -> dict | None:
         row = self._db.execute("SELECT body FROM pantry WHERE id = 'household'").fetchone()

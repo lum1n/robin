@@ -2,6 +2,9 @@ import json
 from email.message import EmailMessage
 
 from robin.capabilities.mail import ImapMailbox, ImaplibClient, Mail, SmtplibClient, mailbox_secret
+from robin.loop import converse
+from robin.model import ModelTurn
+from robin.policy import Task
 from robin.session import Assistant
 
 PASSWORD = "sk-mailboxsecretvalue1234567890"
@@ -165,7 +168,7 @@ def test_plain_part_is_the_body_and_a_missing_secret_does_not_connect() -> None:
     assert seen == []
     broker.put("ada", "mailbox", mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD))
     rows = mailbox.messages("ada")
-    assert rows == [{"sender": "Jane Doe", "body": "plain note"}]
+    assert rows == [{"sender": "Jane Doe", "subject": "", "body": "plain note"}]
     assert "<p>" not in rows[0]["body"]
 
 
@@ -200,6 +203,70 @@ def test_send_waits_for_confirm_and_the_password_is_not_logged() -> None:
     assert assistant.activity.read("bea") == []
     schemas = assistant.tools("ada")
     assert all("password" not in json.dumps(tool) for tool in schemas)
+
+
+def test_asking_for_mail_fetches_the_inbox_before_the_model_speaks() -> None:
+    assistant = Assistant()
+    directory = Directory()
+    assistant.broker.put(
+        "ada",
+        "mailbox",
+        mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD),
+    )
+    assistant.add(Mail(ImapMailbox(assistant.broker, open_imap=directory.open_imap, open_smtp=directory.open_smtp)))
+
+    class Scripted:
+        def __init__(self) -> None:
+            self.user = ""
+
+        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
+            self.user = user
+            return ModelTurn("I am unable to read your email.")
+
+    model = Scripted()
+    reply = converse(assistant, Task("ada", "home", "read my email"), model)
+    assert model.user == ""
+    assert "Inbox:" in reply.text
+    assert "hello from ada" in reply.text
+    assert PASSWORD not in reply.text
+    missing = converse(assistant, Task("bea", "home", "check my inbox"), model)
+    assert missing.text == "The mailbox is not connected. Connect it from the app, then ask again."
+
+
+def test_an_icloud_address_uses_icloud_mail_servers() -> None:
+    seen: list[str] = []
+
+    class Probe:
+        def login(self, user: str, password: str) -> None:
+            return None
+
+        def fetch_recent(self, limit: int) -> list[bytes]:
+            return []
+
+        def logout(self) -> None:
+            return None
+
+    broker = Broker()
+    broker.put(
+        "ada",
+        "mailbox",
+        mailbox_secret(imap_host="", smtp_host="icloud.com", user="ada@icloud.com", password=PASSWORD),
+    )
+    mailbox = ImapMailbox(broker, open_imap=lambda host: seen.append(host) or Probe(), open_smtp=lambda host: None)
+    assert mailbox.messages("ada") == []
+    assert seen == ["imap.mail.me.com"]
+    assistant = Assistant()
+    assistant.broker.put(
+        "ada",
+        "mailbox",
+        mailbox_secret(imap_host="imap.mail.me.com", smtp_host="smtp.mail.me.com", user="ada@icloud.com", password=PASSWORD),
+    )
+    mail = Mail(ImapMailbox(assistant.broker, open_imap=lambda host: ExplodingLogin(PASSWORD), open_smtp=lambda host: None))
+    assistant.add(mail)
+    assert mail.prepare("ada", "read my icloud mail") == ""
+    told = mail.take_direct("ada")
+    assert "app-specific password" in told
+    assert PASSWORD not in told
 
 
 def test_login_failure_does_not_repeat_the_password() -> None:

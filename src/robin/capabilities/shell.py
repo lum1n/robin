@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from robin.capabilities.browser import _wants_page
 from robin.capabilities.identity import claim, run_as
 from robin.capability import Capability, Effect, FieldSpec, Tool
 
@@ -41,6 +42,11 @@ class Terminal(Capability):
 
     def __init__(self, box: ShellBox) -> None:
         self.box = box
+
+    def offered_tools(self, account_id: str, task: str) -> list[Tool]:
+        if _wants_page(task):
+            return []
+        return list(self.tools)
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
         if tool_name == "run_command":

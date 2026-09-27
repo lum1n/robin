@@ -134,8 +134,7 @@ def test_tick_checks_enabled_accounts_and_prints_no_secret(tmp_path: Path, capsy
     printed = capsys.readouterr().out
     assert '"checked": 1' in printed
     assert "mailbox-password-ada" not in printed
-    assert Quiet.prompts
-    assert "mailbox-password-ada" not in Quiet.prompts[0]
+    assert "mailbox-password-ada" not in "".join(Quiet.prompts)
 
     def boom(*_args, **_kwargs):
         raise AssertionError("model")

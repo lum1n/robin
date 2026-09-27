@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
-from robin.airlock import VocabularyTerm, redact
-from robin.capability import Capability, Effect, Registry, render_context
+from robin.airlock import UNRESOLVED, VocabularyTerm, redact
+from robin.capability import Capability, DueWork, Effect, Registry, SecretAccepted, render_context
 from robin.ner import Ner, UnavailableNer
 from robin.policy import Decision, Task, decide
 from robin.store import HouseholdStore
@@ -39,6 +40,11 @@ class Broker:
 
     def reveal(self, account_id: str, name: str) -> str:
         return self._secrets[(account_id, name)]
+
+    def delete(self, account_id: str, name: str) -> None:
+        self._secrets.pop((account_id, name), None)
+        if self.store is not None:
+            self.store.delete_secret(account_id, name)
 
     def names(self, account_id: str) -> list[str]:
         return sorted(name for owner, name in self._secrets if owner == account_id)
@@ -141,8 +147,36 @@ class Assistant:
     def scheduled_accounts(self) -> list[str]:
         return sorted(account_id for account_id, enabled in self.schedules.items() if enabled)
 
-    def tools(self, account_id: str) -> list[dict[str, Any]]:
-        return self.registry.schemas(account_id)
+    def tools(self, account_id: str, task: str = "") -> list[dict[str, Any]]:
+        return self.registry.schemas(account_id, task)
+
+    def prepare(self, account_id: str, task: str) -> str:
+        notes = [note for capability in self.registry.for_account(account_id) if (note := capability.prepare(account_id, task))]
+        return "\n".join(notes)
+
+    def take_direct(self, account_id: str) -> str:
+        notes = [note for capability in self.registry.for_account(account_id) if (note := capability.take_direct(account_id))]
+        return "\n".join(notes)
+
+    def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
+        for capability in self.registry.for_account(account_id):
+            accepted = capability.accept_secret(account_id, conversation_id, text)
+            if accepted is not None:
+                return accepted
+        return None
+
+    def peel_secret(self, account_id: str, text: str) -> str | None:
+        for capability in self.registry.for_account(account_id):
+            peeled = capability.peel_secret(account_id, text)
+            if peeled is not None:
+                return peeled
+        return None
+
+    def due(self, now: datetime) -> list[DueWork]:
+        found: list[DueWork] = []
+        for capability in self.registry._capabilities:
+            found.extend(capability.due(now))
+        return found
 
     def decide(self, task: Task) -> Decision:
         vault = self.vaults.get(task.account_id, task.conversation_id)
@@ -163,7 +197,8 @@ class Assistant:
             ner_available=self.ner.available(),
             extra=self.ner.detect(task.text) if self.ner.available() else (),
         )
-        redacted = json.dumps({"message": message, "context": context}, sort_keys=True)
+        outgoing = UNRESOLVED if task.free_text and message_report.unresolved else message
+        redacted = json.dumps({"message": outgoing, "context": context}, sort_keys=True)
         local_context, _ = render_context(
             self.registry.for_account(task.account_id),
             task.account_id,

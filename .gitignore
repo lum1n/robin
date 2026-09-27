@@ -1,4 +1,5 @@
 .venv/
+.ms-playwright/
 clients/RobinKit/.build/
 __pycache__/
 .pytest_cache/
