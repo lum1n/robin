@@ -53,10 +53,11 @@ class PlaywrightPage:
 
     def read(self) -> tuple[str, str]:
         data = self._collect()
-        self._refs = {
-            str(index): (str(item["role"]), str(item["name"]))
-            for index, item in enumerate(data.get("interactive") or (), start=1)
-        }
+        refs: dict[str, tuple[str, str]] = {}
+        for index, item in enumerate(data.get("interactive") or (), start=1):
+            key = str(item.get("ref") or index)
+            refs[key] = (str(item.get("role") or "link"), str(item.get("name") or ""))
+        self._refs = refs
         text = _format_snapshot(data)
         secrets = list(data.get("secrets") or [])
         for secret in secrets:
@@ -114,7 +115,24 @@ class PlaywrightPage:
                 values.append(value)
         return [value for value in values if value]
 
-    def click(self, target: str, role: str = "") -> None:
+    def settle(self) -> None:
+        page = self._page
+        wait = getattr(page, "wait_for_load_state", None)
+        if callable(wait):
+            try:
+                wait("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+        pause = getattr(page, "wait_for_timeout", None)
+        if callable(pause):
+            try:
+                pause(150)
+            except Exception:
+                pass
+
+    def click(self, target: str, role: str = "", ref: str = "") -> None:
+        if ref and self._act_ref(ref, "click"):
+            return
         if role in {"link", "button"}:
             try:
                 control = self._page.get_by_role(role, name=target)
@@ -125,7 +143,9 @@ class PlaywrightPage:
                 pass
         self._page.get_by_text(target).click()
 
-    def type_text(self, target: str, text: str) -> None:
+    def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
+        if ref and self._act_ref(ref, "fill", text):
+            return
         try:
             labeled = self._page.get_by_label(target)
             if int(labeled.count()) > 0:
@@ -141,6 +161,25 @@ class PlaywrightPage:
         except Exception:
             pass
         self._page.get_by_label(target).fill(text)
+
+    def _act_ref(self, ref: str, action: str, text: str = "") -> bool:
+        selector = f'[data-robin-ref="{ref}"]'
+        frames: list[Any] = [self._page]
+        frames.extend(frame for frame in (getattr(self._page, "frames", None) or ()) if frame is not None)
+        for frame in frames:
+            try:
+                locator = frame.locator(selector)
+                if int(locator.count()) == 0:
+                    continue
+                target = locator.first
+                if action == "click":
+                    target.click()
+                else:
+                    target.fill(text)
+                return True
+            except Exception:
+                continue
+        return False
 
     def type_password(self, text: str) -> None:
         self._fields("input[type='password']").first.fill(text)
@@ -556,22 +595,31 @@ class Browser(Capability):
         try:
             if tool_name == "click":
                 target = str(arguments.get("target", ""))
-                role, name = self._resolve(account_id, target, prefer=("link", "button"))
-                self._use(account_id, lambda page: _click(page, name, role))
-                return f"clicked {target}\n{self._observe(account_id)}"
+                before = self._url(account_id)
+                role, name, ref = self._resolve(account_id, target, prefer=("link", "button"))
+                self._use(account_id, lambda page: _click(page, name, role, ref=ref))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"clicked {target}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "type_text":
                 target = str(arguments.get("target", ""))
                 text = str(arguments.get("text", ""))
-                role, name = self._resolve(account_id, target, prefer=("textbox",))
-                self._use(account_id, lambda page: _type_text(page, name, text, role))
-                return f"typed into {target}\n{self._observe(account_id)}"
+                before = self._url(account_id)
+                role, name, ref = self._resolve(account_id, target, prefer=("textbox",))
+                self._use(account_id, lambda page: _type_text(page, name, text, role, ref=ref))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"typed into {target}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "type_password":
                 secret = str(arguments.get("text", ""))
                 self._use(account_id, lambda page: page.type_password(secret))
                 return "typed"
             if tool_name == "submit":
+                before = self._url(account_id)
                 self._use(account_id, lambda page: page.submit())
-                return f"submitted\n{self._observe(account_id)}"
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"submitted\n{_action_diff(before, after)}\n{after}"
             if tool_name == "read_screen":
                 return self._observe(account_id)
         except RuntimeError as exc:
@@ -599,18 +647,31 @@ class Browser(Capability):
             text = text[:4000]
         return text
 
-    def _resolve(self, account_id: str, target: str, *, prefer: tuple[str, ...]) -> tuple[str, str]:
+    def _resolve(self, account_id: str, target: str, *, prefer: tuple[str, ...]) -> tuple[str, str, str]:
         key = target.strip()
         refs = self._refs.get(account_id) or {}
         if key in refs:
-            return refs[key]
-        for _ref, (role, name) in refs.items():
+            role, name = refs[key]
+            return role, name, key
+        for ref, (role, name) in refs.items():
             if name == key and (not prefer or role in prefer):
-                return role, name
-        for _ref, (role, name) in refs.items():
+                return role, name, ref
+        for ref, (role, name) in refs.items():
             if name == key:
-                return role, name
-        return "", key
+                return role, name, ref
+        return "", key, ""
+
+    def _url(self, account_id: str) -> str:
+        try:
+            return str(self._use(account_id, lambda page: page.location()) or "")
+        except Exception:
+            return ""
+
+    def _settle(self, account_id: str) -> None:
+        try:
+            self._use(account_id, lambda page: _settle(page))
+        except Exception:
+            return
 
     def _use(self, account_id: str, function: Any) -> Any:
         if self.desk is not None:
@@ -926,10 +987,14 @@ _SNAPSHOT_JS = """() => {
   const cleanLabel = (value) => String(value || "").replace(/\\s+/g, " ").trim().slice(0, 120);
   const visible = (node) => {
     if (!(node instanceof Element)) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    try {
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch (err) {
+      return true;
+    }
   };
   const regionOf = (node) => {
     if (node.closest('[role="dialog"], dialog[open], [aria-modal="true"]')) return "dialog";
@@ -969,9 +1034,21 @@ _SNAPSHOT_JS = """() => {
     return states;
   };
   const interactive = [];
+  let nextRef = 1;
+  const clearStamps = (root) => {
+    for (const node of root.querySelectorAll("[data-robin-ref]")) {
+      node.removeAttribute("data-robin-ref");
+    }
+  };
   const add = (node, role, name, value) => {
     if (!visible(node) || interactive.length >= 80) return;
+    if (node.getAttribute && node.getAttribute("data-robin-ref")) return;
+    const ref = String(nextRef++);
+    try {
+      node.setAttribute("data-robin-ref", ref);
+    } catch (err) {}
     interactive.push({
+      ref,
       role,
       name: cleanLabel(name) || "unnamed",
       region: regionOf(node),
@@ -979,23 +1056,13 @@ _SNAPSHOT_JS = """() => {
       value: cleanLabel(value || ""),
     });
   };
-  const roots = [];
-  const dialog = document.querySelector('[role="dialog"], dialog[open], [aria-modal="true"]');
-  if (dialog) roots.push(dialog);
-  roots.push(document);
-  const seenNodes = new Set();
-  for (const root of roots) {
-    const scope = root === document ? document : root;
+  const collectIn = (scope) => {
     for (const node of scope.querySelectorAll("a[href]")) {
-      if (seenNodes.has(node)) continue;
-      seenNodes.add(node);
       add(node, "link", labelOf(node, [node.innerText, node.getAttribute("aria-label"), node.getAttribute("title")]));
     }
     for (const node of scope.querySelectorAll(
       "button, [role='button'], input[type='submit'], input[type='button'], summary"
     )) {
-      if (seenNodes.has(node)) continue;
-      seenNodes.add(node);
       add(
         node,
         "button",
@@ -1005,8 +1072,6 @@ _SNAPSHOT_JS = """() => {
     for (const node of scope.querySelectorAll(
       "input:not([type='hidden']):not([type='password']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio']):not([type='file']), textarea, [role='textbox']"
     )) {
-      if (seenNodes.has(node)) continue;
-      seenNodes.add(node);
       add(
         node,
         "textbox",
@@ -1020,8 +1085,6 @@ _SNAPSHOT_JS = """() => {
       );
     }
     for (const node of scope.querySelectorAll("input[type='checkbox'], [role='checkbox']")) {
-      if (seenNodes.has(node)) continue;
-      seenNodes.add(node);
       add(
         node,
         "checkbox",
@@ -1029,8 +1092,6 @@ _SNAPSHOT_JS = """() => {
       );
     }
     for (const node of scope.querySelectorAll("input[type='radio'], [role='radio']")) {
-      if (seenNodes.has(node)) continue;
-      seenNodes.add(node);
       add(
         node,
         "radio",
@@ -1038,8 +1099,6 @@ _SNAPSHOT_JS = """() => {
       );
     }
     for (const node of scope.querySelectorAll("select, [role='combobox'], [role='listbox']")) {
-      if (seenNodes.has(node)) continue;
-      seenNodes.add(node);
       const selected = node.selectedOptions && node.selectedOptions[0] ? node.selectedOptions[0].text : node.value;
       add(
         node,
@@ -1049,12 +1108,38 @@ _SNAPSHOT_JS = """() => {
       );
     }
     for (const node of scope.querySelectorAll("[role='tab'], [role='menuitem'], [role='option'], [role='switch']")) {
-      if (seenNodes.has(node)) continue;
-      seenNodes.add(node);
       const role = node.getAttribute("role") || "button";
       add(node, role, labelOf(node, [node.innerText, node.getAttribute("aria-label"), node.getAttribute("title")]));
     }
-  }
+  };
+  const walkShadow = (root) => {
+    for (const node of root.querySelectorAll("*")) {
+      if (node.shadowRoot) {
+        clearStamps(node.shadowRoot);
+        collectIn(node.shadowRoot);
+        walkShadow(node.shadowRoot);
+      }
+    }
+  };
+  const walkDocument = (doc) => {
+    if (!doc || !doc.querySelectorAll) return;
+    clearStamps(doc);
+    const dialog = doc.querySelector('[role="dialog"], dialog[open], [aria-modal="true"]');
+    if (dialog) {
+      collectIn(dialog);
+      walkShadow(dialog);
+    }
+    collectIn(doc);
+    walkShadow(doc);
+    for (const frame of doc.querySelectorAll("iframe")) {
+      try {
+        const child = frame.contentDocument;
+        if (child) walkDocument(child);
+      } catch (err) {}
+    }
+  };
+  walkDocument(document);
+  const dialog = document.querySelector('[role="dialog"], dialog[open], [aria-modal="true"]');
   const contentRoot = dialog
     || document.querySelector("main, article, [role='main']")
     || document.body
@@ -1091,6 +1176,7 @@ def _format_snapshot(data: dict[str, Any]) -> str:
         for index, item in enumerate(interactive, start=1):
             role = str(item.get("role") or "link")
             name = str(item.get("name") or "").replace('"', "'")
+            ref = str(item.get("ref") or index)
             meta: list[str] = []
             region = str(item.get("region") or "").strip()
             if region:
@@ -1103,7 +1189,7 @@ def _format_snapshot(data: dict[str, Any]) -> str:
             if value:
                 meta.append(f"value={value.replace(chr(34), chr(39))}")
             suffix = f" ({', '.join(meta)})" if meta else ""
-            lines.append(f'[{index}] {role} "{name}"{suffix}')
+            lines.append(f'[{ref}] {role} "{name}"{suffix}')
     else:
         lines.append("(none)")
     lines.append("")
@@ -1147,14 +1233,42 @@ def _parse_refs(snapshot: str) -> dict[str, tuple[str, str]]:
     return refs
 
 
-def _click(page: Page, target: str, role: str = "") -> None:
+def _action_diff(before_url: str, snapshot: str) -> str:
+    after_url = ""
+    for line in snapshot.splitlines():
+        if line.startswith("URL:"):
+            after_url = line[4:].strip()
+            break
+    bits: list[str] = []
+    if before_url and after_url and before_url != after_url:
+        bits.append(f"url {after_url}")
+    if " (dialog" in snapshot:
+        bits.append("dialog open")
+    if not bits:
+        bits.append("page updated")
+    return "changed: " + ", ".join(bits)
+
+
+def _settle(page: Page) -> None:
+    settle = getattr(page, "settle", None)
+    if callable(settle):
+        settle()
+
+
+def _click(page: Page, target: str, role: str = "", ref: str = "") -> None:
     click = getattr(page, "click")
     try:
-        click(target, role=role)
+        click(target, role=role, ref=ref)
     except TypeError:
-        click(target)
+        try:
+            click(target, role=role)
+        except TypeError:
+            click(target)
 
 
-def _type_text(page: Page, target: str, text: str, role: str = "") -> None:
+def _type_text(page: Page, target: str, text: str, role: str = "", ref: str = "") -> None:
     type_text = getattr(page, "type_text")
-    type_text(target, text)
+    try:
+        type_text(target, text, role=role, ref=ref)
+    except TypeError:
+        type_text(target, text)

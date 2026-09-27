@@ -18,10 +18,10 @@ The collector used to flatten the page and cut every string at 120 characters, i
 
 What a screenshot still shows, and this snapshot still drops:
 
-- A full accessibility-tree walk. Collection is still query selectors, not the browser a11y tree.
-- Iframes and shadow DOM. Login fields are searched in frames. The snapshot is not.
-- Which DOM node a ref points at. A ref is still resolved to role plus name, then clicked with `get_by_role` or `get_by_text`. A second "Delete" can be listed twice and still hit the first node.
-- Proof that the last action worked beyond the next snapshot (no one-line diff yet).
+- A full accessibility-tree walk. Collection is still query selectors (plus same-origin iframes and open shadow roots), not the browser a11y tree.
+- Proof beyond the one-line change note and the next snapshot.
+- Extra pointer actions: scroll, select, key press, hover, and back are not tools yet.
+- Popups and downloads as their own page.
 
 If local NER is off, `release` replaces that entire snapshot with `[UNRESOLVED]`. The model then has nothing to click. Tool arguments are already restored before `invoke`, so a placeholder in a name can still be resolved at click time once the ref itself survives.
 
@@ -63,7 +63,7 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 - [x] Stop cutting page content at 120 characters in `_SNAPSHOT_JS`
 - [ ] Build the snapshot from the visible accessibility tree, not from query selectors alone
 - [x] If a dialog is open, snapshot that dialog first
-- [ ] Include iframes and open shadow roots
+- [x] Include iframes and open shadow roots
 - [x] Record role, accessible name, states, value, and a numbered ref for each control
 - [x] Keep two controls with the same name as two refs
 - [x] Give an unlabeled control a ref and a neighbor label
@@ -73,9 +73,9 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 
 ### Actions hit the ref
 
-- [ ] Stamp the ref on the node, or keep a locator, and click that node
-- [ ] After each action, wait until navigation or the DOM settles
-- [ ] Return a fresh snapshot plus a one-line diff: URL, dialog opened or closed, text that appeared
+- [x] Stamp the ref on the node, or keep a locator, and click that node
+- [x] After each action, wait until navigation or the DOM settles
+- [x] Return a fresh snapshot plus a one-line diff: URL, dialog opened or closed, text that appeared
 - [ ] Add scroll, select, checkbox and radio, key press, hover, and back
 - [ ] Type into the focused ref, including a field that is not a labeled textbox
 - [ ] When a site opens a popup or starts a download, keep that as its own page

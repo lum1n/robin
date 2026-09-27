@@ -327,6 +327,7 @@ def test_click_uses_interactive_refs_from_the_snapshot() -> None:
             super().__init__(text="Storm hits the coast")
             self._refs = {"1": ("link", "Storm hits the coast")}
             self.role_clicks: list[tuple[str, str]] = []
+            self.ref_clicks: list[str] = []
 
         def open(self, url: str) -> None:
             self.text = "Storm hits the coast"
@@ -337,7 +338,9 @@ def test_click_uses_interactive_refs_from_the_snapshot() -> None:
                 "",
             )
 
-        def click(self, target: str, role: str = "") -> None:
+        def click(self, target: str, role: str = "", ref: str = "") -> None:
+            if ref:
+                self.ref_clicks.append(ref)
             self.role_clicks.append((role, target))
             self.clicked = target
 
@@ -352,8 +355,62 @@ def test_click_uses_interactive_refs_from_the_snapshot() -> None:
     assert "[1] link" in opened["result"]
     clicked = assistant.invoke("ada", "home", "click", {"target": "1"})
     assert clicked["status"] == "done"
+    assert page.ref_clicks == ["1"]
     assert page.role_clicks == [("link", "Storm hits the coast")]
+    assert "changed:" in clicked["result"]
     assert "Content:" in clicked["result"]
+
+
+def test_stamped_ref_clicks_the_second_duplicate_control() -> None:
+    class Stamped(FakePlaywright):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = Node(values=["Delete"])
+            self.first.name = "Delete"
+            self.second = Node(values=["Delete"])
+            self.second.name = "Delete"
+            self.stamped = {"1": self.first, "2": self.second}
+            self.ref_hits: list[str] = []
+
+        def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+            self.url = url
+
+        def evaluate(self, script: str) -> dict:
+            return {
+                "url": self.url,
+                "title": "Items",
+                "interactive": [
+                    {"ref": "1", "role": "button", "name": "Delete", "region": "main", "states": [], "value": ""},
+                    {"ref": "2", "role": "button", "name": "Delete", "region": "main", "states": [], "value": ""},
+                ],
+                "content": "two rows",
+                "secrets": [],
+            }
+
+        def locator(self, selector: str) -> Node:
+            if 'data-robin-ref="' in selector:
+                ref = selector.split('data-robin-ref="', 1)[1].split('"', 1)[0]
+                node = self.stamped[ref]
+                hits = self.ref_hits
+
+                def click() -> None:
+                    hits.append(ref)
+                    node.clicks.append(ref)
+
+                node.click = click  # type: ignore[method-assign]
+                return node
+            return super().locator(selector)
+
+    fake = Stamped()
+    page = PlaywrightPage(fake)
+    browser = Browser("ada", page)
+    shown = browser.invoke("ada", "read_screen", {})
+    assert shown.count('button "Delete"') == 2
+    clicked = browser.invoke("ada", "click", {"target": "2"})
+    assert fake.ref_hits == ["2"]
+    assert "changed:" in clicked
+    assert fake.first.clicks == []
+    assert fake.second.clicks == ["2"]
 
 
 class _Step:
@@ -459,6 +516,10 @@ def test_a_model_denial_does_not_hide_a_page_that_opened() -> None:
 def test_snapshot_keeps_page_body_and_richer_controls() -> None:
     from robin.capabilities.browser import _SNAPSHOT_JS, _format_snapshot, _parse_refs
 
+    assert "data-robin-ref" in _SNAPSHOT_JS
+    assert "shadowRoot" in _SNAPSHOT_JS
+    assert "iframe" in _SNAPSHOT_JS
+    assert "contentDocument" in _SNAPSHOT_JS
     assert "slice(0, 120)" in _SNAPSHOT_JS
     assert 'content.replace(/\\r/g, "").slice(0, 3500)' in _SNAPSHOT_JS or "slice(0, 3500)" in _SNAPSHOT_JS
     assert "content = clean(" not in _SNAPSHOT_JS
@@ -471,10 +532,10 @@ def test_snapshot_keeps_page_body_and_richer_controls() -> None:
             "url": "https://news.test/",
             "title": "News",
             "interactive": [
-                {"role": "button", "name": "Save", "region": "dialog", "states": ["disabled"], "value": ""},
-                {"role": "checkbox", "name": "Remember me", "region": "dialog", "states": ["checked"], "value": ""},
-                {"role": "link", "name": "Read more", "region": "main", "states": [], "value": ""},
-                {"role": "link", "name": "Read more", "region": "main", "states": [], "value": ""},
+                {"ref": "1", "role": "button", "name": "Save", "region": "dialog", "states": ["disabled"], "value": ""},
+                {"ref": "2", "role": "checkbox", "name": "Remember me", "region": "dialog", "states": ["checked"], "value": ""},
+                {"ref": "3", "role": "link", "name": "Read more", "region": "main", "states": [], "value": ""},
+                {"ref": "4", "role": "link", "name": "Read more", "region": "main", "states": [], "value": ""},
             ],
             "content": long_body,
         }
