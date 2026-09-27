@@ -821,6 +821,10 @@ class Browser(Capability):
         return cleaned or f"open {url}"
 
     def offered_tools(self, account_id: str, task: str) -> list[Tool]:
+        from robin.capabilities.desktop import _wants_desktop
+
+        if _wants_desktop(task) and not _wants_page(task):
+            return []
         if self._page_open(account_id):
             return list(self.tools)
         if _wants_page(task):

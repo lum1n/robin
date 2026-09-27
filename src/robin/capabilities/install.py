@@ -7,6 +7,7 @@ from pathlib import Path
 
 from robin.capabilities.browser import Browser, Desk, open_chromium
 from robin.capabilities.calendar import CalDAV, Calendar
+from robin.capabilities.desktop import Desktop
 from robin.capabilities.files import Files, Workspace
 from robin.capabilities.groceries import Groceries
 from robin.capabilities.jobs import Jobs
@@ -24,6 +25,7 @@ def install(assistant: Assistant) -> None:
     assistant.add(Groceries(store=assistant.store))
     assistant.add(Jobs(store=assistant.store))
     assistant.add(Browser(desk=Desk(open_chromium, profiles=root), broker=assistant.broker))
+    assistant.add(Desktop())
     assistant.add(Files(workspace))
     assistant.add(Photos(workspace, store=assistant.store))
     assistant.add(Terminal(ShellBox(root)))

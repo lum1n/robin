@@ -1,6 +1,6 @@
 # Text control
 
-Robin steers a computer with text. A screenshot is not taken. That is the difference from Grok and Muse, which look at the viewport and click pixels. Mail and calendar already go further than a picture can: they use a connector, and the model never sees the password. The browser is the fallback for a site that has no connector. The text path matches a screenshot agent on ordinary accessible websites; the remaining gap is visual-only UI and the desktop outside the browser.
+Robin steers a computer with text. A screenshot is not taken. That is the difference from Grok and Muse, which look at the viewport and click pixels. Mail and calendar already go further than a picture can: they use a connector, and the model never sees the password. The browser is the fallback for a site that has no connector. Desktop apps on the Linux instance use the same refs over AT-SPI. The remaining gap is visual-only UI with no accessible name or role.
 
 ## Where the turn stops
 
@@ -18,7 +18,7 @@ What a screenshot still shows, and this snapshot still drops:
 
 - Pixel layout and purely visual cues with no accessible name or role.
 - A download is listed and saved under the account browser profile, but not opened as a document viewer.
-- Native OS windows outside the browser (that is the later AT-SPI path).
+- Controls that expose nothing on the accessibility bus.
 
 If local NER is off, a named page stays on the machine as a cleaned extract and is not sent to a model. When a snapshot may leave, refs, roles, URL, and control states stay intact; names and body text still go through the airlock as placeholders. The whole snapshot is never replaced with `[UNRESOLVED]`. Tool arguments are already restored before `invoke`, so a placeholder in a name can still be resolved at click time.
 
@@ -38,7 +38,7 @@ The loop has to act after it looks, and the snapshot has to contain the dialog a
 
 6. Size the context for one viewport. A structured viewport tree plus the action log needs a budget of its own, separate from history. Drop older snapshots once the action log has them. The 6,000-character cap exists so a turn fits a 4096-token local model together with the tool list and the reply. Raising it means checking that model, or splitting the snapshot so the local route still fits.
 
-7. Treat the desktop as the same protocol, later. Mail and calendar stay connectors. The browser stays the fallback for websites. Grok and Muse also drive other applications. On the Linux VM the text equivalent is the accessibility bus (AT-SPI): windows, roles, names, and actions, with the same refs and the same confirm rule for anything that sends, pays, or deletes.
+7. Treat the desktop as the same protocol. Mail and calendar stay connectors. The browser stays the fallback for websites. On the Linux instance, AT-SPI supplies windows, roles, names, and actions with the same refs. `submit`, `pay`, and `delete_item` wait for a confirm.
 
 ## Todo
 
@@ -96,7 +96,7 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 - [x] Drop older snapshots once the action log records them
 - [x] Check the 6,000-character cap against the 4096-token local model before raising it
 
-### The desktop, later
+### The desktop
 
-- [ ] Add an AT-SPI capability with the same refs, the same snapshot shape, and the same confirm rule for send, pay, and delete
-- [ ] Leave mail and calendar on their connectors
+- [x] Add an AT-SPI capability with the same refs, the same snapshot shape, and the same confirm rule for send, pay, and delete
+- [x] Leave mail and calendar on their connectors

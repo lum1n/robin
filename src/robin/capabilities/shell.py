@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from robin.capabilities.browser import _wants_page
+from robin.capabilities.desktop import _wants_desktop
 from robin.capabilities.identity import claim, run_as
 from robin.capability import Capability, Effect, FieldSpec, Tool
 
@@ -44,7 +45,7 @@ class Terminal(Capability):
         self.box = box
 
     def offered_tools(self, account_id: str, task: str) -> list[Tool]:
-        if _wants_page(task):
+        if _wants_page(task) or _wants_desktop(task):
             return []
         return list(self.tools)
 
