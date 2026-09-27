@@ -361,6 +361,112 @@ def test_click_uses_interactive_refs_from_the_snapshot() -> None:
     assert "Content:" in clicked["result"]
 
 
+def test_popup_pages_can_be_listed_and_switched() -> None:
+    from robin.capabilities.browser import _format_snapshot
+
+    class Tabbed(MemoryPage):
+        def __init__(self) -> None:
+            super().__init__(text="main")
+            self._tabs = [
+                {"url": "https://shop.test/", "title": "Shop", "text": "main shop"},
+                {"url": "https://pay.test/checkout", "title": "Pay", "text": "checkout form"},
+            ]
+            self._active = 0
+            self._downloads = ["invoice.pdf"]
+
+        def page_list(self) -> list[dict]:
+            rows = []
+            for index, tab in enumerate(self._tabs, start=1):
+                rows.append(
+                    {
+                        "index": index,
+                        "url": tab["url"],
+                        "title": tab["title"],
+                        "active": index == self._active + 1,
+                    }
+                )
+            return rows
+
+        def downloads(self) -> list[str]:
+            return list(self._downloads)
+
+        def switch_page(self, index: int) -> None:
+            self._active = int(index) - 1
+
+        def read(self) -> tuple[str, str]:
+            tab = self._tabs[self._active]
+            text = _format_snapshot(
+                {
+                    "url": tab["url"],
+                    "title": tab["title"],
+                    "pages": self.page_list(),
+                    "downloads": self.downloads(),
+                    "interactive": [{"ref": "1", "role": "button", "name": "Pay", "region": "main", "states": [], "value": ""}],
+                    "content": tab["text"],
+                }
+            )
+            return text, ""
+
+        def location(self) -> str:
+            return self._tabs[self._active]["url"]
+
+    page = Tabbed()
+    browser = Browser("ada", page)
+    shown = browser.invoke("ada", "read_screen", {})
+    assert "Pages:" in shown
+    assert "[1] https://shop.test/" in shown
+    assert "[2] https://pay.test/checkout" in shown
+    assert "(active)" in shown
+    assert "Downloads:" in shown
+    assert "invoice.pdf" in shown
+    switched = browser.invoke("ada", "switch_page", {"index": 2})
+    assert page._active == 1
+    assert "https://pay.test/checkout" in switched
+    assert "switched to page 2" in switched
+
+
+def test_adopting_a_popup_focuses_it_and_notes_the_change() -> None:
+    class FakeTab:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self._handlers: dict[str, list] = {}
+
+        def on(self, event: str, handler) -> None:
+            self._handlers.setdefault(event, []).append(handler)
+
+        def title(self) -> str:
+            return self.url.rsplit("/", 1)[-1]
+
+        def evaluate(self, script: str) -> dict:
+            return {
+                "url": self.url,
+                "title": self.title(),
+                "interactive": [],
+                "content": f"body {self.url}",
+                "secrets": [],
+            }
+
+        def locator(self, selector: str) -> Node:
+            return Node(values=["x"])
+
+        def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> None:
+            self.url = url
+
+    main = FakeTab("https://shop.test/")
+    popup = FakeTab("https://pay.test/checkout")
+    page = PlaywrightPage(main)
+    before = {"url": main.url, "pages": 1, "downloads": 0}
+    page._adopt(popup)
+    assert page._page is popup
+    assert len(page.page_list()) == 2
+    assert page.page_list()[1]["active"] is True
+    text, _secrets = page.read()
+    assert "Pages:" in text
+    from robin.capabilities.browser import _action_diff
+
+    assert "popup opened" in _action_diff(before, text)
+
+
 def test_desk_passes_a_per_account_browser_profile(tmp_path) -> None:
     seen: list[tuple[str, Path | None]] = []
 

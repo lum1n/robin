@@ -45,7 +45,110 @@ class PlaywrightPage:
 
     def __init__(self, page: Any) -> None:
         self._page = page
+        self._tabs: list[Any] = [page]
+        self._active = 0
         self._refs: dict[str, tuple[str, str]] = {}
+        self._downloads: list[str] = []
+        self._context: Any = None
+        self._watch(page)
+
+    def bind_context(self, context: Any) -> None:
+        """Listen for popups and extra pages on this browser context."""
+        self._context = context
+        on = getattr(context, "on", None)
+        if callable(on):
+            on("page", self._adopt)
+        for page in list(getattr(context, "pages", ()) or ()):
+            if page in self._tabs:
+                continue
+            self._tabs.append(page)
+            self._watch(page)
+
+    def _watch(self, page: Any) -> None:
+        on = getattr(page, "on", None)
+        if not callable(on):
+            return
+        on("close", lambda: self._closed(page))
+        on("download", lambda download: self._download(download))
+
+    def _adopt(self, page: Any) -> None:
+        if page in self._tabs:
+            return
+        self._tabs.append(page)
+        self._active = len(self._tabs) - 1
+        self._page = page
+        self._watch(page)
+
+    def _closed(self, page: Any) -> None:
+        if page not in self._tabs:
+            return
+        index = self._tabs.index(page)
+        del self._tabs[index]
+        if not self._tabs:
+            return
+        if index < self._active:
+            self._active -= 1
+        elif index == self._active:
+            self._active = min(self._active, len(self._tabs) - 1)
+        self._page = self._tabs[self._active]
+
+    def _download(self, download: Any) -> None:
+        name = ""
+        try:
+            name = str(getattr(download, "suggested_filename", "") or "")
+        except Exception:
+            name = ""
+        if not name:
+            try:
+                name = str(download.url).rsplit("/", 1)[-1]
+            except Exception:
+                name = "download"
+        profile = getattr(self, "_profile", None)
+        if profile and name:
+            folder = Path(profile) / "downloads"
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                path = folder / Path(name).name
+                download.save_as(str(path))
+                name = str(path)
+            except Exception:
+                pass
+        if name and name not in self._downloads:
+            self._downloads.append(name)
+
+    def page_list(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for index, page in enumerate(self._tabs, start=1):
+            try:
+                url = str(getattr(page, "url", "") or "")
+            except Exception:
+                url = ""
+            title = ""
+            title_fn = getattr(page, "title", None)
+            if callable(title_fn):
+                try:
+                    title = str(title_fn() or "")
+                except Exception:
+                    title = ""
+            rows.append(
+                {
+                    "index": index,
+                    "url": url,
+                    "title": title,
+                    "active": index == self._active + 1,
+                }
+            )
+        return rows
+
+    def downloads(self) -> list[str]:
+        return list(self._downloads)
+
+    def switch_page(self, index: int) -> None:
+        position = int(index) - 1
+        if position < 0 or position >= len(self._tabs):
+            raise RuntimeError(f"no page {index}")
+        self._active = position
+        self._page = self._tabs[position]
 
     def open(self, url: str) -> None:
         self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
@@ -53,6 +156,8 @@ class PlaywrightPage:
 
     def read(self) -> tuple[str, str]:
         data = self._collect()
+        data["pages"] = self.page_list()
+        data["downloads"] = self.downloads()
         refs: dict[str, tuple[str, str]] = {}
         for index, item in enumerate(data.get("interactive") or (), start=1):
             key = str(item.get("ref") or index)
@@ -353,19 +458,27 @@ def open_chromium(url: str, profile: Path | None = None) -> PlaywrightPage:
             str(profile),
             headless=True,
             executable_path=str(executable),
+            accept_downloads=True,
         )
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=25000)
         opened = PlaywrightPage(page)
+        opened._profile = str(profile)
+        opened.bind_context(context)
         opened._playwright = playwright
         opened._context = context
+        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        opened.clear_gate()
         return opened
     browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
-    page = browser.new_page()
-    page.goto(url)
+    context = browser.new_context(accept_downloads=True)
+    page = context.new_page()
     opened = PlaywrightPage(page)
+    opened.bind_context(context)
     opened._playwright = playwright
     opened._browser = browser
+    opened._context = context
+    page.goto(url)
+    opened.clear_gate()
     return opened
 
 
@@ -396,7 +509,7 @@ class _BrowserCalls:
 
 
 class Desk:
-    """One page per account. The opener runs only when a task opens a page."""
+    """Pages for one account. Popups stay with that account's browser session."""
 
     def __init__(self, opener: Any, *, profiles: Path | None = None) -> None:
         self.opener = opener
@@ -554,6 +667,16 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
+            name="switch_page",
+            description="Focus another open page or popup by its Pages index from the snapshot.",
+            parameters={
+                "type": "object",
+                "properties": {"index": {"type": "integer"}},
+                "required": ["index"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
             name="type_password",
             description="Type a password. Waits for confirmation.",
             parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
@@ -696,7 +819,7 @@ class Browser(Capability):
         try:
             if tool_name == "click":
                 target = str(arguments.get("target", ""))
-                before = self._url(account_id)
+                before = self._glance(account_id)
                 role, name, ref = self._resolve(account_id, target, prefer=("link", "button"))
                 self._use(account_id, lambda page: _click(page, name, role, ref=ref))
                 self._settle(account_id)
@@ -705,7 +828,7 @@ class Browser(Capability):
             if tool_name == "type_text":
                 target = str(arguments.get("target", ""))
                 text = str(arguments.get("text", ""))
-                before = self._url(account_id)
+                before = self._glance(account_id)
                 role, name, ref = self._resolve(account_id, target, prefer=("textbox",))
                 self._use(account_id, lambda page: _type_text(page, name, text, role, ref=ref))
                 self._settle(account_id)
@@ -714,7 +837,7 @@ class Browser(Capability):
             if tool_name == "select_option":
                 target = str(arguments.get("target", ""))
                 value = str(arguments.get("value", ""))
-                before = self._url(account_id)
+                before = self._glance(account_id)
                 role, name, ref = self._resolve(account_id, target, prefer=("combobox",))
                 self._use(account_id, lambda page: _select_option(page, name, value, ref=ref))
                 self._settle(account_id)
@@ -723,7 +846,7 @@ class Browser(Capability):
             if tool_name == "scroll":
                 direction = str(arguments.get("direction", "down"))
                 target = str(arguments.get("target", ""))
-                before = self._url(account_id)
+                before = self._glance(account_id)
                 ref = ""
                 if target:
                     _role, _name, ref = self._resolve(account_id, target, prefer=())
@@ -733,23 +856,30 @@ class Browser(Capability):
                 return f"scrolled {direction}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "press_key":
                 key = str(arguments.get("key", ""))
-                before = self._url(account_id)
+                before = self._glance(account_id)
                 self._use(account_id, lambda page: _press_key(page, key))
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"pressed {key}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "go_back":
-                before = self._url(account_id)
+                before = self._glance(account_id)
                 self._use(account_id, lambda page: _go_back(page))
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"went back\n{_action_diff(before, after)}\n{after}"
+            if tool_name == "switch_page":
+                index = int(arguments.get("index", 0))
+                before = self._glance(account_id)
+                self._use(account_id, lambda page: _switch_page(page, index))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"switched to page {index}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "type_password":
                 secret = str(arguments.get("text", ""))
                 self._use(account_id, lambda page: page.type_password(secret))
                 return "typed"
             if tool_name == "submit":
-                before = self._url(account_id)
+                before = self._glance(account_id)
                 self._use(account_id, lambda page: page.submit())
                 self._settle(account_id)
                 after = self._observe(account_id)
@@ -800,6 +930,29 @@ class Browser(Capability):
             return str(self._use(account_id, lambda page: page.location()) or "")
         except Exception:
             return ""
+
+    def _glance(self, account_id: str) -> dict[str, Any]:
+        page = self._current(account_id)
+        url = ""
+        try:
+            url = str(page.location() or "")
+        except Exception:
+            url = ""
+        pages = 1
+        listing = getattr(page, "page_list", None)
+        if callable(listing):
+            try:
+                pages = max(1, len(listing()))
+            except Exception:
+                pages = 1
+        downloads = 0
+        downs = getattr(page, "downloads", None)
+        if callable(downs):
+            try:
+                downloads = len(downs())
+            except Exception:
+                downloads = 0
+        return {"url": url, "pages": pages, "downloads": downloads}
 
     def _settle(self, account_id: str) -> None:
         try:
@@ -1297,6 +1450,8 @@ _SNAPSHOT_JS = """() => {
 def _format_snapshot(data: dict[str, Any]) -> str:
     url = str(data.get("url") or "").strip()
     title = str(data.get("title") or "").strip()
+    pages = list(data.get("pages") or [])
+    downloads = [str(item) for item in (data.get("downloads") or []) if str(item).strip()]
     interactive = list(data.get("interactive") or [])[:_MAX_INTERACTIVE]
     content = _content_lines(str(data.get("content") or ""))
     if len(content) > _MAX_CONTENT:
@@ -1304,6 +1459,24 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     lines = [f"URL: {url or '(unknown)'}"]
     if title:
         lines.append(f"Title: {title}")
+    if len(pages) > 1 or downloads:
+        lines.append("")
+        lines.append("Pages:")
+        if pages:
+            for item in pages:
+                index = item.get("index", 0)
+                page_url = str(item.get("url") or "").strip() or "(unknown)"
+                page_title = str(item.get("title") or "").replace('"', "'").strip()
+                active = " (active)" if item.get("active") else ""
+                label = f' "{page_title}"' if page_title else ""
+                lines.append(f"[{index}] {page_url}{label}{active}")
+        else:
+            lines.append("(one)")
+    if downloads:
+        lines.append("")
+        lines.append("Downloads:")
+        for item in downloads[-8:]:
+            lines.append(f"- {item}")
     lines.append("")
     lines.append("Interactive:")
     if interactive:
@@ -1367,20 +1540,61 @@ def _parse_refs(snapshot: str) -> dict[str, tuple[str, str]]:
     return refs
 
 
-def _action_diff(before_url: str, snapshot: str) -> str:
+def _action_diff(before: dict[str, Any] | str, snapshot: str) -> str:
+    if isinstance(before, str):
+        before = {"url": before, "pages": 1, "downloads": 0}
     after_url = ""
     for line in snapshot.splitlines():
         if line.startswith("URL:"):
             after_url = line[4:].strip()
             break
     bits: list[str] = []
+    before_url = str(before.get("url") or "")
     if before_url and after_url and before_url != after_url:
         bits.append(f"url {after_url}")
+    after_pages = _count_pages(snapshot)
+    before_pages = int(before.get("pages") or 1)
+    if after_pages > before_pages:
+        bits.append(f"popup opened ({after_pages} pages)")
+    elif after_pages < before_pages:
+        bits.append(f"page closed ({after_pages} pages)")
+    after_downloads = _count_downloads(snapshot)
+    before_downloads = int(before.get("downloads") or 0)
+    if after_downloads > before_downloads:
+        bits.append("download started")
     if " (dialog" in snapshot:
         bits.append("dialog open")
     if not bits:
         bits.append("page updated")
     return "changed: " + ", ".join(bits)
+
+
+def _count_pages(snapshot: str) -> int:
+    if "\nPages:\n" not in snapshot:
+        return 1
+    section = snapshot.split("\nPages:\n", 1)[1]
+    count = 0
+    for line in section.splitlines():
+        if line.startswith("["):
+            count += 1
+            continue
+        if line.startswith("Interactive:") or line.startswith("Downloads:") or line.startswith("Content:"):
+            break
+    return count or 1
+
+
+def _count_downloads(snapshot: str) -> int:
+    if "\nDownloads:\n" not in snapshot:
+        return 0
+    section = snapshot.split("\nDownloads:\n", 1)[1]
+    count = 0
+    for line in section.splitlines():
+        if line.startswith("- "):
+            count += 1
+            continue
+        if line.startswith("Interactive:") or line.startswith("Content:") or line.startswith("Pages:"):
+            break
+    return count
 
 
 def _settle(page: Page) -> None:
@@ -1446,3 +1660,11 @@ def _go_back(page: Page) -> None:
         back()
         return
     raise RuntimeError("go_back is not available")
+
+
+def _switch_page(page: Page, index: int) -> None:
+    switch = getattr(page, "switch_page", None)
+    if callable(switch):
+        switch(index)
+        return
+    raise RuntimeError("switch_page is not available")

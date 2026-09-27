@@ -22,6 +22,7 @@ SYSTEM = (
     "open_page returns a text snapshot with URL, Interactive refs, and Content. "
     "To click or type, use Interactive refs (for example target 1) or the visible name. "
     "Use select_option for dropdowns, scroll to reveal more of the page, press_key for Enter or Tab, and go_back to leave a page. "
+    "When Pages lists more than one entry, switch_page focuses that popup or tab by index. "
     "Keep using tools until the person's task is done, or you need them to confirm or answer. "
     "When answering from a page, write clear prose or a short bullet list from Content. "
     "For news or a homepage, list the top stories with one line each. "
@@ -248,7 +249,20 @@ def _release_snapshot(text: str, vault, vocabulary, ner) -> str:
             in_content = True
             lines_out.append(line)
             continue
-        if stripped in {"", "Interactive:"} or stripped.startswith("URL:") or stripped.startswith("Title:"):
+        if stripped in {"", "Interactive:", "Pages:", "Downloads:"} or stripped.startswith("URL:") or stripped.startswith("Title:"):
+            lines_out.append(line)
+            continue
+        if stripped.startswith("- ") and not in_content:
+            if ner.available():
+                safe = _release(stripped, vault, vocabulary, ner, free_text=True)
+                if safe and safe != UNRESOLVED:
+                    lines_out.append(safe)
+                else:
+                    lines_out.append("- download")
+            else:
+                lines_out.append(stripped)
+            continue
+        if stripped.startswith("[") and "://" in stripped and not in_content:
             lines_out.append(line)
             continue
         match = _REF_LINE.match(stripped)

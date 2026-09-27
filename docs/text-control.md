@@ -20,8 +20,8 @@ What a screenshot still shows, and this snapshot still drops:
 
 - A full accessibility-tree walk. Collection is still query selectors (plus same-origin iframes and open shadow roots), not the browser a11y tree.
 - Proof beyond the one-line change note and the next snapshot.
-- Extra pointer actions: hover is not a tool yet; scroll, select_option, press_key, and go_back are.
-- Popups and downloads as their own page.
+- Extra pointer actions: hover is not a tool yet; scroll, select_option, press_key, go_back, and switch_page are.
+- A download is noted and saved under the account browser profile when possible; it is not opened as a document viewer yet.
 
 If local NER is off, a named page stays on the machine as a cleaned extract and is not sent to a model. When a snapshot may leave, refs, roles, URL, and control states stay intact; names and body text still go through the airlock as placeholders. The whole snapshot is never replaced with `[UNRESOLVED]`. Tool arguments are already restored before `invoke`, so a placeholder in a name can still be resolved at click time.
 
@@ -78,12 +78,12 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 - [x] Return a fresh snapshot plus a one-line diff: URL, dialog opened or closed, text that appeared
 - [x] Add scroll, select, checkbox and radio, key press, hover, and back
 - [ ] Type into the focused ref, including a field that is not a labeled textbox
-- [ ] When a site opens a popup or starts a download, keep that as its own page
+- [x] When a site opens a popup or starts a download, keep that as its own page
 
 ### The browser stays with the account
 
 - [x] Persist the Playwright context in that account's directory so cookies survive a restart
-- [ ] Keep more than one page when a flow opens a second window
+- [x] Keep more than one page when a flow opens a second window
 
 ### The airlock redacts spans
 
