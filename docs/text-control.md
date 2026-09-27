@@ -23,7 +23,7 @@ What a screenshot still shows, and this snapshot still drops:
 - Extra pointer actions: hover is not a tool yet; scroll, select_option, press_key, and go_back are.
 - Popups and downloads as their own page.
 
-If local NER is off, `release` replaces that entire snapshot with `[UNRESOLVED]`. The model then has nothing to click. Tool arguments are already restored before `invoke`, so a placeholder in a name can still be resolved at click time once the ref itself survives.
+If local NER is off, a named page stays on the machine as a cleaned extract and is not sent to a model. When a snapshot may leave, refs, roles, URL, and control states stay intact; names and body text still go through the airlock as placeholders. The whole snapshot is never replaced with `[UNRESOLVED]`. Tool arguments are already restored before `invoke`, so a placeholder in a name can still be resolved at click time.
 
 ## What has to change
 
@@ -87,10 +87,11 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 
 ### The airlock redacts spans
 
-- [ ] Refs, roles, URL, and control states always reach the model
-- [ ] Names and body text still become placeholders for a person, email, phone, or address
-- [ ] A snapshot is never replaced wholesale with `[UNRESOLVED]`
-- [ ] A placeholder in a control name is restored before the click, which `invoke` already does for tool arguments
+- [x] Refs, roles, URL, and control states always reach the model
+- [x] Names and body text still become placeholders for a person, email, phone, or address
+- [x] A snapshot is never replaced wholesale with `[UNRESOLVED]`
+- [x] A placeholder in a control name is restored before the click, which `invoke` already does for tool arguments
+- [x] Without NER, a named page still stays local (cleaned extract); structure-preserving release runs when the page may leave
 
 ### The viewport fits the context
 

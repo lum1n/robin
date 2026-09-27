@@ -120,7 +120,9 @@ def _converse(
         if direct:
             return Reply("reply", direct, Route.LOCAL)
         if prepared:
-            outgoing = _release(prepared, vault, vocabulary, assistant.ner, free_text=True)
+            if _is_page_snapshot(prepared) and not assistant.ner.available():
+                return Reply("reply", _present_fetched(prepared), Route.LOCAL)
+            outgoing = _release_result(prepared, vault, vocabulary, assistant.ner)
             if not outgoing or outgoing == UNRESOLVED:
                 return Reply("reply", _present_fetched(prepared), Route.LOCAL)
             if not _is_page_snapshot(prepared):
@@ -135,7 +137,7 @@ def _converse(
             snapshot = outgoing
     else:
         tool_name, raw_result = seed
-        result = _release(raw_result, vault, vocabulary, assistant.ner, free_text=True)
+        result = _release_result(raw_result, vault, vocabulary, assistant.ner)
         actions, snapshot = _record_result(actions, snapshot, tool_name, result)
 
     for _ in range(max_steps):
@@ -174,7 +176,7 @@ def _converse(
                 allow_cloud=task.allow_cloud,
                 free_text=task.free_text,
             )
-        result = _release(outcome["result"], vault, vocabulary, assistant.ner, free_text=True)
+        result = _release_result(outcome["result"], vault, vocabulary, assistant.ner)
         if len(result) > 6000:
             result = result[:6000]
         actions, snapshot = _record_result(actions, snapshot, call.name, result)
@@ -223,6 +225,67 @@ def _release(text: str, vault, vocabulary, ner, *, free_text: bool) -> str:
         ner_available=ner.available(),
         extra=extra,
     )
+
+
+def _release_result(text: str, vault, vocabulary, ner) -> str:
+    """Tool results that are page snapshots keep structure; names and body still go through the airlock."""
+    if _is_page_snapshot(text) or "\nURL:" in text:
+        return _release_snapshot(text, vault, vocabulary, ner)
+    return _release(text, vault, vocabulary, ner, free_text=True)
+
+
+def _release_snapshot(text: str, vault, vocabulary, ner) -> str:
+    lead, page = _split_snapshot(text)
+    if not page:
+        page = text.lstrip()
+        lead = ""
+    lines_out: list[str] = []
+    in_content = False
+    for raw in page.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if stripped == "Content:":
+            in_content = True
+            lines_out.append(line)
+            continue
+        if stripped in {"", "Interactive:"} or stripped.startswith("URL:") or stripped.startswith("Title:"):
+            lines_out.append(line)
+            continue
+        match = _REF_LINE.match(stripped)
+        if match and not in_content:
+            ref, role, name, meta = match.group(1), match.group(2), match.group(3), match.group(4)
+            safe_name = _release_label(name, vault, vocabulary, ner)
+            suffix = f" ({meta})" if meta else ""
+            lines_out.append(f'[{ref}] {role} "{safe_name}"{suffix}')
+            continue
+        if in_content:
+            if not ner.available():
+                continue
+            safe = _release(line, vault, vocabulary, ner, free_text=True)
+            if safe and safe != UNRESOLVED:
+                lines_out.append(safe)
+            continue
+        lines_out.append(line)
+    body = "\n".join(lines_out)
+    if lead:
+        return f"{lead}\n{body}"
+    return body
+
+
+def _release_label(name: str, vault, vocabulary, ner) -> str:
+    if not name or name == "unnamed" or name.startswith("unnamed, near "):
+        return name.replace('"', "'")
+    if not ner.available():
+        return "label"
+    safe = _release(name, vault, vocabulary, ner, free_text=True)
+    if not safe or safe == UNRESOLVED:
+        return "label"
+    return safe.replace('"', "'")
+
+
+_REF_LINE = re.compile(
+    r'^\[(\d+)\]\s+(\w+)\s+"(.*)"(?:\s+\(([^)]*)\))?\s*$'
+)
 
 
 def _history(assistant: Assistant, task: Task, vault, vocabulary, ner) -> str:

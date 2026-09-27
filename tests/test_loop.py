@@ -117,6 +117,37 @@ def test_the_loop_stops_after_the_step_limit() -> None:
     assert model.seen[-1][1] == []
 
 
+def test_a_page_snapshot_keeps_refs_after_the_airlock() -> None:
+    from robin.airlock import VocabularyTerm
+    from robin.loop import _release_snapshot
+    from robin.ner import UnavailableNer
+    from robin.vault import Vault
+
+    class ReadyNer(UnavailableNer):
+        def available(self) -> bool:
+            return True
+
+        def detect(self, text: str):
+            return ()
+
+    snapshot = (
+        'URL: https://news.test/\nTitle: News\n\nInteractive:\n'
+        '[1] link "Jane Doe story" (main)\n[2] button "Save" (dialog)\n\n'
+        "Content:\nJane Doe leads the front page."
+    )
+    vault = Vault("ada", "t")
+    vocabulary = (VocabularyTerm("Jane Doe"),)
+    ner = ReadyNer()
+    released = _release_snapshot(snapshot, vault, vocabulary, ner)
+    assert released.startswith("URL: https://news.test/")
+    assert '[1] link "' in released
+    assert "[UNRESOLVED]" not in released
+    assert "Jane Doe" not in released
+    assert '[2] button "Save"' in released
+    assert "Interactive:" in released
+    assert "Content:" in released
+
+
 def test_reading_the_page_keeps_tools_for_the_next_step() -> None:
     assistant = Assistant()
     assistant.add(Screen(owner="ada", text="Astrid's funeral leads the front page.", password=""))
