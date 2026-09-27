@@ -21,6 +21,7 @@ SYSTEM = (
     "If the person names a site or asks for a page, call open_page with an https URL. "
     "open_page returns a text snapshot with URL, Interactive refs, and Content. "
     "To click or type, use Interactive refs (for example target 1) or the visible name. "
+    "Use select_option for dropdowns, scroll to reveal more of the page, press_key for Enter or Tab, and go_back to leave a page. "
     "Keep using tools until the person's task is done, or you need them to confirm or answer. "
     "When answering from a page, write clear prose or a short bullet list from Content. "
     "For news or a homepage, list the top stories with one line each. "

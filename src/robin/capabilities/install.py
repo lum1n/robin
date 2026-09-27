@@ -23,7 +23,7 @@ def install(assistant: Assistant) -> None:
     assistant.add(Calendar(CalDAV(assistant.broker)))
     assistant.add(Groceries(store=assistant.store))
     assistant.add(Jobs(store=assistant.store))
-    assistant.add(Browser(desk=Desk(open_chromium), broker=assistant.broker))
+    assistant.add(Browser(desk=Desk(open_chromium, profiles=root), broker=assistant.broker))
     assistant.add(Files(workspace))
     assistant.add(Photos(workspace, store=assistant.store))
     assistant.add(Terminal(ShellBox(root)))

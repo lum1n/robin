@@ -361,6 +361,65 @@ def test_click_uses_interactive_refs_from_the_snapshot() -> None:
     assert "Content:" in clicked["result"]
 
 
+def test_desk_passes_a_per_account_browser_profile(tmp_path) -> None:
+    seen: list[tuple[str, Path | None]] = []
+
+    def opener(url: str, profile: Path | None = None) -> MemoryPage:
+        seen.append((url, profile))
+        return MemoryPage(text=url)
+
+    desk = Desk(opener, profiles=tmp_path)
+    desk.open("ada", "https://example.test/a")
+    assert seen[0][0] == "https://example.test/a"
+    assert seen[0][1] == (tmp_path / "ada" / "browser").resolve()
+    desk.open("bea", "https://example.test/b")
+    assert seen[1][1] == (tmp_path / "bea" / "browser").resolve()
+
+
+def test_scroll_select_press_and_back_are_available() -> None:
+    class Controls(MemoryPage):
+        def __init__(self) -> None:
+            super().__init__(text="form")
+            self.scrolled = ""
+            self.selected: list[tuple[str, str]] = []
+            self.keys: list[str] = []
+            self.backed = False
+            self._refs = {"1": ("combobox", "Country")}
+
+        def read(self) -> tuple[str, str]:
+            return (
+                'URL: https://example.test/\n\nInteractive:\n[1] combobox "Country"\n\nContent:\nform',
+                "",
+            )
+
+        def location(self) -> str:
+            return "https://example.test/"
+
+        def select_option(self, target: str, value: str, ref: str = "") -> None:
+            self.selected.append((ref or target, value))
+
+        def scroll(self, direction: str, ref: str = "") -> None:
+            self.scrolled = direction
+
+        def press_key(self, key: str) -> None:
+            self.keys.append(key)
+
+        def go_back(self) -> None:
+            self.backed = True
+
+    page = Controls()
+    browser = Browser("ada", page)
+    browser.invoke("ada", "read_screen", {})
+    assert "selected NO" in browser.invoke("ada", "select_option", {"target": "1", "value": "NO"})
+    assert page.selected == [("1", "NO")]
+    browser.invoke("ada", "scroll", {"direction": "down"})
+    assert page.scrolled == "down"
+    browser.invoke("ada", "press_key", {"key": "Enter"})
+    assert page.keys == ["Enter"]
+    browser.invoke("ada", "go_back", {})
+    assert page.backed is True
+
+
 def test_stamped_ref_clicks_the_second_duplicate_control() -> None:
     class Stamped(FakePlaywright):
         def __init__(self) -> None:

@@ -162,6 +162,41 @@ class PlaywrightPage:
             pass
         self._page.get_by_label(target).fill(text)
 
+    def type_password(self, text: str) -> None:
+        self._fields("input[type='password']").first.fill(text)
+
+    def select_option(self, target: str, value: str, ref: str = "") -> None:
+        if ref and self._act_ref(ref, "select", value):
+            return
+        try:
+            labeled = self._page.get_by_label(target)
+            if int(labeled.count()) > 0:
+                labeled.first.select_option(value)
+                return
+        except Exception:
+            pass
+        self._page.locator("select").first.select_option(value)
+
+    def scroll(self, direction: str, ref: str = "") -> None:
+        amount = {"up": -800, "down": 800, "top": -100000, "bottom": 100000}.get(direction.lower(), 800)
+        if ref:
+            selector = f'[data-robin-ref="{ref}"]'
+            try:
+                self._page.locator(selector).first.evaluate(
+                    "(node, delta) => { node.scrollBy(0, delta); }",
+                    amount,
+                )
+                return
+            except Exception:
+                pass
+        self._page.evaluate(f"window.scrollBy(0, {int(amount)})")
+
+    def press_key(self, key: str) -> None:
+        self._page.keyboard.press(key)
+
+    def go_back(self) -> None:
+        self._page.go_back(wait_until="domcontentloaded", timeout=15000)
+
     def _act_ref(self, ref: str, action: str, text: str = "") -> bool:
         selector = f'[data-robin-ref="{ref}"]'
         frames: list[Any] = [self._page]
@@ -174,15 +209,14 @@ class PlaywrightPage:
                 target = locator.first
                 if action == "click":
                     target.click()
+                elif action == "select":
+                    target.select_option(text)
                 else:
                     target.fill(text)
                 return True
             except Exception:
                 continue
         return False
-
-    def type_password(self, text: str) -> None:
-        self._fields("input[type='password']").first.fill(text)
 
     def submit(self) -> None:
         self._page.locator("button[type='submit'], input[type='submit']").first.click()
@@ -306,13 +340,26 @@ def _chromium_executable() -> Path | None:
     return None
 
 
-def open_chromium(url: str) -> PlaywrightPage:
+def open_chromium(url: str, profile: Path | None = None) -> PlaywrightPage:
     from playwright.sync_api import sync_playwright
 
     executable = _chromium_executable()
     if executable is None:
         raise RuntimeError("Chromium is not installed. Run playwright install chromium on this machine.")
     playwright = sync_playwright().start()
+    if profile is not None:
+        profile.mkdir(parents=True, exist_ok=True)
+        context = playwright.chromium.launch_persistent_context(
+            str(profile),
+            headless=True,
+            executable_path=str(executable),
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        opened = PlaywrightPage(page)
+        opened._playwright = playwright
+        opened._context = context
+        return opened
     browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
     page = browser.new_page()
     page.goto(url)
@@ -351,8 +398,9 @@ class _BrowserCalls:
 class Desk:
     """One page per account. The opener runs only when a task opens a page."""
 
-    def __init__(self, opener: Any) -> None:
+    def __init__(self, opener: Any, *, profiles: Path | None = None) -> None:
         self.opener = opener
+        self.profiles = profiles
         self.pages: dict[str, Page] = {}
         self._calls = _BrowserCalls()
         self._lock = threading.Lock()
@@ -367,7 +415,7 @@ class Desk:
             with self._lock:
                 current = self.pages.get(account_id)
             if current is None:
-                current = self.opener(url)
+                current = self._launch(account_id, url)
                 with self._lock:
                     self.pages[account_id] = current
                 return current
@@ -375,6 +423,20 @@ class Desk:
             return current
 
         return self._calls.run(work)
+
+    def _launch(self, account_id: str, url: str) -> Page:
+        profile = None
+        if self.profiles is not None and account_id:
+            profile = (self.profiles / account_id / "browser").resolve()
+        if profile is None:
+            return self.opener(url)
+        try:
+            return self.opener(url, profile)
+        except TypeError:
+            try:
+                return self.opener(url, profile=profile)
+            except TypeError:
+                return self.opener(url)
 
     def run(self, account_id: str, function: Any) -> Any:
         def work() -> Any:
@@ -450,6 +512,45 @@ class Browser(Capability):
                 "properties": {"target": {"type": "string"}, "text": {"type": "string"}},
                 "required": ["target", "text"],
             },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
+            name="select_option",
+            description="Choose an option in a combobox or select ref.",
+            parameters={
+                "type": "object",
+                "properties": {"target": {"type": "string"}, "value": {"type": "string"}},
+                "required": ["target", "value"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
+            name="scroll",
+            description="Scroll the page or a ref. Direction is up, down, top, or bottom.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "direction": {"type": "string"},
+                    "target": {"type": "string"},
+                },
+                "required": ["direction"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
+            name="press_key",
+            description="Press a key such as Enter, Tab, Escape, or ArrowDown.",
+            parameters={
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
+            name="go_back",
+            description="Go back one page in the browser history.",
+            parameters={"type": "object", "properties": {}},
             effect=Effect.MUTATE,
         ),
         Tool(
@@ -610,6 +711,39 @@ class Browser(Capability):
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"typed into {target}\n{_action_diff(before, after)}\n{after}"
+            if tool_name == "select_option":
+                target = str(arguments.get("target", ""))
+                value = str(arguments.get("value", ""))
+                before = self._url(account_id)
+                role, name, ref = self._resolve(account_id, target, prefer=("combobox",))
+                self._use(account_id, lambda page: _select_option(page, name, value, ref=ref))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"selected {value} in {target}\n{_action_diff(before, after)}\n{after}"
+            if tool_name == "scroll":
+                direction = str(arguments.get("direction", "down"))
+                target = str(arguments.get("target", ""))
+                before = self._url(account_id)
+                ref = ""
+                if target:
+                    _role, _name, ref = self._resolve(account_id, target, prefer=())
+                self._use(account_id, lambda page: _scroll(page, direction, ref=ref))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"scrolled {direction}\n{_action_diff(before, after)}\n{after}"
+            if tool_name == "press_key":
+                key = str(arguments.get("key", ""))
+                before = self._url(account_id)
+                self._use(account_id, lambda page: _press_key(page, key))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"pressed {key}\n{_action_diff(before, after)}\n{after}"
+            if tool_name == "go_back":
+                before = self._url(account_id)
+                self._use(account_id, lambda page: _go_back(page))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                return f"went back\n{_action_diff(before, after)}\n{after}"
             if tool_name == "type_password":
                 secret = str(arguments.get("text", ""))
                 self._use(account_id, lambda page: page.type_password(secret))
@@ -1272,3 +1406,43 @@ def _type_text(page: Page, target: str, text: str, role: str = "", ref: str = ""
         type_text(target, text, role=role, ref=ref)
     except TypeError:
         type_text(target, text)
+
+
+def _select_option(page: Page, target: str, value: str, ref: str = "") -> None:
+    select = getattr(page, "select_option", None)
+    if callable(select):
+        try:
+            select(target, value, ref=ref)
+            return
+        except TypeError:
+            select(target, value)
+            return
+    raise RuntimeError("select is not available")
+
+
+def _scroll(page: Page, direction: str, ref: str = "") -> None:
+    scroll = getattr(page, "scroll", None)
+    if callable(scroll):
+        try:
+            scroll(direction, ref=ref)
+            return
+        except TypeError:
+            scroll(direction)
+            return
+    raise RuntimeError("scroll is not available")
+
+
+def _press_key(page: Page, key: str) -> None:
+    press = getattr(page, "press_key", None)
+    if callable(press):
+        press(key)
+        return
+    raise RuntimeError("press_key is not available")
+
+
+def _go_back(page: Page) -> None:
+    back = getattr(page, "go_back", None)
+    if callable(back):
+        back()
+        return
+    raise RuntimeError("go_back is not available")

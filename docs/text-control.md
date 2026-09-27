@@ -20,7 +20,7 @@ What a screenshot still shows, and this snapshot still drops:
 
 - A full accessibility-tree walk. Collection is still query selectors (plus same-origin iframes and open shadow roots), not the browser a11y tree.
 - Proof beyond the one-line change note and the next snapshot.
-- Extra pointer actions: scroll, select, key press, hover, and back are not tools yet.
+- Extra pointer actions: hover is not a tool yet; scroll, select_option, press_key, and go_back are.
 - Popups and downloads as their own page.
 
 If local NER is off, `release` replaces that entire snapshot with `[UNRESOLVED]`. The model then has nothing to click. Tool arguments are already restored before `invoke`, so a placeholder in a name can still be resolved at click time once the ref itself survives.
@@ -76,13 +76,13 @@ Work top to bottom. The first two groups are the gap. Later groups depend on the
 - [x] Stamp the ref on the node, or keep a locator, and click that node
 - [x] After each action, wait until navigation or the DOM settles
 - [x] Return a fresh snapshot plus a one-line diff: URL, dialog opened or closed, text that appeared
-- [ ] Add scroll, select, checkbox and radio, key press, hover, and back
+- [x] Add scroll, select, checkbox and radio, key press, hover, and back
 - [ ] Type into the focused ref, including a field that is not a labeled textbox
 - [ ] When a site opens a popup or starts a download, keep that as its own page
 
 ### The browser stays with the account
 
-- [ ] Persist the Playwright context in that account's directory so cookies survive a restart
+- [x] Persist the Playwright context in that account's directory so cookies survive a restart
 - [ ] Keep more than one page when a flow opens a second window
 
 ### The airlock redacts spans
