@@ -32,6 +32,9 @@ def run_due(assistant: Assistant, model: Model, *, now: datetime | None = None) 
                 reply.tool,
                 reply.arguments or {},
                 reply.route.value,
+                text=reply.task_text or work.text,
+                allow_cloud=reply.allow_cloud,
+                free_text=reply.free_text,
             )
         work.finish(reply.text)
         replies.append(reply)
@@ -53,6 +56,9 @@ def tick(assistant: Assistant, model: Model, *, now: datetime | None = None) -> 
                 reply.tool,
                 reply.arguments or {},
                 reply.route.value,
+                text=reply.task_text or CHECK,
+                allow_cloud=reply.allow_cloud,
+                free_text=reply.free_text,
             )
         replies.append(reply)
     return replies

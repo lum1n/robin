@@ -221,16 +221,19 @@ def test_with_ner_a_page_is_summarized_not_dumped() -> None:
         def __init__(self) -> None:
             self.system = ""
             self.user = ""
+            self.tools: list[str] = []
 
         def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
             self.system = system
             self.user = user
+            self.tools = [tool["name"] for tool in tools]
             return ModelTurn("- Storm hits the coast\n- Schools update")
 
     model = Scripted()
     reply = converse(assistant, Task("ada", "home", "top news from vg.no"), model)
     assert "Storm hits the coast" in model.user
-    assert "top stories" in model.system.lower() or "bullet list" in model.system.lower()
+    assert "bullet list" in model.system.lower() or "top stories" in model.system.lower()
+    assert "click" in model.tools
     assert reply.text.startswith("- Storm")
     assert "Nav chrome" not in reply.text
 
@@ -451,3 +454,37 @@ def test_a_model_denial_does_not_hide_a_page_that_opened() -> None:
     reply = converse(assistant, Task("ada", "home", "open https://vg.no"), model)
     assert "Astrid leads the front page." in reply.text
     assert "bullet list" in model.system.lower() or "top stories" in model.system.lower()
+
+
+def test_snapshot_keeps_page_body_and_richer_controls() -> None:
+    from robin.capabilities.browser import _SNAPSHOT_JS, _format_snapshot, _parse_refs
+
+    assert "slice(0, 120)" in _SNAPSHOT_JS
+    assert 'content.replace(/\\r/g, "").slice(0, 3500)' in _SNAPSHOT_JS or "slice(0, 3500)" in _SNAPSHOT_JS
+    assert "content = clean(" not in _SNAPSHOT_JS
+    assert "checkbox" in _SNAPSHOT_JS
+    assert "combobox" in _SNAPSHOT_JS
+    assert 'role="dialog"' in _SNAPSHOT_JS
+    long_body = "Lead story about the storm on the coast. " * 10
+    formatted = _format_snapshot(
+        {
+            "url": "https://news.test/",
+            "title": "News",
+            "interactive": [
+                {"role": "button", "name": "Save", "region": "dialog", "states": ["disabled"], "value": ""},
+                {"role": "checkbox", "name": "Remember me", "region": "dialog", "states": ["checked"], "value": ""},
+                {"role": "link", "name": "Read more", "region": "main", "states": [], "value": ""},
+                {"role": "link", "name": "Read more", "region": "main", "states": [], "value": ""},
+            ],
+            "content": long_body,
+        }
+    )
+    assert long_body[:200] in formatted.replace("\n", " ") or "Lead story about the storm" in formatted
+    assert len(formatted.split("Content:", 1)[1]) > 120
+    assert '[1] button "Save" (dialog, disabled)' in formatted
+    assert '[2] checkbox "Remember me" (dialog, checked)' in formatted
+    assert formatted.count('link "Read more"') == 2
+    refs = _parse_refs(formatted)
+    assert refs["1"] == ("button", "Save")
+    assert refs["3"] == ("link", "Read more")
+    assert refs["4"] == ("link", "Read more")

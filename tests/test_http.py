@@ -42,7 +42,12 @@ def _service(tmp_path, model, ner=None) -> tuple[Service, Screen, dict[str, str]
 
 
 def test_a_message_can_stop_for_confirmation_and_a_second_call_runs_it(tmp_path) -> None:
-    model = Scripted([ModelTurn("", (ToolCall("submit", {}),))])
+    model = Scripted(
+        [
+            ModelTurn("", (ToolCall("submit", {}),)),
+            ModelTurn("Sent."),
+        ]
+    )
     service, screen, ada, _bea = _service(tmp_path, model)
     held = dispatch(
         service,
@@ -66,6 +71,7 @@ def test_a_message_can_stop_for_confirmation_and_a_second_call_runs_it(tmp_path)
     assert done[0] == 200
     assert done[1]["status"] == "reply"
     assert screen.submitted is True
+    assert done[1]["text"] == "Sent."
     again = dispatch(
         service,
         "POST",

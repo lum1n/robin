@@ -117,7 +117,7 @@ def test_the_loop_stops_after_the_step_limit() -> None:
     assert model.seen[-1][1] == []
 
 
-def test_reading_the_page_is_followed_by_an_answer() -> None:
+def test_reading_the_page_keeps_tools_for_the_next_step() -> None:
     assistant = Assistant()
     assistant.add(Screen(owner="ada", text="Astrid's funeral leads the front page.", password=""))
     model = Scripted(
@@ -128,8 +128,102 @@ def test_reading_the_page_is_followed_by_an_answer() -> None:
     )
     reply = converse(assistant, Task("ada", "t", "what is the news"), model)
     assert reply.text == "Astrid's funeral leads the front page."
-    assert model.seen[1][1] == []
+    assert "read_screen" in model.seen[1][1]
+    assert "Action log:" in model.seen[1][0]
     assert len(model.seen) == 2
+
+
+def test_a_page_prepare_still_allows_click() -> None:
+    from robin.capabilities.browser import Browser, Desk
+    from robin.ner import UnavailableNer
+
+    class ReadyNer(UnavailableNer):
+        def available(self) -> bool:
+            return True
+
+    class News:
+        def __init__(self) -> None:
+            self.clicked = ""
+            self.url = "https://news.test/"
+
+        def open(self, url: str) -> None:
+            self.url = url
+
+        def read(self) -> tuple[str, str]:
+            return (
+                'URL: https://news.test/\nTitle: News\n\nInteractive:\n[1] link "Storm"\n\nContent:\nStorm hits the coast',
+                "",
+            )
+
+        def click(self, target: str, role: str = "") -> None:
+            self.clicked = target
+
+        def type_text(self, target: str, text: str) -> None:
+            return None
+
+        def type_password(self, text: str) -> None:
+            return None
+
+        def submit(self) -> None:
+            return None
+
+        def needs_login(self) -> bool:
+            return False
+
+        def type_username(self, text: str) -> None:
+            return None
+
+        def location(self) -> str:
+            return self.url
+
+        def sign_in(self, user: str, password: str) -> None:
+            return None
+
+        def needs_code(self) -> bool:
+            return False
+
+        def submit_code(self, code: str) -> None:
+            return None
+
+    page = News()
+    assistant = Assistant(ner=ReadyNer())
+    assistant.add(Browser(desk=Desk(lambda url: page)))
+    model = Scripted(
+        [
+            ModelTurn("", (ToolCall("click", {"target": "1"}),)),
+            ModelTurn("Opened the storm story."),
+        ]
+    )
+    reply = converse(assistant, Task("ada", "t", "open the storm link on news.test"), model)
+    assert page.clicked == "Storm"
+    assert reply.text == "Opened the storm story."
+    assert "click" in model.seen[0][1]
+    assert "Current page:" in model.seen[0][0]
+
+
+def test_resume_after_confirm_continues_with_the_model() -> None:
+    from robin.loop import resume
+
+    screen = Screen(owner="ada", text="form", password="")
+    assistant = Assistant()
+    assistant.add(screen)
+    held_model = Scripted([ModelTurn("", (ToolCall("submit", {}),))])
+    held = converse(assistant, Task("ada", "t", "send the form"), held_model)
+    assert held.status == "confirm"
+    assistant.set_pending(
+        "ada",
+        "t",
+        held.tool or "submit",
+        held.arguments or {},
+        held.route.value,
+        text=held.task_text or "send the form",
+    )
+    follow = Scripted([ModelTurn("The form was sent.")])
+    reply = resume(assistant, "ada", "t", follow)
+    assert screen.submitted is True
+    assert reply.status == "reply"
+    assert reply.text == "The form was sent."
+    assert "submit" in follow.seen[0][0] or "Action log:" in follow.seen[0][0]
 
 
 def test_chat_model_posts_to_the_local_completions_url() -> None:

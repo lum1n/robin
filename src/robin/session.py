@@ -118,8 +118,26 @@ class Assistant:
         if self.store is not None:
             self.store.save_vault(self.vaults.get(account_id, conversation_id))
 
-    def set_pending(self, account_id: str, conversation_id: str, tool: str, arguments: dict, route: str) -> None:
-        record = {"tool": tool, "arguments": arguments, "route": route}
+    def set_pending(
+        self,
+        account_id: str,
+        conversation_id: str,
+        tool: str,
+        arguments: dict,
+        route: str,
+        *,
+        text: str = "",
+        allow_cloud: bool = False,
+        free_text: bool = False,
+    ) -> None:
+        record = {
+            "tool": tool,
+            "arguments": arguments,
+            "route": route,
+            "text": text,
+            "allow_cloud": allow_cloud,
+            "free_text": free_text,
+        }
         self._pending[(account_id, conversation_id)] = record
         if self.store is not None:
             self.store.save_pending(account_id, conversation_id, record)
@@ -178,7 +196,7 @@ class Assistant:
             found.extend(capability.due(now))
         return found
 
-    def decide(self, task: Task) -> Decision:
+    def decide(self, task: Task, *, record: bool = True) -> Decision:
         vault = self.vaults.get(task.account_id, task.conversation_id)
         vocabulary = self.vocabulary.get(task.account_id, ())
         context, context_report = render_context(
@@ -209,7 +227,7 @@ class Assistant:
         )
         local_message = vault.restore(message)
         local_text = json.dumps({"message": local_message, "context": local_context}, sort_keys=True)
-        if self.store is not None:
+        if record and self.store is not None:
             self.store.append_turn(task.account_id, task.conversation_id, "user", task.text)
             self.store.save_vault(vault)
         return decide(task, context_report.merge(message_report), redacted=redacted, local_text=local_text)

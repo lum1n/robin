@@ -165,9 +165,20 @@ def _post_message(service: Service, headers: dict[str, str], body: dict[str, Any
         return denied
     if body.get("confirm") is True:
         try:
-            reply = resume(service.assistant, account_id, conversation_id)
+            reply = resume(service.assistant, account_id, conversation_id, service.model)
         except PendingMissing:
             return 409, {"error": "nothing to confirm"}
+        if reply.status == "confirm" and reply.tool:
+            service.assistant.set_pending(
+                account_id,
+                conversation_id,
+                reply.tool,
+                reply.arguments or {},
+                reply.route.value,
+                text=reply.task_text or "",
+                allow_cloud=reply.allow_cloud,
+                free_text=reply.free_text,
+            )
         return 200, _public_reply(reply)
     service.assistant.clear_pending(account_id, conversation_id)
     reply = converse(
@@ -188,6 +199,9 @@ def _post_message(service: Service, headers: dict[str, str], body: dict[str, Any
             reply.tool,
             reply.arguments or {},
             reply.route.value,
+            text=reply.task_text or str(body.get("text") or ""),
+            allow_cloud=reply.allow_cloud,
+            free_text=reply.free_text,
         )
     return 200, _public_reply(reply)
 

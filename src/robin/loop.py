@@ -21,10 +21,13 @@ SYSTEM = (
     "If the person names a site or asks for a page, call open_page with an https URL. "
     "open_page returns a text snapshot with URL, Interactive refs, and Content. "
     "To click or type, use Interactive refs (for example target 1) or the visible name. "
+    "Keep using tools until the person's task is done, or you need them to confirm or answer. "
+    "When answering from a page, write clear prose or a short bullet list from Content. "
+    "For news or a homepage, list the top stories with one line each. "
+    "Skip navigation chrome, cookie banners, and repeated site chrome. "
+    "Do not dump the raw snapshot. "
     "Do not use the shell to browse. "
     "Do not say a page failed to open unless open_page said so. "
-    "After open_page or read_screen, answer the person in clear prose or a short bullet list from Content. "
-    "Do not dump the raw snapshot. Do not call another tool. "
     "Do not invent tool results."
 )
 
@@ -36,6 +39,8 @@ ANSWER = (
     "Skip navigation chrome, cookie banners, and repeated site chrome. "
     "The fetch succeeded. Do not say it failed, do not paste the raw page, and do not ask to use a tool."
 )
+
+DEFAULT_MAX_STEPS = 24
 
 
 class PendingMissing(LookupError):
@@ -49,9 +54,12 @@ class Reply:
     route: Route
     tool: str | None = None
     arguments: dict | None = None
+    task_text: str | None = None
+    allow_cloud: bool = False
+    free_text: bool = False
 
 
-def converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int = 4) -> Reply:
+def converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int = DEFAULT_MAX_STEPS) -> Reply:
     token = current_task.set(
         ActiveTurn(task.account_id, task.conversation_id, task.allow_cloud, task.free_text)
     )
@@ -89,34 +97,50 @@ def _with_site_login(assistant: Assistant, task: Task, model: Model, *, max_step
     return _converse(assistant, task, model, max_steps=max_steps)
 
 
-def _converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int) -> Reply:
-    decision = assistant.decide(task)
+def _converse(
+    assistant: Assistant,
+    task: Task,
+    model: Model,
+    *,
+    max_steps: int,
+    seed: tuple[str, str] | None = None,
+) -> Reply:
+    decision = assistant.decide(task, record=seed is None)
     vault = assistant.vaults.get(task.account_id, task.conversation_id)
     vocabulary = assistant.vocabulary.get(task.account_id, ())
     visible = decision.redacted or ""
     history = _history(assistant, task, vault, vocabulary, assistant.ner)
     spoken = _release(task.text, vault, vocabulary, assistant.ner, free_text=task.free_text)
-    prepared = assistant.prepare(task.account_id, task.text)
-    direct = assistant.take_direct(task.account_id)
-    if direct:
-        return Reply("reply", direct, Route.LOCAL)
-    if prepared:
-        outgoing = _release(prepared, vault, vocabulary, assistant.ner, free_text=True)
-        if not outgoing or outgoing == UNRESOLVED:
-            return Reply("reply", _present_fetched(prepared), Route.LOCAL)
-        note = f"{outgoing}\nAnswer the person from the text above. Format clearly; do not paste the raw page."
-        _show_egress(_compose(visible, spoken, history, note))
-        turn = model.complete(
-            system=ANSWER,
-            user=_compose(visible, spoken, history, note),
-            tools=[],
-        )
-        return _reply_text(_grounded(turn.message, prepared), vault, vocabulary, decision.route)
-    notes = ""
-    answer_next = False
+    actions: list[str] = []
+    snapshot = ""
+    if seed is None:
+        prepared = assistant.prepare(task.account_id, task.text)
+        direct = assistant.take_direct(task.account_id)
+        if direct:
+            return Reply("reply", direct, Route.LOCAL)
+        if prepared:
+            outgoing = _release(prepared, vault, vocabulary, assistant.ner, free_text=True)
+            if not outgoing or outgoing == UNRESOLVED:
+                return Reply("reply", _present_fetched(prepared), Route.LOCAL)
+            if not _is_page_snapshot(prepared):
+                note = f"{outgoing}\nAnswer the person from the text above. Format clearly; do not paste the raw page."
+                _show_egress(_compose(visible, spoken, history, note))
+                turn = model.complete(
+                    system=ANSWER,
+                    user=_compose(visible, spoken, history, note),
+                    tools=[],
+                )
+                return _reply_text(_grounded(turn.message, prepared), vault, vocabulary, decision.route)
+            snapshot = outgoing
+    else:
+        tool_name, raw_result = seed
+        result = _release(raw_result, vault, vocabulary, assistant.ner, free_text=True)
+        actions, snapshot = _record_result(actions, snapshot, tool_name, result)
+
     for _ in range(max_steps):
-        tools = [] if answer_next else assistant.tools(task.account_id, task.text)
+        tools = assistant.tools(task.account_id, task.text)
         allowed = {tool["name"] for tool in tools}
+        notes = _operator_notes(actions, snapshot)
         prompt = _compose(visible, spoken, history, notes, keep_end=True)
         _show_egress(prompt)
         turn = model.complete(
@@ -124,8 +148,11 @@ def _converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int)
             user=prompt,
             tools=tools,
         )
-        if not turn.tool_calls or answer_next:
-            return _reply_text(turn.message, vault, vocabulary, decision.route)
+        if not turn.tool_calls:
+            message = turn.message
+            if snapshot:
+                message = _grounded(message, snapshot)
+            return _reply_text(message, vault, vocabulary, decision.route)
         call = turn.tool_calls[0]
         if call.name not in allowed:
             return Reply("reply", "That action is not available.", decision.route)
@@ -142,13 +169,15 @@ def _converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int)
                 decision.route,
                 tool=call.name,
                 arguments=dict(call.arguments),
+                task_text=task.text,
+                allow_cloud=task.allow_cloud,
+                free_text=task.free_text,
             )
         result = _release(outcome["result"], vault, vocabulary, assistant.ner, free_text=True)
         if len(result) > 6000:
             result = result[:6000]
-        notes = f"{notes}\nTool {call.name} returned: {result}".strip()
-        if call.name in {"read_screen", "open_page"}:
-            answer_next = True
+        actions, snapshot = _record_result(actions, snapshot, call.name, result)
+    notes = _operator_notes(actions, snapshot)
     prompt = _compose(
         visible,
         spoken,
@@ -162,7 +191,10 @@ def _converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int)
         user=prompt,
         tools=[],
     )
-    return _reply_text(turn.message, vault, vocabulary, decision.route)
+    message = turn.message
+    if snapshot:
+        message = _grounded(message, snapshot)
+    return _reply_text(message, vault, vocabulary, decision.route)
 
 
 _MODEL_CHARS = 6000
@@ -170,6 +202,7 @@ _SNAPSHOT_CHARS = 2200
 _EXTRA_CHARS = 4500
 _TURN_CHARS = 800
 _HISTORY_TURNS = 16
+_ACTION_LINES = 24
 
 
 def _show_egress(user: str) -> None:
@@ -329,6 +362,49 @@ def _keep_message(snapshot: str, spoken: str, room: int) -> str:
     return snapshot[:room]
 
 
+def _is_page_snapshot(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("URL:") or "\nURL:" in text
+
+
+def _split_snapshot(result: str) -> tuple[str, str]:
+    """Separate a short action line from a page snapshot when both are present."""
+    if "\nURL:" in result and not result.lstrip().startswith("URL:"):
+        lead, _, rest = result.partition("\nURL:")
+        return lead.strip(), "URL:" + rest
+    if result.lstrip().startswith("URL:"):
+        return "", result.lstrip()
+    return result.strip(), ""
+
+
+def _record_result(
+    actions: list[str],
+    snapshot: str,
+    tool_name: str,
+    result: str,
+) -> tuple[list[str], str]:
+    lead, page = _split_snapshot(result)
+    if page:
+        if lead:
+            actions = [*actions, lead][-_ACTION_LINES:]
+        else:
+            actions = [*actions, f"{tool_name}"][-_ACTION_LINES:]
+        return actions, page
+    line = lead or result
+    if len(line) > 500:
+        line = line[:500]
+    return [*actions, f"Tool {tool_name} returned: {line}"][-_ACTION_LINES:], snapshot
+
+
+def _operator_notes(actions: list[str], snapshot: str) -> str:
+    parts: list[str] = []
+    if actions:
+        parts.append("Action log:\n" + "\n".join(actions))
+    if snapshot:
+        parts.append("Current page:\n" + snapshot)
+    return "\n\n".join(parts)
+
+
 def _reply_text(message: str, vault, vocabulary, route: Route) -> Reply:
     text = message.strip() or "I could not finish that."
     shown, _ = redact(text, vault, vocabulary=vocabulary)
@@ -349,7 +425,14 @@ def _confirm_text(assistant: Assistant, task: Task, call: ToolCall) -> str:
     return f"{base} {vault.restore(shown)}"
 
 
-def resume(assistant: Assistant, account_id: str, conversation_id: str) -> Reply:
+def resume(
+    assistant: Assistant,
+    account_id: str,
+    conversation_id: str,
+    model: Model | None = None,
+    *,
+    max_steps: int = DEFAULT_MAX_STEPS,
+) -> Reply:
     pending = assistant.take_pending(account_id, conversation_id)
     if pending is None:
         raise PendingMissing(conversation_id)
@@ -361,7 +444,42 @@ def resume(assistant: Assistant, account_id: str, conversation_id: str) -> Reply
         confirmed=True,
     )
     route = Route(pending["route"])
-    reply = Reply("reply", outcome["result"], route, tool=pending["tool"])
+    if model is None:
+        reply = Reply("reply", outcome["result"], route, tool=pending["tool"])
+        assistant.remember(account_id, conversation_id, reply.status, reply.text)
+        assistant.persist_vault(account_id, conversation_id)
+        return reply
+    task = Task(
+        account_id=account_id,
+        conversation_id=conversation_id,
+        text=str(pending.get("text") or "continue"),
+        allow_cloud=bool(pending.get("allow_cloud")),
+        free_text=bool(pending.get("free_text")),
+    )
+    token = current_task.set(
+        ActiveTurn(task.account_id, task.conversation_id, task.allow_cloud, task.free_text)
+    )
+    try:
+        reply = _converse(
+            assistant,
+            task,
+            model,
+            max_steps=max_steps,
+            seed=(str(pending["tool"]), outcome["result"]),
+        )
+    finally:
+        current_task.reset(token)
+    if reply.route is not route and reply.status == "reply":
+        reply = Reply(
+            reply.status,
+            reply.text,
+            route,
+            tool=reply.tool,
+            arguments=reply.arguments,
+            task_text=reply.task_text,
+            allow_cloud=reply.allow_cloud,
+            free_text=reply.free_text,
+        )
     assistant.remember(account_id, conversation_id, reply.status, reply.text)
     assistant.persist_vault(account_id, conversation_id)
     return reply

@@ -916,57 +916,160 @@ def _web_url(url: str) -> None:
         raise ValueError("url must be http or https")
 
 
-_MAX_INTERACTIVE = 40
+_MAX_INTERACTIVE = 80
 _MAX_CONTENT = 3500
-_REF_LINE = re.compile(r"^\[(\d+)\]\s+(link|button|textbox)\s+\"(.*)\"\s*$")
+_REF_LINE = re.compile(
+    r'^\[(\d+)\]\s+(\w+)\s+"(.*)"(?:\s+\(([^)]*)\))?\s*$'
+)
 
 _SNAPSHOT_JS = """() => {
-  const clean = (value) => String(value || "").replace(/\\s+/g, " ").trim().slice(0, 120);
-  const interactive = [];
-  const seen = new Set();
-  const add = (role, name) => {
-    const label = clean(name);
-    if (!label || label.length < 1) return;
-    const key = role + "|" + label.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    interactive.push({ role, name: label });
+  const cleanLabel = (value) => String(value || "").replace(/\\s+/g, " ").trim().slice(0, 120);
+  const visible = (node) => {
+    if (!(node instanceof Element)) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
   };
-  for (const node of document.querySelectorAll("a[href]")) {
-    add("link", node.innerText || node.getAttribute("aria-label") || node.getAttribute("title"));
+  const regionOf = (node) => {
+    if (node.closest('[role="dialog"], dialog[open], [aria-modal="true"]')) return "dialog";
+    if (node.closest("header, [role='banner']")) return "header";
+    if (node.closest("nav, [role='navigation']")) return "nav";
+    if (node.closest("main, article, [role='main']")) return "main";
+    return "page";
+  };
+  const neighbor = (node) => {
+    const prev = node.previousElementSibling;
+    if (prev) {
+      const text = cleanLabel(prev.innerText || prev.getAttribute("aria-label") || "");
+      if (text) return text.slice(0, 40);
+    }
+    const parent = node.parentElement;
+    if (parent) {
+      const text = cleanLabel(parent.innerText || parent.getAttribute("aria-label") || "");
+      if (text) return text.slice(0, 40);
+    }
+    return "";
+  };
+  const labelOf = (node, fallbacks) => {
+    for (const value of fallbacks) {
+      const label = cleanLabel(value);
+      if (label) return label;
+    }
+    const near = neighbor(node);
+    return near ? 'unnamed, near "' + near.replace(/"/g, "'") + '"' : "unnamed";
+  };
+  const statesOf = (node) => {
+    const states = [];
+    if (node.disabled || node.getAttribute("aria-disabled") === "true") states.push("disabled");
+    if (node.checked || node.getAttribute("aria-checked") === "true") states.push("checked");
+    if (node.getAttribute("aria-expanded") === "true") states.push("expanded");
+    if (node.getAttribute("aria-selected") === "true" || node.selected) states.push("selected");
+    if (node.getAttribute("aria-invalid") === "true") states.push("invalid");
+    return states;
+  };
+  const interactive = [];
+  const add = (node, role, name, value) => {
+    if (!visible(node) || interactive.length >= 80) return;
+    interactive.push({
+      role,
+      name: cleanLabel(name) || "unnamed",
+      region: regionOf(node),
+      states: statesOf(node),
+      value: cleanLabel(value || ""),
+    });
+  };
+  const roots = [];
+  const dialog = document.querySelector('[role="dialog"], dialog[open], [aria-modal="true"]');
+  if (dialog) roots.push(dialog);
+  roots.push(document);
+  const seenNodes = new Set();
+  for (const root of roots) {
+    const scope = root === document ? document : root;
+    for (const node of scope.querySelectorAll("a[href]")) {
+      if (seenNodes.has(node)) continue;
+      seenNodes.add(node);
+      add(node, "link", labelOf(node, [node.innerText, node.getAttribute("aria-label"), node.getAttribute("title")]));
+    }
+    for (const node of scope.querySelectorAll(
+      "button, [role='button'], input[type='submit'], input[type='button'], summary"
+    )) {
+      if (seenNodes.has(node)) continue;
+      seenNodes.add(node);
+      add(
+        node,
+        "button",
+        labelOf(node, [node.innerText, node.value, node.getAttribute("aria-label"), node.getAttribute("title")])
+      );
+    }
+    for (const node of scope.querySelectorAll(
+      "input:not([type='hidden']):not([type='password']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio']):not([type='file']), textarea, [role='textbox']"
+    )) {
+      if (seenNodes.has(node)) continue;
+      seenNodes.add(node);
+      add(
+        node,
+        "textbox",
+        labelOf(node, [
+          node.getAttribute("aria-label"),
+          node.getAttribute("placeholder"),
+          node.getAttribute("name"),
+          node.id,
+        ]),
+        node.value
+      );
+    }
+    for (const node of scope.querySelectorAll("input[type='checkbox'], [role='checkbox']")) {
+      if (seenNodes.has(node)) continue;
+      seenNodes.add(node);
+      add(
+        node,
+        "checkbox",
+        labelOf(node, [node.getAttribute("aria-label"), node.getAttribute("name"), node.id, node.value])
+      );
+    }
+    for (const node of scope.querySelectorAll("input[type='radio'], [role='radio']")) {
+      if (seenNodes.has(node)) continue;
+      seenNodes.add(node);
+      add(
+        node,
+        "radio",
+        labelOf(node, [node.getAttribute("aria-label"), node.getAttribute("name"), node.id, node.value])
+      );
+    }
+    for (const node of scope.querySelectorAll("select, [role='combobox'], [role='listbox']")) {
+      if (seenNodes.has(node)) continue;
+      seenNodes.add(node);
+      const selected = node.selectedOptions && node.selectedOptions[0] ? node.selectedOptions[0].text : node.value;
+      add(
+        node,
+        "combobox",
+        labelOf(node, [node.getAttribute("aria-label"), node.getAttribute("name"), node.id]),
+        selected
+      );
+    }
+    for (const node of scope.querySelectorAll("[role='tab'], [role='menuitem'], [role='option'], [role='switch']")) {
+      if (seenNodes.has(node)) continue;
+      seenNodes.add(node);
+      const role = node.getAttribute("role") || "button";
+      add(node, role, labelOf(node, [node.innerText, node.getAttribute("aria-label"), node.getAttribute("title")]));
+    }
   }
-  for (const node of document.querySelectorAll(
-    "button, [role='button'], input[type='submit'], input[type='button']"
-  )) {
-    add(
-      "button",
-      node.innerText || node.value || node.getAttribute("aria-label") || node.getAttribute("title")
-    );
-  }
-  for (const node of document.querySelectorAll(
-    "input:not([type='hidden']):not([type='password']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio']), textarea, [role='textbox']"
-  )) {
-    add(
-      "textbox",
-      node.getAttribute("aria-label") ||
-        node.getAttribute("placeholder") ||
-        node.getAttribute("name") ||
-        node.id ||
-        "text"
-    );
-  }
-  const root =
-    document.querySelector("main, article, [role='main']") || document.body || document.documentElement;
-  const content = clean(root && root.innerText ? root.innerText : "");
+  const contentRoot = dialog
+    || document.querySelector("main, article, [role='main']")
+    || document.body
+    || document.documentElement;
+  let content = contentRoot && contentRoot.innerText ? String(contentRoot.innerText) : "";
+  content = content.replace(/\\r/g, "").slice(0, 3500);
   const secrets = [];
   for (const node of document.querySelectorAll("input[type='password']")) {
     if (node.value) secrets.push(String(node.value));
   }
   return {
     url: location.href || "",
-    title: clean(document.title || ""),
-    interactive: interactive.slice(0, 40),
-    content: content.slice(0, 3500),
+    title: cleanLabel(document.title || ""),
+    interactive: interactive.slice(0, 80),
+    content,
     secrets,
   };
 }"""
@@ -988,7 +1091,19 @@ def _format_snapshot(data: dict[str, Any]) -> str:
         for index, item in enumerate(interactive, start=1):
             role = str(item.get("role") or "link")
             name = str(item.get("name") or "").replace('"', "'")
-            lines.append(f'[{index}] {role} "{name}"')
+            meta: list[str] = []
+            region = str(item.get("region") or "").strip()
+            if region:
+                meta.append(region)
+            for state in item.get("states") or ():
+                text = str(state).strip()
+                if text:
+                    meta.append(text)
+            value = str(item.get("value") or "").strip()
+            if value:
+                meta.append(f"value={value.replace(chr(34), chr(39))}")
+            suffix = f" ({', '.join(meta)})" if meta else ""
+            lines.append(f'[{index}] {role} "{name}"{suffix}')
     else:
         lines.append("(none)")
     lines.append("")
