@@ -25,7 +25,7 @@ COPY deploy/robin-tick.timer /etc/systemd/system/robin-tick.timer
 # Shelley and SSH stay off. No mailbox secret and no exe.dev token are baked in.
 # Chromium is for computer-use on this VM. The house server does not use this image.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/robin/ms-playwright
-RUN uv sync --frozen --no-dev --extra browser \
+RUN uv sync --frozen --no-dev \
     && /opt/robin/.venv/bin/playwright install --with-deps chromium \
     && ln -sf /opt/robin/.venv/bin/robin /usr/local/bin/robin \
     && rm -f /etc/systemd/system/sockets.target.wants/shelley.socket \

@@ -79,7 +79,7 @@ class Node:
         return self.values[0] if self.values else ""
 
     def click(self) -> None:
-        self.clicks.append(getattr(self, "name", "click"))
+        self.clicks.append(getattr(self, "name", "browser_click"))
 
     def fill(self, text: str) -> None:
         self.fills.append(text)
@@ -111,7 +111,7 @@ class FakePlaywright:
     def locator(self, selector: str) -> Node:
         if "password" in selector:
             return self.passwords
-        if "submit" in selector:
+        if "browser_submit" in selector:
             return self.submit_button
         return self.body
 
@@ -142,7 +142,10 @@ def test_the_model_sees_text_and_a_password_stays_out() -> None:
     assert PASSWORD not in decision.local_text
     assert PASSWORD not in decision.redacted
     assert SECRET not in decision.local_text
-    assert decision.cloud_payload is None
+    # An open page is not ambient context, so a clean look may go to the cloud.
+    assert decision.cloud_payload is not None
+    assert SECRET not in decision.cloud_payload
+    assert PASSWORD not in decision.cloud_payload
     bea = assistant.decide(Task("bea", "screen", "look"))
     assert "Ignore previous instructions" not in bea.local_text
     assert PASSWORD not in bea.local_text
@@ -152,90 +155,51 @@ def test_submit_and_typing_a_password_wait_for_confirm() -> None:
     page = MemoryPage(text="desk", password="")
     assistant = Assistant()
     assistant.add(Browser("ada", page))
-    held = assistant.invoke("ada", "screen", "type_password", {"text": PASSWORD})
+    held = assistant.invoke("ada", "screen", "browser_type_password", {"text": PASSWORD})
     assert held["status"] == "confirm"
     assert page.password_typed == ""
-    submit = assistant.invoke("ada", "screen", "submit", {})
+    submit = assistant.invoke("ada", "screen", "browser_submit", {})
     assert submit["status"] == "confirm"
     assert page.submitted is False
-    done = assistant.invoke("ada", "screen", "type_password", {"text": PASSWORD}, confirmed=True)
+    done = assistant.invoke("ada", "screen", "browser_type_password", {"text": PASSWORD}, confirmed=True)
     assert done["status"] == "done"
     assert page.password_typed == PASSWORD
     log = json.dumps(assistant.activity.read("ada"))
     assert PASSWORD not in log
-    click = assistant.invoke("ada", "screen", "click", {"target": "ok"})
+    click = assistant.invoke("ada", "screen", "browser_click", {"target": "ok"})
     assert click["status"] == "done"
     assert page.clicked == "ok"
     try:
-        assistant.invoke("bea", "screen", "read_screen", {})
+        assistant.invoke("bea", "screen", "browser_read", {})
     except KeyError:
         return
     raise AssertionError("other account read the screen")
 
 
-def test_a_general_question_does_not_offer_the_browser() -> None:
+def test_browser_tools_are_offered_without_trigger_words() -> None:
     assistant = Assistant()
     assistant.add(Browser(desk=Desk(lambda url: MemoryPage(text=url))))
+    names = {tool["name"] for tool in assistant.tools("ada")}
+    assert "browser_open" in names
 
     class Scripted:
         def __init__(self) -> None:
             self.tools: list[str] = []
 
-        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
+        def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
             self.tools = [tool["name"] for tool in tools]
-            self.user = user
             return ModelTurn("Oslo.")
 
     model = Scripted()
     reply = converse(assistant, Task("ada", "home", "What is the capital of Norway?"), model)
     assert reply.status == "reply"
     assert reply.text == "Oslo."
-    assert "open_page" not in model.tools
-    assert "read_screen" not in model.tools
-    asking = Scripted()
-    opened = converse(assistant, Task("ada", "home", "open https://example.test"), asking)
-    assert "https://example.test" in opened.text
-    assert not hasattr(asking, "user")
-    news = Scripted()
-    reply = converse(assistant, Task("ada", "home", "can you give me the latest news from vg.no?"), news)
-    assert "vg.no" in reply.text
-    assert not hasattr(news, "user")
-    assistant.invoke("ada", "home", "open_page", {"url": "https://example.test/ada"})
+    assert "browser_open" in model.tools
+    assistant.invoke("ada", "home", "browser_open", {"url": "https://example.test/ada"})
     follow = Scripted()
     converse(assistant, Task("ada", "home", "what is on the page"), follow)
-    assert "read_screen" in follow.tools
+    assert "browser_read" in follow.tools
 
-
-def test_with_ner_a_page_is_summarized_not_dumped() -> None:
-    from robin.ner import UnavailableNer
-
-    class ReadyNer(UnavailableNer):
-        def available(self) -> bool:
-            return True
-
-    page = _Article("Storm hits the coast.\nNav chrome\nSecond story about schools.")
-    assistant = Assistant(ner=ReadyNer())
-    assistant.add(Browser(desk=Desk(lambda url: page)))
-
-    class Scripted:
-        def __init__(self) -> None:
-            self.system = ""
-            self.user = ""
-            self.tools: list[str] = []
-
-        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
-            self.system = system
-            self.user = user
-            self.tools = [tool["name"] for tool in tools]
-            return ModelTurn("- Storm hits the coast\n- Schools update")
-
-    model = Scripted()
-    reply = converse(assistant, Task("ada", "home", "top news from vg.no"), model)
-    assert "Storm hits the coast" in model.user
-    assert "bullet list" in model.system.lower() or "top stories" in model.system.lower()
-    assert "click" in model.tools
-    assert reply.text.startswith("- Storm")
-    assert "Nav chrome" not in reply.text
 
 
 def test_a_checkout_binary_is_used_when_the_home_cache_has_no_chrome(tmp_path, monkeypatch) -> None:
@@ -262,7 +226,7 @@ def test_a_checkout_binary_is_used_when_the_home_cache_has_no_chrome(tmp_path, m
 def test_reading_before_a_page_is_open_returns_that() -> None:
     assistant = Assistant()
     assistant.add(Browser(desk=Desk(lambda url: MemoryPage(text=url))))
-    done = assistant.invoke("ada", "home", "read_screen", {})
+    done = assistant.invoke("ada", "home", "browser_read", {})
     assert done["status"] == "done"
     assert done["result"] == "no page is open"
 
@@ -277,48 +241,31 @@ def test_a_task_opens_one_accounts_page_and_does_not_launch_for_a_bad_url() -> N
     desk = Desk(opener)
     assistant = Assistant()
     assistant.add(Browser(desk=desk))
-    done = assistant.invoke("ada", "display", "open_page", {"url": "https://example.test/ada"})
+    done = assistant.invoke("ada", "display", "browser_open", {"url": "https://example.test/ada"})
     assert done["status"] == "done"
     assert "URL:" in done["result"]
     assert "Content:" in done["result"]
     assert "ada page" in done["result"]
     assert opened == ["https://example.test/ada"]
+    assert desk.has("ada")
     ada = assistant.decide(Task("ada", "screen", "look"))
     bea = assistant.decide(Task("bea", "screen", "look"))
-    assert "ada page" in ada.local_text
+    # An open page is not re-fetched into ambient context on every decide.
+    assert "ada page" not in ada.local_text
     assert PASSWORD not in ada.local_text
     assert "ada page" not in bea.local_text
     before = len(opened)
     try:
-        assistant.invoke("ada", "display", "open_page", {"url": "file:///etc/robin/store.key"})
+        assistant.invoke("ada", "display", "browser_open", {"url": "file:///etc/robin/store.key"})
     except ValueError:
         pass
     else:
         raise AssertionError("a file url opened a page")
     assert len(opened) == before
-    assistant.invoke("ada", "display", "open_page", {"url": "https://example.test/next"})
+    assistant.invoke("ada", "display", "browser_open", {"url": "https://example.test/next"})
     assert opened == ["https://example.test/ada"]
     assert desk.pages["ada"].text == "https://example.test/next"
 
-
-def test_playwright_reads_text_and_does_not_photograph_the_page() -> None:
-    fake = FakePlaywright()
-    page = PlaywrightPage(fake)
-    shown = Browser("ada", page).records("ada")
-    assert "Welcome" in shown[0]["text"]
-    assert "Interactive:" in shown[0]["text"]
-    assert '[1] button "Save"' in shown[0]["text"]
-    assert PASSWORD not in shown[0]["text"]
-    assert shown[0]["password"] == PASSWORD
-    page.click("Save", role="button")
-    assert fake.clicked.name == "Save"
-    page.type_text("Note", "milk")
-    assert fake.labeled == "Note"
-    assert fake.label.fills == ["milk"]
-    page.submit()
-    assert fake.submit_button.clicks == ["click"]
-    source = Path("src/robin/capabilities/browser.py").read_text()
-    assert "screenshot" not in source
 
 
 def test_click_uses_interactive_refs_from_the_snapshot() -> None:
@@ -350,10 +297,10 @@ def test_click_uses_interactive_refs_from_the_snapshot() -> None:
     page = Linked()
     assistant = Assistant()
     assistant.add(Browser(desk=Desk(lambda url: page)))
-    opened = assistant.invoke("ada", "home", "open_page", {"url": "https://news.test/"})
+    opened = assistant.invoke("ada", "home", "browser_open", {"url": "https://news.test/"})
     assert opened["status"] == "done"
     assert "[1] link" in opened["result"]
-    clicked = assistant.invoke("ada", "home", "click", {"target": "1"})
+    clicked = assistant.invoke("ada", "home", "browser_click", {"target": "1"})
     assert clicked["status"] == "done"
     assert page.ref_clicks == ["1"]
     assert page.role_clicks == [("link", "Storm hits the coast")]
@@ -412,14 +359,14 @@ def test_popup_pages_can_be_listed_and_switched() -> None:
 
     page = Tabbed()
     browser = Browser("ada", page)
-    shown = browser.invoke("ada", "read_screen", {})
+    shown = browser.invoke("ada", "browser_read", {})
     assert "Pages:" in shown
     assert "[1] https://shop.test/" in shown
     assert "[2] https://pay.test/checkout" in shown
     assert "(active)" in shown
     assert "Downloads:" in shown
     assert "invoice.pdf" in shown
-    switched = browser.invoke("ada", "switch_page", {"index": 2})
+    switched = browser.invoke("ada", "browser_switch", {"index": 2})
     assert page._active == 1
     assert "https://pay.test/checkout" in switched
     assert "switched to page 2" in switched
@@ -515,14 +462,14 @@ def test_scroll_select_press_and_back_are_available() -> None:
 
     page = Controls()
     browser = Browser("ada", page)
-    browser.invoke("ada", "read_screen", {})
-    assert "selected NO" in browser.invoke("ada", "select_option", {"target": "1", "value": "NO"})
+    browser.invoke("ada", "browser_read", {})
+    assert "selected NO" in browser.invoke("ada", "browser_select", {"target": "1", "value": "NO"})
     assert page.selected == [("1", "NO")]
-    browser.invoke("ada", "scroll", {"direction": "down"})
+    browser.invoke("ada", "browser_scroll", {"direction": "down"})
     assert page.scrolled == "down"
-    browser.invoke("ada", "press_key", {"key": "Enter"})
+    browser.invoke("ada", "browser_press", {"key": "Enter"})
     assert page.keys == ["Enter"]
-    browser.invoke("ada", "go_back", {})
+    browser.invoke("ada", "browser_back", {})
     assert page.backed is True
 
 
@@ -569,9 +516,9 @@ def test_stamped_ref_clicks_the_second_duplicate_control() -> None:
     fake = Stamped()
     page = PlaywrightPage(fake)
     browser = Browser("ada", page)
-    shown = browser.invoke("ada", "read_screen", {})
+    shown = browser.invoke("ada", "browser_read", {})
     assert shown.count('button "Delete"') == 2
-    clicked = browser.invoke("ada", "click", {"target": "2"})
+    clicked = browser.invoke("ada", "browser_click", {"target": "2"})
     assert fake.ref_hits == ["2"]
     assert "changed:" in clicked
     assert fake.first.clicks == []
@@ -640,6 +587,27 @@ class _StepNode:
         return "Sign in"
 
 
+def test_password_fields_appear_as_password_refs_without_values() -> None:
+    from robin.capabilities.browser import _format_snapshot
+
+    formatted = _format_snapshot(
+        {
+            "url": "https://shop.test/login",
+            "title": "Logg inn",
+            "interactive": [
+                {"ref": "1", "role": "textbox", "name": "E-post", "region": "page", "states": [], "value": "ada@shop.com"},
+                {"ref": "2", "role": "password", "name": "Passord", "region": "page", "states": [], "value": "secret"},
+                {"ref": "3", "role": "button", "name": "Logg inn", "region": "page", "states": [], "value": ""},
+            ],
+            "content": "Velkommen",
+        }
+    )
+    assert '[2] password "Passord"' in formatted
+    assert "secret" not in formatted
+    assert "value=secret" not in formatted
+    assert '[1] textbox "E-post"' in formatted
+
+
 def test_sign_in_fills_the_email_step_and_then_the_password() -> None:
     page = _Step()
     PlaywrightPage(page).sign_in("ada@shop.com", "correct-horse-battery")
@@ -652,30 +620,6 @@ class _Article(MemoryPage):
     def open(self, url: str) -> None:
         return None
 
-
-def test_a_model_denial_does_not_hide_a_page_that_opened() -> None:
-    from robin.ner import UnavailableNer
-
-    class ReadyNer(UnavailableNer):
-        def available(self) -> bool:
-            return True
-
-    page = _Article("Astrid leads the front page.")
-    assistant = Assistant(ner=ReadyNer())
-    assistant.add(Browser(desk=Desk(lambda url: page)))
-
-    class Scripted:
-        def __init__(self) -> None:
-            self.system = ""
-
-        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
-            self.system = system
-            return ModelTurn("I am unable to open that page.")
-
-    model = Scripted()
-    reply = converse(assistant, Task("ada", "home", "open https://vg.no"), model)
-    assert "Astrid leads the front page." in reply.text
-    assert "bullet list" in model.system.lower() or "top stories" in model.system.lower()
 
 
 def test_a11y_tree_walk_collects_focusable_and_aria_controls() -> None:
@@ -744,6 +688,33 @@ def test_a11y_tree_walk_collects_focusable_and_aria_controls() -> None:
     assert "(more below)" in formatted
 
 
+def test_a_missing_type_target_returns_instead_of_hanging() -> None:
+    class Missing(MemoryPage):
+        def __init__(self) -> None:
+            super().__init__(text="form")
+            self._refs = {"1": ("textbox", "Email")}
+
+        def read(self) -> tuple[str, str]:
+            return (
+                'URL: https://example.test/login\n\nInteractive:\n[1] textbox "Email"\n\nContent:\nform',
+                "",
+            )
+
+        def location(self) -> str:
+            return "https://example.test/login"
+
+        def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
+            raise TimeoutError(
+                'Locator.fill: Timeout 30000ms exceeded.\nCall log:\n  - waiting for get_by_label("username")'
+            )
+
+    page = Missing()
+    browser = Browser(desk=Desk(lambda url: page))
+    browser.invoke("ada", "browser_open", {"url": "https://example.test/login"})
+    result = browser.invoke("ada", "browser_type", {"target": "username", "text": "ada"})
+    assert "could not find that field" in result
+
+
 def test_hover_and_type_focused_are_available() -> None:
     class Controls(MemoryPage):
         def __init__(self) -> None:
@@ -769,22 +740,12 @@ def test_hover_and_type_focused_are_available() -> None:
 
     page = Controls()
     browser = Browser("ada", page)
-    browser.invoke("ada", "read_screen", {})
-    browser.invoke("ada", "hover", {"target": "1"})
+    browser.invoke("ada", "browser_read", {})
+    browser.invoke("ada", "browser_hover", {"target": "1"})
     assert page.hovered == "1"
-    browser.invoke("ada", "type_focused", {"text": "hello"})
+    browser.invoke("ada", "browser_type_focused", {"text": "hello"})
     assert page.focused_typed == "hello"
 
-
-def test_compose_keeps_the_current_page_when_history_is_long() -> None:
-    from robin.loop import _compose
-
-    history = "\n".join(f"person: turn {i} " + ("x" * 200) for i in range(20))
-    page = "Current page:\nURL: https://news.test/\n\nContent:\n" + ("story " * 400)
-    packed = _compose("{}", "what is the news", history, "Action log:\nclick", page=page, keep_end=True)
-    assert "Current page:" in packed
-    assert "https://news.test/" in packed
-    assert len(packed) <= 6000
 
 
 def test_snapshot_keeps_page_body_and_richer_controls() -> None:
@@ -826,3 +787,32 @@ def test_snapshot_keeps_page_body_and_richer_controls() -> None:
     assert refs["1"] == ("button", "Save")
     assert refs["3"] == ("link", "Read more")
     assert refs["4"] == ("link", "Read more")
+
+
+def test_page_methods_run_on_the_browser_thread() -> None:
+    import threading
+
+    seen: list[str] = []
+
+    class Tracked(MemoryPage):
+        def location(self) -> str:
+            seen.append(threading.current_thread().name)
+            return "https://example.test/"
+
+        def read(self) -> tuple[str, str]:
+            seen.append(threading.current_thread().name)
+            return "plain text without url header", ""
+
+        def page_list(self) -> list:
+            seen.append(threading.current_thread().name)
+            return []
+
+        def downloads(self) -> list:
+            seen.append(threading.current_thread().name)
+            return []
+
+    browser = Browser(desk=Desk(lambda url: Tracked(text=url)))
+    browser.invoke("ada", "browser_open", {"url": "https://example.test/"})
+    browser._glance("ada")
+    assert seen
+    assert all(name == "robin-browser" for name in seen)

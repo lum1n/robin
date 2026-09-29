@@ -154,6 +154,28 @@ public struct Reply: Decodable, Sendable, Equatable {
     public let text: String
     public let route: String
     public let tool: String?
+    public let timing: String?
+
+    public init(status: String, text: String, route: String, tool: String?, timing: String? = nil) {
+        self.status = status
+        self.text = text
+        self.route = route
+        self.tool = tool
+        self.timing = timing
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(String.self, forKey: .status)
+        text = try container.decode(String.self, forKey: .text)
+        route = try container.decode(String.self, forKey: .route)
+        tool = try container.decodeIfPresent(String.self, forKey: .tool)
+        timing = try container.decodeIfPresent(String.self, forKey: .timing)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status, text, route, tool, timing
+    }
 }
 
 public struct RobinFailure: Error, Equatable, Sendable {

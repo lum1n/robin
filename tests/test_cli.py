@@ -125,8 +125,8 @@ def test_tick_checks_enabled_accounts_and_prints_no_secret(tmp_path: Path, capsy
         def __init__(self, base_url: str = "http://127.0.0.1:8080", transport=None, model: str = "local") -> None:
             return None
 
-        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
-            Quiet.prompts.append(user)
+        def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
+            Quiet.prompts.append(str(messages))
             return ModelTurn("mailbox-password-ada should stay out of the journal")
 
     monkeypatch.setattr("robin.model.ChatModel", Quiet)

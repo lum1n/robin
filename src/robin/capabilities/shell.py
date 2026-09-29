@@ -5,8 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from robin.capabilities.browser import _wants_page
-from robin.capabilities.desktop import _wants_desktop
 from robin.capabilities.identity import claim, run_as
 from robin.capability import Capability, Effect, FieldSpec, Tool
 
@@ -29,8 +27,8 @@ class Terminal(Capability):
     id = "shell"
     tools = [
         Tool(
-            name="run_command",
-            description="Run a command in this account's directory. Waits for confirmation.",
+            name="shell_run",
+            description="Run a shell command in this account's directory. Waits for confirmation. Do not use this to browse the web.",
             parameters={
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -44,12 +42,10 @@ class Terminal(Capability):
     def __init__(self, box: ShellBox) -> None:
         self.box = box
 
-    def offered_tools(self, account_id: str, task: str) -> list[Tool]:
-        if _wants_page(task) or _wants_desktop(task):
-            return []
-        return list(self.tools)
+    def status(self, account_id: str) -> str:
+        return "shell: available"
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        if tool_name == "run_command":
+        if tool_name == "shell_run":
             return self.box.run(account_id, str(arguments.get("command", "")))
         raise NotImplementedError(tool_name)

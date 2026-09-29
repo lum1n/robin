@@ -40,14 +40,17 @@ class Jobs(Capability):
     id = "jobs"
     tools = [
         Tool(
-            name="list_jobs",
+            name="jobs_list",
             description="List this account's automations.",
             parameters={"type": "object", "properties": {}},
             effect=Effect.READ,
         ),
         Tool(
-            name="add_job",
-            description="Save an automation for this account. Use a clock time, every_minutes, or in_minutes.",
+            name="jobs_add",
+            description=(
+                "Save an automation for this account. "
+                "Provide instruction plus one of: hour/minute (daily), every_minutes, or in_minutes (once)."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -63,7 +66,7 @@ class Jobs(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="update_job",
+            name="jobs_update",
             description="Change one of this account's automations.",
             parameters={
                 "type": "object",
@@ -73,13 +76,15 @@ class Jobs(Capability):
                     "hour": {"type": "integer"},
                     "minute": {"type": "integer"},
                     "days": {"type": "string"},
+                    "every_minutes": {"type": "integer"},
+                    "in_minutes": {"type": "integer"},
                 },
                 "required": ["id"],
             },
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="cancel_job",
+            name="jobs_cancel",
             description="Cancel one of this account's automations.",
             parameters={
                 "type": "object",
@@ -116,38 +121,10 @@ class Jobs(Capability):
         if store is not None:
             self._jobs = {account_id: [dict(row) for row in rows] for account_id, rows in store.load_jobs().items()}
 
-    def offered_tools(self, account_id: str, task: str) -> list[Tool]:
-        if _wants_automation(task):
-            return list(self.tools)
-        return []
-
-    def prepare(self, account_id: str, task: str) -> str:
+    def status(self, account_id: str) -> str:
         with self._lock:
-            jobs = [dict(row) for row in self._jobs.get(account_id, [])]
-        kind = _interpret(task, jobs)
-        if kind is None:
-            return ""
-        if kind == "list":
-            return self._list(account_id)
-        if kind == "add":
-            schedule, instruction = _create_fields(task, self.clock())
-            if schedule is None:
-                return "Say a time, such as 08:00, every hour, or in 15 minutes."
-            if not instruction:
-                return "Say what the automation should do."
-            return self._add(account_id, instruction, schedule)
-        if kind == "cancel":
-            target = _one_target(task, jobs)
-            if target is None:
-                return _which(jobs, "cancel")
-            return self._cancel(account_id, target["id"])
-        target = _one_target(task, jobs)
-        if target is None:
-            return _which(jobs, "change")
-        schedule, instruction = _edit_fields(task, target, jobs, self.clock())
-        if schedule is None and not instruction:
-            return "Say the new time or what it should do."
-        return self._update(account_id, target["id"], instruction=instruction, schedule=schedule)
+            count = len(self._jobs.get(account_id, []))
+        return f"jobs: {count} automation(s)"
 
     def records(self, account_id: str) -> list[dict[str, str]]:
         with self._lock:
@@ -189,15 +166,15 @@ class Jobs(Capability):
         return work
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        if tool_name == "list_jobs":
+        if tool_name == "jobs_list":
             return self._list(account_id)
-        if tool_name == "add_job":
+        if tool_name == "jobs_add":
             instruction = str(arguments.get("instruction", "")).strip()
             schedule = _schedule_from_arguments(arguments, self.clock())
             if schedule is None or not instruction:
                 return "Say what to do, and a time such as 08:00, every hour, or in 15 minutes."
             return self._add(account_id, instruction, schedule)
-        if tool_name == "update_job":
+        if tool_name == "jobs_update":
             instruction = str(arguments.get("instruction", "")).strip()
             schedule = _schedule_from_arguments(arguments, self.clock(), partial=True)
             return self._update(
@@ -206,7 +183,7 @@ class Jobs(Capability):
                 instruction=instruction,
                 schedule=schedule,
             )
-        if tool_name == "cancel_job":
+        if tool_name == "jobs_cancel":
             return self._cancel(account_id, str(arguments.get("id", "")))
         raise NotImplementedError(tool_name)
 

@@ -10,6 +10,7 @@ public enum ShellPhase: Equatable, Sendable {
 public actor Shell {
     public private(set) var phase: ShellPhase = .signedOut
     public private(set) var scheduleEnabled = false
+    public private(set) var serverTiming = ""
     private var client: RobinClient?
     private let transport: any RobinTransport
 
@@ -29,6 +30,7 @@ public actor Shell {
     public func leave() {
         client = nil
         scheduleEnabled = false
+        serverTiming = ""
         phase = .signedOut
     }
 
@@ -82,6 +84,7 @@ public actor Shell {
 
     private func show(_ reply: Reply, on current: RobinClient) async throws {
         let threads = try await current.threads()
+        serverTiming = reply.timing ?? ""
         if reply.status == "confirm" {
             phase = .confirm(threads: threads, prompt: reply.text, tool: reply.tool ?? "")
         } else {

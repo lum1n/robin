@@ -18,8 +18,8 @@ class Scripted:
         self.turns = list(turns)
         self.seen: list[str] = []
 
-    def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
-        self.seen.append(user)
+    def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
+        self.seen.append(messages)
         return self.turns.pop(0)
 
 
@@ -44,7 +44,7 @@ def _service(tmp_path, model, ner=None) -> tuple[Service, Screen, dict[str, str]
 def test_a_message_can_stop_for_confirmation_and_a_second_call_runs_it(tmp_path) -> None:
     model = Scripted(
         [
-            ModelTurn("", (ToolCall("submit", {}),)),
+            ModelTurn("", (ToolCall("screen_submit", {}),)),
             ModelTurn("Sent."),
         ]
     )
@@ -58,7 +58,7 @@ def test_a_message_can_stop_for_confirmation_and_a_second_call_runs_it(tmp_path)
     )
     assert held[0] == 200
     assert held[1]["status"] == "confirm"
-    assert held[1]["tool"] == "submit"
+    assert held[1]["tool"] == "screen_submit"
     assert screen.submitted is False
 
     done = dispatch(
@@ -101,8 +101,9 @@ def test_threads_and_activity_stay_on_the_account_that_owns_them(tmp_path) -> No
     assert bea_threads[1]["threads"] == []
     assert any(turn["text"] == "hello Jane Doe" for turn in ada_turns[1]["turns"])
     assert bea_turns[1]["turns"] == []
-    assert FODSELSNUMMER not in model.seen[0]
-    assert SECRET not in model.seen[0]
+    prompt = str(model.seen[0])
+    assert FODSELSNUMMER not in prompt
+    assert SECRET not in prompt
     activity = dispatch(service, "GET", "/v1/activity", query={"account_id": "bea"}, headers=bea)
     assert activity[1]["entries"] == []
     assert stolen[0] == 401
@@ -126,8 +127,9 @@ def test_cloud_opt_in_sends_placeholders_and_the_reply_restores_them(tmp_path) -
     assert status == 200
     assert payload["route"] == "cloud"
     assert payload["text"] == "hello Jane Doe"
-    assert "Jane Doe" not in model.seen[0]
-    assert "[PERSON_1]" in model.seen[0]
+    prompt = str(model.seen[0])
+    assert "Jane Doe" not in prompt
+    assert "[PERSON_1]" in prompt
 
 
 def test_a_session_connects_a_mailbox_and_a_restart_keeps_the_secret(tmp_path) -> None:

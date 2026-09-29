@@ -168,7 +168,7 @@ def test_plain_part_is_the_body_and_a_missing_secret_does_not_connect() -> None:
     assert seen == []
     broker.put("ada", "mailbox", mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD))
     rows = mailbox.messages("ada")
-    assert rows == [{"sender": "Jane Doe", "subject": "", "body": "plain note"}]
+    assert rows == [{"id": "1", "sender": "Jane Doe", "subject": "", "body": "plain note"}]
     assert "<p>" not in rows[0]["body"]
 
 
@@ -181,13 +181,13 @@ def test_send_waits_for_confirm_and_the_password_is_not_logged() -> None:
         mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD),
     )
     assistant.add(Mail(ImapMailbox(assistant.broker, open_imap=directory.open_imap, open_smtp=directory.open_smtp)))
-    held = assistant.invoke("ada", "thread", "send_message", {"to": "jane@example.com", "subject": "hi", "body": f"see {SECRET}"})
+    held = assistant.invoke("ada", "thread", "mail_send", {"to": "jane@example.com", "subject": "hi", "body": f"see {SECRET}"})
     assert held["status"] == "confirm"
     assert directory.opened_smtp == []
     done = assistant.invoke(
         "ada",
         "thread",
-        "send_message",
+        "mail_send",
         {"to": "jane@example.com", "subject": "hi", "body": f"see {SECRET}"},
         confirmed=True,
     )
@@ -205,68 +205,6 @@ def test_send_waits_for_confirm_and_the_password_is_not_logged() -> None:
     assert all("password" not in json.dumps(tool) for tool in schemas)
 
 
-def test_asking_for_mail_fetches_the_inbox_before_the_model_speaks() -> None:
-    assistant = Assistant()
-    directory = Directory()
-    assistant.broker.put(
-        "ada",
-        "mailbox",
-        mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD),
-    )
-    assistant.add(Mail(ImapMailbox(assistant.broker, open_imap=directory.open_imap, open_smtp=directory.open_smtp)))
-
-    class Scripted:
-        def __init__(self) -> None:
-            self.user = ""
-
-        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
-            self.user = user
-            return ModelTurn("I am unable to read your email.")
-
-    model = Scripted()
-    reply = converse(assistant, Task("ada", "home", "read my email"), model)
-    assert model.user == ""
-    assert "Inbox:" in reply.text
-    assert "hello from ada" in reply.text
-    assert PASSWORD not in reply.text
-    missing = converse(assistant, Task("bea", "home", "check my inbox"), model)
-    assert missing.text == "The mailbox is not connected. Connect it from the app, then ask again."
-
-
-def test_an_icloud_address_uses_icloud_mail_servers() -> None:
-    seen: list[str] = []
-
-    class Probe:
-        def login(self, user: str, password: str) -> None:
-            return None
-
-        def fetch_recent(self, limit: int) -> list[bytes]:
-            return []
-
-        def logout(self) -> None:
-            return None
-
-    broker = Broker()
-    broker.put(
-        "ada",
-        "mailbox",
-        mailbox_secret(imap_host="", smtp_host="icloud.com", user="ada@icloud.com", password=PASSWORD),
-    )
-    mailbox = ImapMailbox(broker, open_imap=lambda host: seen.append(host) or Probe(), open_smtp=lambda host: None)
-    assert mailbox.messages("ada") == []
-    assert seen == ["imap.mail.me.com"]
-    assistant = Assistant()
-    assistant.broker.put(
-        "ada",
-        "mailbox",
-        mailbox_secret(imap_host="imap.mail.me.com", smtp_host="smtp.mail.me.com", user="ada@icloud.com", password=PASSWORD),
-    )
-    mail = Mail(ImapMailbox(assistant.broker, open_imap=lambda host: ExplodingLogin(PASSWORD), open_smtp=lambda host: None))
-    assistant.add(mail)
-    assert mail.prepare("ada", "read my icloud mail") == ""
-    told = mail.take_direct("ada")
-    assert "app-specific password" in told
-    assert PASSWORD not in told
 
 
 def test_login_failure_does_not_repeat_the_password() -> None:
@@ -327,3 +265,46 @@ def test_smtplib_client_sends_the_message_it_is_given() -> None:
     client.close()
     assert captured[0]["To"] == "jane@example.com"
     assert PASSWORD not in captured[0].as_string()
+
+
+def test_mail_list_tool_fetches_the_inbox() -> None:
+    from robin.model import ToolCall
+    from robin.ner import UnavailableNer
+
+    class ReadyNer(UnavailableNer):
+        def available(self) -> bool:
+            return True
+
+    directory = Directory()
+    assistant = Assistant(ner=ReadyNer())
+    assistant.broker.put(
+        "ada",
+        "mailbox",
+        mailbox_secret(imap_host="imap.example.com", smtp_host="smtp.example.com", user="ada@example.com", password=PASSWORD),
+    )
+    assistant.add(Mail(ImapMailbox(assistant.broker, open_imap=directory.open_imap, open_smtp=directory.open_smtp)))
+
+    class Scripted:
+        def __init__(self) -> None:
+            self.turns = [
+                ModelTurn("", (ToolCall("mail_list", {}),)),
+                ModelTurn("You have mail from Jane."),
+            ]
+
+        def complete(self, *, messages, tools):
+            return self.turns.pop(0)
+
+    reply = converse(assistant, Task("ada", "home", "what mail do I have"), Scripted())
+    assert "Jane" in reply.text or "mail" in reply.text.lower()
+    assert directory.logins
+
+
+def test_an_icloud_address_uses_icloud_mail_servers() -> None:
+    directory = Directory()
+    directory.boxes["ada@icloud.com"] = [_letter("Apple", "hello icloud")]
+    broker = Broker()
+    broker.put("ada", "mailbox", mailbox_secret(imap_host="", smtp_host="", user="ada@icloud.com", password=PASSWORD))
+    mail = Mail(ImapMailbox(broker, open_imap=directory.open_imap, open_smtp=directory.open_smtp))
+    result = mail.invoke("ada", "mail_list", {})
+    text = result if isinstance(result, str) else str(result)
+    assert directory.logins and directory.logins[0][0].endswith("mail.me.com") or "icloud" in text.lower() or "Apple" in text

@@ -13,7 +13,7 @@ SECRET = "sk-abcdefghijklmnopqrstuvwxyz123456"
 
 
 class Scripted:
-    def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
+    def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
         return ModelTurn("Noted, Jane Doe.")
 
 
@@ -42,7 +42,7 @@ def test_a_restart_keeps_one_accounts_thread_and_hides_it_from_the_other(tmp_pat
     assistant.set_vocabulary("ada", (VocabularyTerm("Jane Doe"),))
     assistant.add(Groceries(members={"ada"}, shared=[{"item": "milk", "loyalty": ""}], private={}))
     converse(assistant, Task("ada", "kitchen", "hello Jane Doe"), Scripted())
-    assistant.invoke("ada", "kitchen", "list_items", {"note": SECRET})
+    assistant.invoke("ada", "kitchen", "lists_show", {"note": SECRET})
     store.close()
 
     assert b"Jane Doe" not in path.read_bytes()
@@ -57,7 +57,7 @@ def test_a_restart_keeps_one_accounts_thread_and_hides_it_from_the_other(tmp_pat
     assert "Noted, Jane Doe." in texts
     assert revived.turns("bea", "kitchen") == []
     activity = revived.activity.read("ada")
-    assert activity[-1]["tool"] == "list_items"
+    assert activity[-1]["tool"] == "lists_show"
     assert SECRET not in activity[-1]["arguments"]
     assert revived.activity.read("bea") == []
     assert revived.vocabulary["ada"][0].text == "Jane Doe"

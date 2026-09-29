@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -115,6 +116,7 @@ def serve(service: Service, host: str = "127.0.0.1", port: int = 8787) -> None:
                 try:
                     status, response = dispatch(service, method, parsed.path, query=query, body=payload, headers=headers)
                 except Exception:
+                    traceback.print_exc()
                     status, response = 500, {"error": "request failed"}
             data = json.dumps(response).encode()
             self.send_response(status)
@@ -168,19 +170,16 @@ def _post_message(service: Service, headers: dict[str, str], body: dict[str, Any
             reply = resume(service.assistant, account_id, conversation_id, service.model)
         except PendingMissing:
             return 409, {"error": "nothing to confirm"}
-        if reply.status == "confirm" and reply.tool:
-            service.assistant.set_pending(
-                account_id,
-                conversation_id,
-                reply.tool,
-                reply.arguments or {},
-                reply.route.value,
-                text=reply.task_text or "",
-                allow_cloud=reply.allow_cloud,
-                free_text=reply.free_text,
-            )
         return 200, _public_reply(reply)
     service.assistant.clear_pending(account_id, conversation_id)
+    ner = service.assistant.ner
+    if getattr(ner, "_installed", False) and not ner.available():
+        return 200, {
+            "status": "reply",
+            "text": "Robin is starting.",
+            "route": "local",
+            "timing": "",
+        }
     reply = converse(
         service.assistant,
         Task(
@@ -192,17 +191,6 @@ def _post_message(service: Service, headers: dict[str, str], body: dict[str, Any
         ),
         service.model,
     )
-    if reply.status == "confirm" and reply.tool:
-        service.assistant.set_pending(
-            account_id,
-            conversation_id,
-            reply.tool,
-            reply.arguments or {},
-            reply.route.value,
-            text=reply.task_text or str(body.get("text") or ""),
-            allow_cloud=reply.allow_cloud,
-            free_text=reply.free_text,
-        )
     return 200, _public_reply(reply)
 
 
@@ -410,4 +398,5 @@ def _public_reply(reply: Any) -> dict[str, Any]:
         "text": reply.text,
         "route": reply.route.value,
         "tool": reply.tool,
+        "timing": getattr(reply, "timing", "") or "",
     }

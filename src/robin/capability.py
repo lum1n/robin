@@ -34,6 +34,7 @@ class Tool:
     parameters: dict[str, Any]
     effect: Effect
     drop_arguments: tuple[str, ...] = ()
+    egress: bool = False
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,14 @@ class FieldSpec:
     klass: FieldClass
     label: str = "TEXT"
     free_text: bool = False
+
+
+@dataclass(frozen=True)
+class Result:
+    """A tool result. Prefer records so the airlock can redact field by field."""
+
+    text: str = ""
+    records: list[dict[str, str]] | None = None
 
 
 @dataclass
@@ -58,6 +67,7 @@ class ActiveTurn:
     conversation_id: str
     allow_cloud: bool = False
     free_text: bool = False
+    text: str = ""
 
 
 current_task: ContextVar[ActiveTurn | None] = ContextVar("robin_task", default=None)
@@ -79,13 +89,12 @@ class Capability:
     def visible_to(self, account_id: str) -> bool:
         return True
 
-    def offered_tools(self, account_id: str, task: str) -> list[Tool]:
+    def available_tools(self, account_id: str) -> list[Tool]:
+        """Tools this account may call. May depend on state, never on request text."""
         return list(self.tools)
 
-    def prepare(self, account_id: str, task: str) -> str:
-        return ""
-
-    def take_direct(self, account_id: str) -> str:
+    def status(self, account_id: str) -> str:
+        """One-line connector status for the system prompt, or empty."""
         return ""
 
     def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
@@ -100,15 +109,21 @@ class Capability:
     def records(self, account_id: str) -> list[dict[str, str]]:
         return []
 
-    def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
+    def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str | Result:
         raise NotImplementedError(tool_name)
 
 
 @dataclass
 class Registry:
     _capabilities: list[Capability] = field(default_factory=list)
+    _names: dict[str, str] = field(default_factory=dict)
 
     def add(self, capability: Capability) -> None:
+        for tool in capability.tools:
+            prior = self._names.get(tool.name)
+            if prior is not None:
+                raise ValueError(f"duplicate tool name {tool.name!r} from {capability.id!r} and {prior!r}")
+            self._names[tool.name] = capability.id
         self._capabilities.append(capability)
 
     def for_account(self, account_id: str) -> list[Capability]:
@@ -121,19 +136,28 @@ class Registry:
                     return capability, tool
         raise KeyError(tool_name)
 
-    def schemas(self, account_id: str, task: str = "") -> list[dict[str, Any]]:
+    def schemas(self, account_id: str) -> list[dict[str, Any]]:
         schemas: list[dict[str, Any]] = []
         for capability in self.for_account(account_id):
-            for tool in capability.offered_tools(account_id, task):
+            for tool in capability.available_tools(account_id):
                 schemas.append(
                     {
                         "name": tool.name,
                         "description": tool.description,
                         "parameters": tool.parameters,
                         "effect": tool.effect.value,
+                        "egress": tool.egress,
                     }
                 )
         return schemas
+
+    def statuses(self, account_id: str) -> list[str]:
+        lines: list[str] = []
+        for capability in self.for_account(account_id):
+            line = capability.status(account_id).strip()
+            if line:
+                lines.append(line)
+        return lines
 
 
 def render_records(
@@ -164,6 +188,32 @@ def render_records(
             report = report.merge(field_report)
         rendered.append(row)
     return rendered, report
+
+
+def render_result(
+    result: str | Result,
+    fields: list[FieldSpec],
+    vault: Vault,
+    *,
+    vocabulary: tuple[VocabularyTerm, ...] = (),
+    ner: Ner | None = None,
+    for_cloud: bool = True,
+) -> tuple[str, Report]:
+    """Release a tool result for the model. Records go through FieldSpecs."""
+    if isinstance(result, Result) and result.records is not None:
+        rows, report = render_records(
+            result.records,
+            fields,
+            vault,
+            vocabulary=vocabulary,
+            ner=ner,
+            for_cloud=for_cloud,
+        )
+        if result.text:
+            return f"{result.text}\n{json.dumps(rows, sort_keys=True)}", report
+        return json.dumps(rows, sort_keys=True), report
+    text = result.text if isinstance(result, Result) else str(result)
+    return text, Report(entities=(), unresolved=False)
 
 
 def render_context(

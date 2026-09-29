@@ -12,7 +12,7 @@ class Scripted:
         self.turns = list(turns)
         self.calls = 0
 
-    def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
+    def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
         self.calls += 1
         return self.turns.pop(0)
 
@@ -23,7 +23,7 @@ def test_a_check_stays_off_until_that_account_turns_it_on(tmp_path) -> None:
     screen = Screen(owner="ada", text="desk", password="")
     assistant = Assistant(store=HouseholdStore(path, key))
     assistant.add(screen)
-    model = Scripted([ModelTurn("", (ToolCall("submit", {}),))])
+    model = Scripted([ModelTurn("", (ToolCall("screen_submit", {}),))])
     assert tick(assistant, model) == []
     assert model.calls == 0
 
@@ -56,8 +56,8 @@ def test_a_check_stays_off_until_that_account_turns_it_on(tmp_path) -> None:
     replies = tick(revived, model)
     assert model.calls == 1
     assert replies[0].status == "confirm"
-    assert replies[0].tool == "submit"
+    assert replies[0].tool == "screen_submit"
     assert screen.submitted is False
     pending = revived.take_pending("ada", "schedule")
     assert pending is not None
-    assert pending["tool"] == "submit"
+    assert pending["tool"] == "screen_submit"

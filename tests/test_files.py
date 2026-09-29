@@ -14,11 +14,22 @@ from robin.session import Assistant
 SECRET = "sk-abcdefghijklmnopqrstuvwxyz123456"
 
 
+def test_a_browser_profile_is_not_listed_with_the_account_files(tmp_path) -> None:
+    workspace = Workspace(tmp_path)
+    cache = tmp_path / "ada" / "browser" / "Default" / "Cache"
+    cache.mkdir(parents=True)
+    (cache / "data_0").write_text("pixels")
+    note = tmp_path / "ada" / "notes"
+    note.mkdir()
+    (note / "today.txt").write_text("hi")
+    assert workspace.names("ada") == ["notes/today.txt"]
+
+
 def test_files_stay_in_the_account_and_delete_waits(tmp_path) -> None:
     workspace = Workspace(tmp_path)
     assistant = Assistant()
     assistant.add(Files(workspace))
-    wrote = assistant.invoke("ada", "files", "write_file", {"path": "notes/today.txt", "text": f"buy milk {SECRET}"})
+    wrote = assistant.invoke("ada", "files", "files_write", {"path": "notes/today.txt", "text": f"buy milk {SECRET}"})
     assert wrote["status"] == "done"
     assert (tmp_path / "ada" / "notes" / "today.txt").read_text().startswith("buy milk")
     ada = assistant.decide(Task("ada", "files", "look"))
@@ -34,10 +45,10 @@ def test_files_stay_in_the_account_and_delete_waits(tmp_path) -> None:
     else:
         raise AssertionError("a path left the account")
     assert not (tmp_path / "bea" / "secret.txt").exists()
-    held = assistant.invoke("ada", "files", "delete_file", {"path": "notes/today.txt"})
+    held = assistant.invoke("ada", "files", "files_delete", {"path": "notes/today.txt"})
     assert held["status"] == "confirm"
     assert (tmp_path / "ada" / "notes" / "today.txt").exists()
-    done = assistant.invoke("ada", "files", "delete_file", {"path": "notes/today.txt"}, confirmed=True)
+    done = assistant.invoke("ada", "files", "files_delete", {"path": "notes/today.txt"}, confirmed=True)
     assert done["result"] == "deleted"
     assert not (tmp_path / "ada" / "notes" / "today.txt").exists()
 
@@ -53,16 +64,16 @@ def test_a_command_waits_and_the_prompt_shows_it_without_the_secret(tmp_path) ->
     assistant.add(Terminal(ShellBox(tmp_path, runner)))
 
     class Scripted:
-        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
-            return ModelTurn("", (ToolCall("run_command", {"command": f"echo {SECRET}"}),))
+        def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
+            return ModelTurn("", (ToolCall("shell_run", {"command": f"echo {SECRET}"}),))
 
     reply = converse(assistant, Task("ada", "desk", "run it"), Scripted())
     assert reply.status == "confirm"
-    assert reply.tool == "run_command"
+    assert reply.tool == "shell_run"
     assert SECRET not in reply.text
     assert "echo" in reply.text
     assert calls == []
-    done = assistant.invoke("ada", "shell", "run_command", {"command": "echo hello"}, confirmed=True)
+    done = assistant.invoke("ada", "shell", "shell_run", {"command": "echo hello"}, confirmed=True)
     assert done["status"] == "done"
     assert calls == [("echo hello", str((tmp_path / "ada").resolve()), "robin-ada")]
     log = assistant.activity.read("ada")
@@ -264,20 +275,20 @@ def test_a_file_question_answers_from_this_users_files(tmp_path) -> None:
             self.user = ""
             self.tools: list[str] = []
 
-        def complete(self, *, system: str, user: str, tools: list[dict]) -> ModelTurn:
-            self.user = user
+        def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
+            self.user = str(messages)
             self.tools = [tool["name"] for tool in tools]
             return ModelTurn("Here are the files.")
 
     model = Scripted()
     reply = converse(assistant, Task("ada", "desk", "what files do I have"), model)
     assert reply.text == "Here are the files."
-    assert model.tools == []
-    assert "dog.jpg" not in model.user
-    assert "[UNRESOLVED]" in model.user
-    assert "secret.txt" not in model.user
+    assert "files_list" in model.tools
     assert SECRET not in model.user
-    read = converse(assistant, Task("ada", "desk", f"read {home / 'dog.jpg'}"), model)
+    read = converse(
+        assistant,
+        Task("ada", "desk", f"read {home / 'dog.jpg'}"),
+        Scripted(),
+    )
     assert read.text == "Here are the files."
-    assert "[UNRESOLVED]" in model.user
-    assert SECRET not in model.user
+    assert SECRET not in read.text

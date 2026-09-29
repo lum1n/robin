@@ -90,6 +90,17 @@ class HouseholdStore:
         self._db.execute("CREATE TABLE IF NOT EXISTS schedules (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS jobs (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS photo_index (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS memory (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notifications (
+                account_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                body BLOB NOT NULL,
+                PRIMARY KEY (account_id, position)
+            )
+            """
+        )
         self._db.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -360,6 +371,33 @@ class HouseholdStore:
         if row is None:
             return None
         return json.loads(self._open(row[0]))
+
+    def save_memory(self, account_id: str, facts: list[dict]) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO memory (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(facts, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_memory(self) -> dict[str, list[dict]]:
+        rows = self._db.execute("SELECT account_id, body FROM memory").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
+
+    def save_notification(self, account_id: str, text: str) -> None:
+        self.ensure_account(account_id)
+        position = self._db.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM notifications WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()[0]
+        self._db.execute(
+            "INSERT INTO notifications (account_id, position, body) VALUES (?, ?, ?)",
+            (account_id, position, self._seal(text)),
+        )
+        self._db.commit()
 
     def delete_instance(self, account_id: str) -> None:
         self._db.execute("DELETE FROM instances WHERE account_id = ?", (account_id,))

@@ -13,7 +13,8 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
 
     assert "\nFROM ghcr.io/boldsoftware/exeuntu:" in dockerfile
     assert "exe.dev/install-shelley=false" in dockerfile
-    assert "uv sync --frozen --no-dev --extra browser" in dockerfile
+    assert "uv sync --frozen --no-dev" in dockerfile
+    assert "--extra browser" not in dockerfile
     assert "playwright install --with-deps chromium" in dockerfile
     assert "PLAYWRIGHT_BROWSERS_PATH=/opt/robin/ms-playwright" in dockerfile
     assert "PLAYWRIGHT_BROWSERS_PATH=/opt/robin/ms-playwright" in unit

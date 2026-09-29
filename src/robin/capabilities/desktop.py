@@ -632,19 +632,19 @@ class Desktop(Capability):
     id = "desktop"
     tools = [
         Tool(
-            name="read_screen",
+            name="desktop_read",
             description="Read the structured text snapshot of the focused desktop window (URL, interactive refs, content).",
             parameters={"type": "object", "properties": {"app": {"type": "string"}}},
             effect=Effect.READ,
         ),
         Tool(
-            name="click",
+            name="desktop_click",
             description="Click an interactive desktop ref from the snapshot (for example 1) or a visible name.",
             parameters={"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]},
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="type_text",
+            name="desktop_type",
             description="Type into a desktop textbox ref that is not a password.",
             parameters={
                 "type": "object",
@@ -654,7 +654,7 @@ class Desktop(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="press_key",
+            name="desktop_press",
             description="Press a key such as Enter, Tab, Escape, or ArrowDown in the focused desktop window.",
             parameters={
                 "type": "object",
@@ -664,7 +664,7 @@ class Desktop(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="switch_page",
+            name="desktop_switch",
             description="Focus another desktop window by its Pages index from the snapshot.",
             parameters={
                 "type": "object",
@@ -674,19 +674,19 @@ class Desktop(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="submit",
+            name="desktop_submit",
             description="Send or confirm from the desktop window. Waits for confirmation.",
             parameters={"type": "object", "properties": {"target": {"type": "string"}}},
             effect=Effect.EXTERNAL,
         ),
         Tool(
-            name="pay",
+            name="desktop_pay",
             description="Pay or purchase from the desktop window. Waits for confirmation.",
             parameters={"type": "object", "properties": {"target": {"type": "string"}}},
             effect=Effect.EXTERNAL,
         ),
         Tool(
-            name="delete_item",
+            name="desktop_delete",
             description="Delete or remove something in the desktop window. Waits for confirmation.",
             parameters={"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]},
             effect=Effect.EXTERNAL,
@@ -702,23 +702,11 @@ class Desktop(Capability):
         self._active = False
         self._last = ""
 
-    def offered_tools(self, account_id: str, task: str) -> list[Tool]:
-        if _wants_page(task):
-            return []
-        if self._active or _wants_desktop(task):
-            return list(self.tools)
-        return []
+    def available_tools(self, account_id: str) -> list[Tool]:
+        return list(self.tools)
 
-    def prepare(self, account_id: str, task: str) -> str:
-        if not _wants_desktop(task):
-            return ""
-        try:
-            text = self.invoke(account_id, "read_screen", {"app": _app_from_task(task)})
-        except Exception as exc:
-            return str(exc)
-        if len(text) > 4000:
-            text = text[:4000]
-        return text
+    def status(self, account_id: str) -> str:
+        return "desktop: available" if self._active else "desktop: idle"
 
     def records(self, account_id: str) -> list[dict[str, str]]:
         if not self._last:
@@ -730,33 +718,33 @@ class Desktop(Capability):
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
         surface = self._ensure()
-        if tool_name == "read_screen":
+        if tool_name == "desktop_read":
             data = surface.snapshot(str(arguments.get("app", "")))
             text = _format_snapshot(data)
             self._active = True
             self._last = text
             return text
         before = self._last
-        if tool_name == "click":
+        if tool_name == "desktop_click":
             target = str(arguments.get("target", ""))
             if _SENSITIVE.search(target):
-                return "that action needs submit, pay, or delete_item so the person can confirm"
+                return "that action needs desktop_submit, desktop_pay, or desktop_delete so the person can confirm"
             surface.click(self._resolve(surface, target))
             return self._after(surface, before, f"clicked {target}")
-        if tool_name == "type_text":
+        if tool_name == "desktop_type":
             target = str(arguments.get("target", ""))
             text = str(arguments.get("text", ""))
             surface.type_text(self._resolve(surface, target), text)
             return self._after(surface, before, f"typed into {target}")
-        if tool_name == "press_key":
+        if tool_name == "desktop_press":
             key = str(arguments.get("key", ""))
             surface.press_key(key)
             return self._after(surface, before, f"pressed {key}")
-        if tool_name == "switch_page":
+        if tool_name == "desktop_switch":
             index = int(arguments.get("index", 0))
             surface.focus_window(index)
             return self._after(surface, before, f"focused window {index}")
-        if tool_name in {"submit", "pay", "delete_item"}:
+        if tool_name in {"desktop_submit", "desktop_pay", "desktop_delete"}:
             target = str(arguments.get("target", "")).strip()
             if not target:
                 data = surface.snapshot()
@@ -800,9 +788,9 @@ class Desktop(Capability):
 
 def _default_sensitive_target(data: dict[str, Any], tool_name: str) -> str:
     needles = {
-        "submit": ("send", "submit", "confirm", "ok", "share"),
-        "pay": ("pay", "purchase", "buy", "checkout"),
-        "delete_item": ("delete", "remove", "trash"),
+        "desktop_submit": ("send", "submit", "confirm", "ok", "share"),
+        "desktop_pay": ("pay", "purchase", "buy", "checkout"),
+        "desktop_delete": ("delete", "remove", "trash"),
     }.get(tool_name, ())
     for item in data.get("interactive") or ():
         name = str(item.get("name") or "").casefold()

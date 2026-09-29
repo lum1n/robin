@@ -2,6 +2,7 @@ from robin.capabilities.desktop import Desktop, MemoryControl, MemorySurface, _w
 from robin.capabilities.browser import Browser, _wants_page
 from robin.loop import converse, _is_page_snapshot
 from robin.model import ModelTurn, ToolCall
+from robin.ner import UnavailableNer
 from robin.policy import Task
 from robin.session import Assistant
 
@@ -24,10 +25,10 @@ def test_snapshot_matches_browser_shape():
         content="Ready",
     )
     desktop = Desktop(surface)
-    text = desktop.invoke("a1", "read_screen", {})
+    text = desktop.invoke("a1", "desktop_read", {})
     assert _is_page_snapshot(text)
     assert text.startswith("URL: desktop://Calculator")
-    assert 'Interactive:' in text
+    assert "Interactive:" in text
     assert '[1] button "7"' in text
     assert '[2] button "Send" (dialog)' in text
     assert '[3] textbox "Name"' in text
@@ -42,12 +43,12 @@ def test_click_and_type_return_fresh_snapshot():
         ]
     )
     desktop = Desktop(surface)
-    desktop.invoke("a1", "read_screen", {})
-    clicked = desktop.invoke("a1", "click", {"target": "1"})
+    desktop.invoke("a1", "desktop_read", {})
+    clicked = desktop.invoke("a1", "desktop_click", {"target": "1"})
     assert surface.clicked == ["1"]
     assert "clicked 1" in clicked
     assert 'button "7"' in clicked
-    typed = desktop.invoke("a1", "type_text", {"target": "Amount", "text": "42"})
+    typed = desktop.invoke("a1", "desktop_type", {"target": "Amount", "text": "42"})
     assert surface.typed == [("2", "42")]
     assert "typed into Amount" in typed
     assert "value=42" in typed
@@ -56,9 +57,9 @@ def test_click_and_type_return_fresh_snapshot():
 def test_sensitive_click_redirects_to_confirm_tools():
     surface = MemorySurface(controls=[MemoryControl("button", "Send email")])
     desktop = Desktop(surface)
-    desktop.invoke("a1", "read_screen", {})
-    reply = desktop.invoke("a1", "click", {"target": "Send email"})
-    assert "submit" in reply
+    desktop.invoke("a1", "desktop_read", {})
+    reply = desktop.invoke("a1", "desktop_click", {"target": "Send email"})
+    assert "desktop_submit" in reply
     assert surface.clicked == []
 
 
@@ -72,19 +73,17 @@ def test_submit_pay_delete_are_external():
     )
     desktop = Desktop(surface)
     effects = {tool.name: tool.effect.value for tool in desktop.tools}
-    assert effects["submit"] == "external"
-    assert effects["pay"] == "external"
-    assert effects["delete_item"] == "external"
-    desktop.invoke("a1", "read_screen", {})
-    desktop.invoke("a1", "submit", {"target": "1"})
-    desktop.invoke("a1", "pay", {"target": "2"})
-    desktop.invoke("a1", "delete_item", {"target": "3"})
+    assert effects["desktop_submit"] == "external"
+    assert effects["desktop_pay"] == "external"
+    assert effects["desktop_delete"] == "external"
+    desktop.invoke("a1", "desktop_read", {})
+    desktop.invoke("a1", "desktop_submit", {"target": "1"})
+    desktop.invoke("a1", "desktop_pay", {"target": "2"})
+    desktop.invoke("a1", "desktop_delete", {"target": "3"})
     assert surface.clicked == ["1", "2", "3"]
 
 
-def test_prepare_seeds_operator_loop():
-    from robin.ner import UnavailableNer
-
+def test_model_drives_desktop_without_prepare():
     class ReadyNer(UnavailableNer):
         def available(self) -> bool:
             return True
@@ -94,7 +93,8 @@ def test_prepare_seeds_operator_loop():
     assistant.add(Desktop(surface))
     model = _Script(
         [
-            ModelTurn("", (ToolCall("click", {"target": "1"}),)),
+            ModelTurn("", (ToolCall("desktop_read", {"app": "Calculator"}),)),
+            ModelTurn("", (ToolCall("desktop_click", {"target": "1"}),)),
             ModelTurn("Clicked seven."),
         ]
     )
@@ -102,17 +102,13 @@ def test_prepare_seeds_operator_loop():
     assert reply.status == "reply"
     assert "Clicked seven" in reply.text
     assert surface.clicked == ["1"]
-    notes = assistant.prepare("a1", "open the Calculator app")
-    assert notes.startswith("URL: desktop://")
 
 
-def test_offered_tools_hide_when_page_task():
+def test_desktop_and_browser_tools_are_both_available():
     desktop = Desktop(MemorySurface())
     browser = Browser(owner="a1", page=_EmptyPage())
-    assert desktop.offered_tools("a1", "open the Calculator app")
-    assert not desktop.offered_tools("a1", "open https://example.com")
-    assert browser.offered_tools("a1", "open https://example.com")
-    assert not browser.offered_tools("a1", "open the Calculator app")
+    assert {tool.name for tool in desktop.available_tools("a1")} == {tool.name for tool in desktop.tools}
+    assert "browser_open" in {tool.name for tool in browser.available_tools("a1")}
 
 
 def test_unavailable_surface_says_so():
@@ -137,7 +133,7 @@ def test_unavailable_surface_says_so():
 
     desktop = Desktop(Dead())
     try:
-        desktop.invoke("a1", "read_screen", {})
+        desktop.invoke("a1", "desktop_read", {})
     except RuntimeError as exc:
         assert "not available" in str(exc)
     else:
@@ -151,40 +147,13 @@ class _EmptyPage:
     def open(self, url: str) -> None:
         return None
 
-    def click(self, target: str, role: str = "", ref: str = "") -> None:
-        return None
-
-    def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
-        return None
-
-    def type_password(self, text: str) -> None:
-        return None
-
-    def submit(self) -> None:
-        return None
-
-    def needs_login(self) -> bool:
-        return False
-
-    def type_username(self, text: str) -> None:
-        return None
-
     def location(self) -> str:
         return "https://example.com"
 
-    def sign_in(self, user: str, password: str) -> None:
-        return None
-
-    def needs_code(self) -> bool:
-        return False
-
-    def submit_code(self, code: str) -> None:
-        return None
-
 
 class _Script:
-    def __init__(self, turns: list[ModelTurn]) -> None:
+    def __init__(self, turns):
         self.turns = list(turns)
 
-    def complete(self, **kwargs):
+    def complete(self, *, messages, tools):
         return self.turns.pop(0)

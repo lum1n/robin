@@ -166,17 +166,17 @@ def test_unknown_capability_is_registered_without_a_core_change() -> None:
 
 def test_screen_submit_waits_and_the_other_account_cannot_see_it() -> None:
     assistant, screen = _assistant()
-    held = assistant.invoke("ada", "screen", "submit", {})
+    held = assistant.invoke("ada", "screen", "screen_submit", {})
     assert held["status"] == "confirm"
     assert screen.submitted is False
-    done = assistant.invoke("ada", "screen", "submit", {}, confirmed=True)
+    done = assistant.invoke("ada", "screen", "screen_submit", {}, confirmed=True)
     assert done["status"] == "done"
     assert screen.submitted is True
-    click = assistant.invoke("ada", "screen", "click", {"target": "ok"})
+    click = assistant.invoke("ada", "screen", "screen_click", {"target": "ok"})
     assert click["status"] == "done"
     assert screen.clicked is True
     try:
-        assistant.invoke("bea", "screen", "read_screen", {})
+        assistant.invoke("bea", "screen", "screen_read", {})
     except KeyError:
         return
     raise AssertionError("other account invoked the screen")
@@ -184,7 +184,7 @@ def test_screen_submit_waits_and_the_other_account_cannot_see_it() -> None:
 
 def test_activity_log_drops_secrets_and_is_private_to_the_account() -> None:
     assistant, _screen = _assistant()
-    assistant.invoke("ada", "screen", "click", {"target": SECRET})
+    assistant.invoke("ada", "screen", "screen_click", {"target": SECRET})
     log = json.dumps(assistant.activity.read("ada"))
     assert SECRET not in log
     assert assistant.activity.read("bea") == []

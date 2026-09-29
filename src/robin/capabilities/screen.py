@@ -6,23 +6,23 @@ from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
 
 
 class Screen(Capability):
-    id = "display"
+    id = "display_fixture"
     tools = [
         Tool(
-            name="read_screen",
-            description="Read the text of this account's screen.",
+            name="screen_read",
+            description="Read the text of this account's screen fixture.",
             parameters={"type": "object", "properties": {}},
             effect=Effect.READ,
         ),
         Tool(
-            name="click",
+            name="screen_click",
             description="Click within the task the person just gave.",
             parameters={"type": "object", "properties": {"target": {"type": "string"}}},
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="submit",
-            description="Submit a form or send something from the screen.",
+            name="screen_submit",
+            description="Submit a form or send something from the screen. Waits for confirmation.",
             parameters={"type": "object", "properties": {}},
             effect=Effect.EXTERNAL,
         ),
@@ -50,10 +50,10 @@ class Screen(Capability):
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
         if account_id != self.owner:
             raise PermissionError(account_id)
-        if tool_name == "click":
+        if tool_name == "screen_click":
             self.clicked = True
             return "clicked"
-        if tool_name == "submit":
+        if tool_name == "screen_submit":
             self.submitted = True
             return "submitted"
         return self.text

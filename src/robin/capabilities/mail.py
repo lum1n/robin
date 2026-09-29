@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import imaplib
 import json
-import re
 import smtplib
 from email import message_from_bytes
 from email.message import EmailMessage
@@ -12,11 +11,10 @@ from email.policy import default
 from email.utils import parseaddr
 from typing import Any, Protocol
 
-from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
+from robin.capability import Capability, Effect, FieldClass, FieldSpec, Result, Tool
 
 INBOX_LIMIT = 10
 _SECRET = ("imap_host", "smtp_host", "user", "password")
-_MAIL_ASK = re.compile(r"\b(?:e-?mails?|inbox|mailbox|unread|icloud)\b|\bmail\b", re.IGNORECASE)
 _HOSTS = {
     "icloud.com": ("imap.mail.me.com", "smtp.mail.me.com"),
     "me.com": ("imap.mail.me.com", "smtp.mail.me.com"),
@@ -36,6 +34,9 @@ class SecretStore(Protocol):
 class _Imap(Protocol):
     def login(self, user: str, password: str) -> None: ...
     def fetch_recent(self, limit: int) -> list[bytes]: ...
+    def search(self, criteria: str, limit: int) -> list[bytes]: ...
+    def fetch_one(self, uid: str) -> bytes | None: ...
+    def store_flags(self, uid: str, action: str) -> None: ...
     def logout(self) -> None: ...
 
 
@@ -60,8 +61,11 @@ class ImaplibClient:
         self._imap.login(user, password)
 
     def fetch_recent(self, limit: int) -> list[bytes]:
+        return self.search("ALL", limit)
+
+    def search(self, criteria: str, limit: int) -> list[bytes]:
         self._imap.select("INBOX", readonly=True)
-        _status, data = self._imap.search(None, "ALL")
+        _status, data = self._imap.search(None, criteria)
         blob = data[0] if data and data[0] else b""
         if isinstance(blob, str):
             blob = blob.encode()
@@ -71,6 +75,26 @@ class ImaplibClient:
             _status, fetched = self._imap.fetch(number, "(BODY.PEEK[])")
             found.append(_body(fetched))
         return found
+
+    def fetch_one(self, uid: str) -> bytes | None:
+        self._imap.select("INBOX", readonly=True)
+        _status, fetched = self._imap.fetch(uid.encode() if isinstance(uid, str) else uid, "(BODY.PEEK[])")
+        try:
+            return _body(fetched)
+        except RuntimeError:
+            return None
+
+    def store_flags(self, uid: str, action: str) -> None:
+        self._imap.select("INBOX", readonly=False)
+        if action == "read":
+            self._imap.store(uid, "+FLAGS", "\\Seen")
+        elif action == "archive":
+            try:
+                self._imap.copy(uid, "Archive")
+            except Exception:
+                pass
+            self._imap.store(uid, "+FLAGS", "\\Deleted")
+            self._imap.expunge()
 
     def logout(self) -> None:
         self._imap.logout()
@@ -103,21 +127,51 @@ class ImapMailbox:
         self._open_imap = open_imap or (lambda host: ImaplibClient(host))
         self._open_smtp = open_smtp or (lambda host: SmtplibClient(host))
         self.limit = limit
+        self._drafts: dict[str, dict[str, str]] = {}
 
     def connected(self, account_id: str) -> bool:
         return self._credentials(account_id) is not None
 
     def messages(self, account_id: str) -> list[dict[str, str]]:
+        return self.search(account_id)
+
+    def search(
+        self,
+        account_id: str,
+        *,
+        query: str = "",
+        sender: str = "",
+        since: str = "",
+        unread: bool = False,
+        folder: str = "INBOX",
+    ) -> list[dict[str, str]]:
         creds = self._credentials(account_id)
         if creds is None:
             return []
+        criteria = _imap_criteria(query=query, sender=sender, since=since, unread=unread)
         client: _Imap = self._open_imap(creds["imap_host"])
         try:
             _login(client, creds)
-            raw_messages = client.fetch_recent(self.limit)
+            if hasattr(client, "search"):
+                raw_messages = client.search(criteria, self.limit)
+            else:
+                raw_messages = client.fetch_recent(self.limit)
         finally:
             client.logout()
-        return [_message(raw) for raw in raw_messages]
+        rows = [_message(raw, index) for index, raw in enumerate(raw_messages, start=1)]
+        _ = folder
+        return rows
+
+    def read(self, account_id: str, message_id: str) -> dict[str, str] | None:
+        rows = self.messages(account_id)
+        for row in rows:
+            if row.get("id") == message_id:
+                return row
+        return None
+
+    def draft(self, account_id: str, to: str, subject: str, body: str) -> str:
+        self._drafts[account_id] = {"to": to, "subject": subject, "body": body}
+        return "draft saved"
 
     def send(self, account_id: str, to: str, subject: str, body: str) -> None:
         creds = self._credentials(account_id)
@@ -134,6 +188,19 @@ class ImapMailbox:
             client.send_message(message)
         finally:
             client.close()
+
+    def mark(self, account_id: str, message_id: str, action: str) -> str:
+        creds = self._credentials(account_id)
+        if creds is None:
+            raise RuntimeError("mailbox is not connected")
+        client: _Imap = self._open_imap(creds["imap_host"])
+        try:
+            _login(client, creds)
+            if hasattr(client, "store_flags"):
+                client.store_flags(message_id, action)
+        finally:
+            client.logout()
+        return f"marked {action}"
 
     def _credentials(self, account_id: str) -> dict[str, str] | None:
         try:
@@ -161,14 +228,53 @@ class Mail(Capability):
     id = "post"
     tools = [
         Tool(
-            name="list_messages",
-            description="List messages for this account.",
+            name="mail_list",
+            description="List recent messages in this account's inbox.",
             parameters={"type": "object", "properties": {}},
             effect=Effect.READ,
         ),
         Tool(
-            name="send_message",
-            description="Send a message from this account.",
+            name="mail_search",
+            description="Search this account's mailbox. Optional filters: query, from, since (YYYY-MM-DD), unread, folder.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "from": {"type": "string"},
+                    "since": {"type": "string"},
+                    "unread": {"type": "boolean"},
+                    "folder": {"type": "string"},
+                },
+            },
+            effect=Effect.READ,
+        ),
+        Tool(
+            name="mail_read",
+            description="Read one message by id from a prior mail_list or mail_search result.",
+            parameters={
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
+            effect=Effect.READ,
+        ),
+        Tool(
+            name="mail_draft",
+            description="Save a draft email for this account. Does not send.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["to", "subject", "body"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
+            name="mail_send",
+            description="Send a message from this account. Waits for confirmation.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -180,60 +286,69 @@ class Mail(Capability):
             },
             effect=Effect.EXTERNAL,
         ),
+        Tool(
+            name="mail_reply",
+            description="Reply to a message by id. Waits for confirmation.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["id", "body"],
+            },
+            effect=Effect.EXTERNAL,
+        ),
+        Tool(
+            name="mail_mark",
+            description="Mark a message read or archive it.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "action": {"type": "string", "enum": ["read", "archive"]},
+                },
+                "required": ["id", "action"],
+            },
+            effect=Effect.MUTATE,
+        ),
     ]
     fields = [
+        FieldSpec("id", FieldClass.ORDINARY),
         FieldSpec("sender", FieldClass.TOKENIZE, label="PERSON"),
+        FieldSpec("subject", FieldClass.ORDINARY, free_text=True),
         FieldSpec("body", FieldClass.ORDINARY, free_text=True),
     ]
 
     def __init__(self, mailbox: ImapMailbox) -> None:
         self.mailbox = mailbox
-        self._direct: dict[str, str] = {}
 
-    def prepare(self, account_id: str, task: str) -> str:
-        self._direct.pop(account_id, None)
-        if not _MAIL_ASK.search(task):
-            return ""
-        if not self.mailbox.connected(account_id):
-            self._direct[account_id] = "The mailbox is not connected. Connect it from the app, then ask again."
-            return ""
-        try:
-            rows = self.mailbox.messages(account_id)
-        except Exception as exc:
-            host = ""
-            creds = self.mailbox._credentials(account_id)
-            if creds is not None:
-                host = creds["imap_host"]
-            self._direct[account_id] = _mail_failure(exc, host)
-            return ""
-        if not rows:
-            self._direct[account_id] = "The inbox is empty."
-            return ""
-        self._direct[account_id] = _listing(rows)
-        return ""
-
-    def take_direct(self, account_id: str) -> str:
-        return self._direct.pop(account_id, "")
+    def status(self, account_id: str) -> str:
+        if self.mailbox.connected(account_id):
+            return "mail: connected"
+        return "mail: not connected, connect it in the app"
 
     def records(self, account_id: str) -> list[dict[str, str]]:
         return []
 
-    def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        if tool_name == "list_messages":
-            if not self.mailbox.connected(account_id):
-                return "The mailbox is not connected."
-            try:
-                rows = self.mailbox.messages(account_id)
-            except Exception as exc:
-                host = ""
-                creds = self.mailbox._credentials(account_id)
-                if creds is not None:
-                    host = creds["imap_host"]
-                return _mail_failure(exc, host)
-            if not rows:
-                return "The inbox is empty."
-            return _listing(rows)
-        if tool_name == "send_message":
+    def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str | Result:
+        if tool_name == "mail_list":
+            return self._list(account_id)
+        if tool_name == "mail_search":
+            return self._search(account_id, arguments)
+        if tool_name == "mail_read":
+            row = self.mailbox.read(account_id, str(arguments.get("id", "")))
+            if row is None:
+                return "No message matched that id."
+            return Result(records=[row])
+        if tool_name == "mail_draft":
+            return self.mailbox.draft(
+                account_id,
+                str(arguments.get("to", "")),
+                str(arguments.get("subject", "")),
+                str(arguments.get("body", "")),
+            )
+        if tool_name == "mail_send":
             self.mailbox.send(
                 account_id,
                 str(arguments.get("to", "")),
@@ -241,7 +356,81 @@ class Mail(Capability):
                 str(arguments.get("body", "")),
             )
             return "sent"
+        if tool_name == "mail_reply":
+            row = self.mailbox.read(account_id, str(arguments.get("id", "")))
+            if row is None:
+                return "No message matched that id."
+            subject = row.get("subject") or ""
+            if not subject.lower().startswith("re:"):
+                subject = f"Re: {subject}"
+            self.mailbox.send(
+                account_id,
+                row.get("sender") or "",
+                subject,
+                str(arguments.get("body", "")),
+            )
+            return "sent"
+        if tool_name == "mail_mark":
+            return self.mailbox.mark(
+                account_id,
+                str(arguments.get("id", "")),
+                str(arguments.get("action", "read")),
+            )
         raise NotImplementedError(tool_name)
+
+    def _list(self, account_id: str) -> str | Result:
+        if not self.mailbox.connected(account_id):
+            return "The mailbox is not connected."
+        try:
+            rows = self.mailbox.messages(account_id)
+        except Exception as exc:
+            host = ""
+            creds = self.mailbox._credentials(account_id)
+            if creds is not None:
+                host = creds["imap_host"]
+            return _mail_failure(exc, host)
+        if not rows:
+            return "The inbox is empty."
+        return Result(text="Inbox:", records=rows)
+
+    def _search(self, account_id: str, arguments: dict[str, Any]) -> str | Result:
+        if not self.mailbox.connected(account_id):
+            return "The mailbox is not connected."
+        try:
+            rows = self.mailbox.search(
+                account_id,
+                query=str(arguments.get("query", "")),
+                sender=str(arguments.get("from", "")),
+                since=str(arguments.get("since", "")),
+                unread=bool(arguments.get("unread")),
+                folder=str(arguments.get("folder", "INBOX") or "INBOX"),
+            )
+        except Exception as exc:
+            host = ""
+            creds = self.mailbox._credentials(account_id)
+            if creds is not None:
+                host = creds["imap_host"]
+            return _mail_failure(exc, host)
+        if not rows:
+            return "No messages matched."
+        return Result(text="Messages:", records=rows)
+
+
+def _imap_criteria(*, query: str, sender: str, since: str, unread: bool) -> str:
+    parts: list[str] = []
+    if unread:
+        parts.append("UNSEEN")
+    if sender:
+        parts.append(f'FROM "{sender}"')
+    if since:
+        parts.append(f'SINCE "{since}"')
+    if query:
+        parts.append(f'TEXT "{query}"')
+    if not parts:
+        return "ALL"
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " ".join(parts) + ")"
 
 
 def _login(client: Any, creds: dict[str, str]) -> None:
@@ -284,24 +473,16 @@ def _mail_failure(exc: Exception, host: str = "") -> str:
     return "The mailbox did not answer."
 
 
-def _listing(rows: list[dict[str, str]]) -> str:
-    lines: list[str] = []
-    for row in rows:
-        sender = row.get("sender") or "unknown"
-        subject = row.get("subject") or ""
-        body = " ".join(row.get("body", "").split())
-        if len(body) > 400:
-            body = body[:400]
-        head = f"{subject}. {body}" if subject else body
-        lines.append(f"From {sender}: {head}".rstrip())
-    return "Inbox:\n" + "\n".join(lines)
-
-
-def _message(raw: bytes) -> dict[str, str]:
+def _message(raw: bytes, index: int = 1) -> dict[str, str]:
     parsed = message_from_bytes(raw, policy=default)
     name, address = parseaddr(str(parsed.get("from") or ""))
     subject = str(parsed.get("subject") or "")
-    return {"sender": name or address, "subject": subject, "body": _text(parsed)}
+    return {
+        "id": str(index),
+        "sender": name or address,
+        "subject": subject,
+        "body": _text(parsed),
+    }
 
 
 def _text(parsed: EmailMessage) -> str:

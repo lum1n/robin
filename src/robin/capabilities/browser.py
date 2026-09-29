@@ -7,11 +7,18 @@ import os
 import queue
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from robin.capability import ActiveTurn, Capability, Effect, FieldClass, FieldSpec, SecretAccepted, Tool, current_task
+
+
+def _active_text() -> str:
+    turn = current_task.get()
+    return turn.text if isinstance(turn, ActiveTurn) else ""
+
 
 
 class Page(Protocol):
@@ -93,6 +100,7 @@ class PlaywrightPage:
         self._page = self._tabs[self._active]
 
     def _download(self, download: Any) -> None:
+        """Record a download. save_as must stay on the Playwright thread; the event already is."""
         name = ""
         try:
             name = str(getattr(download, "suggested_filename", "") or "")
@@ -109,9 +117,12 @@ class PlaywrightPage:
             try:
                 folder.mkdir(parents=True, exist_ok=True)
                 path = folder / Path(name).name
-                download.save_as(str(path))
-                name = str(path)
+                save = getattr(download, "save_as", None)
+                if callable(save):
+                    save(str(path))
+                    name = str(path)
             except Exception:
+                # Never raise from a Playwright event callback; it corrupts the sync greenlet.
                 pass
         if name and name not in self._downloads:
             self._downloads.append(name)
@@ -243,11 +254,25 @@ class PlaywrightPage:
             try:
                 control = self._page.get_by_role(role, name=target)
                 if int(control.count()) > 0:
-                    control.first.click()
+                    _call_timeout(control.first.click, 5000)
                     return
             except Exception:
                 pass
-        self._page.get_by_text(target).click()
+        try:
+            control = self._page.get_by_text(target, exact=True)
+            if int(control.count()) > 0:
+                _call_timeout(control.first.click, 5000)
+                return
+        except Exception:
+            pass
+        try:
+            control = self._page.get_by_text(target)
+            if int(control.count()) > 0:
+                _call_timeout(control.first.click, 5000)
+                return
+        except Exception:
+            pass
+        raise RuntimeError(f'no clickable control matching "{target}"')
 
     def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
         if ref and self._act_ref(ref, "fill", text):
@@ -255,21 +280,37 @@ class PlaywrightPage:
         try:
             labeled = self._page.get_by_label(target)
             if int(labeled.count()) > 0:
-                labeled.first.fill(text)
+                _call_timeout(labeled.first.fill, 5000, text)
+                return
+        except Exception:
+            pass
+        try:
+            box = self._page.get_by_role(role or "textbox", name=target)
+            if int(box.count()) > 0:
+                _call_timeout(box.first.fill, 5000, text)
                 return
         except Exception:
             pass
         try:
             box = self._page.get_by_role("textbox", name=target)
             if int(box.count()) > 0:
-                box.first.fill(text)
+                _call_timeout(box.first.fill, 5000, text)
                 return
         except Exception:
             pass
-        self._page.get_by_label(target).fill(text)
+        try:
+            if self._fill_named(target, text):
+                return
+        except Exception:
+            pass
+        raise RuntimeError(f'no text field matching "{target}"')
 
     def type_password(self, text: str) -> None:
-        self._fields("input[type='password']").first.fill(text)
+        self._await_selector("input[type='password']", timeout_ms=8000)
+        fields = self._fields("input[type='password']")
+        if int(fields.count()) == 0:
+            raise RuntimeError("no password field on this page")
+        fields.first.fill(text)
 
     def select_option(self, target: str, value: str, ref: str = "") -> None:
         if ref and self._act_ref(ref, "select", value):
@@ -281,7 +322,14 @@ class PlaywrightPage:
                 return
         except Exception:
             pass
-        self._page.locator("select").first.select_option(value)
+        try:
+            boxes = self._page.locator("select")
+            if int(boxes.count()) > 0:
+                boxes.first.select_option(value)
+                return
+        except Exception:
+            pass
+        raise RuntimeError(f'no select matching "{target}"')
 
     def scroll(self, direction: str, ref: str = "") -> None:
         amount = {"up": -800, "down": 800, "top": -100000, "bottom": 100000}.get(direction.lower(), 800)
@@ -307,11 +355,18 @@ class PlaywrightPage:
             try:
                 control = self._page.get_by_role(role, name=target)
                 if int(control.count()) > 0:
-                    control.first.hover()
+                    control.first.hover(timeout=5000)
                     return
             except Exception:
                 pass
-        self._page.get_by_text(target).hover()
+        try:
+            control = self._page.get_by_text(target, exact=True)
+            if int(control.count()) > 0:
+                control.first.hover(timeout=5000)
+                return
+        except Exception:
+            pass
+        raise RuntimeError(f'no hover target matching "{target}"')
 
     def type_focused(self, text: str) -> None:
         try:
@@ -337,14 +392,50 @@ class PlaywrightPage:
                     continue
                 target = locator.first
                 if action == "click":
-                    target.click()
+                    _call_timeout(target.click, 5000)
                 elif action == "select":
-                    target.select_option(text)
+                    _call_timeout(target.select_option, 5000, text)
                 elif action == "hover":
-                    target.hover()
+                    _call_timeout(target.hover, 5000)
                 else:
-                    target.fill(text)
+                    _call_timeout(target.fill, 5000, text)
                 return True
+            except Exception:
+                continue
+        return False
+
+    def _fill_named(self, target: str, text: str) -> bool:
+        needle = target.strip().lower()
+        if not needle:
+            return False
+        selectors = (
+            f'input[placeholder*="{target}" i], textarea[placeholder*="{target}" i]',
+            f'input[name*="{target}" i], textarea[name*="{target}" i]',
+            f'input[aria-label*="{target}" i], textarea[aria-label*="{target}" i]',
+            f'input[id*="{target}" i], textarea[id*="{target}" i]',
+        )
+        for selector in selectors:
+            try:
+                found = self._fields(selector)
+                if int(found.count()) == 0:
+                    continue
+                found.first.fill(text, timeout=5000)
+                return True
+            except Exception:
+                continue
+        # Case-insensitive placeholder contains check via role textboxes.
+        try:
+            boxes = self._page.get_by_role("textbox")
+            total = int(boxes.count())
+        except Exception:
+            return False
+        for index in range(min(total, 20)):
+            try:
+                box = boxes.nth(index)
+                name = str(box.get_attribute("placeholder") or box.get_attribute("name") or box.get_attribute("aria-label") or "")
+                if needle in name.lower():
+                    box.fill(text, timeout=5000)
+                    return True
             except Exception:
                 continue
         return False
@@ -364,7 +455,10 @@ class PlaywrightPage:
         return bool(_LOGIN_WORD.search(text))
 
     def type_username(self, text: str) -> None:
+        self._await_selector(_USER_SELECTOR, timeout_ms=8000)
         field = self._fields(_USER_SELECTOR)
+        if int(field.count()) == 0:
+            raise RuntimeError("no username field on this page")
         field.first.fill(text)
 
     def clear_gate(self) -> None:
@@ -382,15 +476,37 @@ class PlaywrightPage:
 
     def sign_in(self, user: str, password: str) -> None:
         self.clear_gate()
+        self._await_selector(f"{_USER_SELECTOR}, input[type='password']", timeout_ms=10000)
         self.type_username(user)
         if int(self._fields("input[type='password']").count()) == 0:
-            self._press(("Continue", "Next", "Log in", "Sign in"))
+            self._press(_LOGIN_CONTINUE)
             try:
                 self._fields("input[type='password']").first.wait_for(timeout=8000)
             except Exception:
                 pass
         self.type_password(password)
-        self._press(("Log in", "Sign in", "Continue", "Submit"))
+        self._press(_LOGIN_SUBMIT)
+        self.settle()
+
+    def _await_selector(self, selector: str, *, timeout_ms: int) -> None:
+        """Wait for a SPA form control after navigation."""
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            try:
+                if int(self._fields(selector).count()) > 0:
+                    return
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return
+            pause = getattr(self._page, "wait_for_timeout", None)
+            if callable(pause):
+                try:
+                    pause(200)
+                    continue
+                except Exception:
+                    pass
+            time.sleep(0.2)
 
     def _fields(self, selector: str) -> Any:
         found = self._page.locator(selector)
@@ -412,6 +528,20 @@ class PlaywrightPage:
 
     def _press(self, labels: tuple[str, ...]) -> None:
         for label in labels:
+            try:
+                control = self._page.get_by_role("button", name=label)
+                if int(control.count()) > 0:
+                    control.first.click()
+                    return
+            except Exception:
+                pass
+            try:
+                control = self._page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE))
+                if int(control.count()) > 0:
+                    control.first.click()
+                    return
+            except Exception:
+                pass
             try:
                 control = self._page.get_by_text(label)
                 if int(control.count()) > 0:
@@ -622,29 +752,38 @@ class Browser(Capability):
     id = "display"
     tools = [
         Tool(
-            name="open_page",
-            description="Open an http or https page when the person asked for that page. Returns a text snapshot of the page.",
+            name="browser_open",
+            description=(
+                "Open an http or https URL and return a text snapshot with URL, Interactive refs, and Content. "
+                "To click or type, use Interactive refs (for example target 1) or the visible name. "
+                "Use browser_select for dropdowns, browser_scroll to reveal more, browser_press for Enter or Tab, "
+                "browser_back to leave a page. Use browser_hover for menus, browser_type_focused when the caret is already in a field. "
+                "When a snapshot says a saved sign-in exists, use browser_fill_username and browser_fill_password; never invent the password. "
+                "When Pages lists more than one entry, browser_switch focuses that popup by index. "
+                "If Content ends with (more below), scroll before answering."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
                 "required": ["url"],
             },
             effect=Effect.MUTATE,
+            egress=True,
         ),
         Tool(
-            name="read_screen",
+            name="browser_read",
             description="Read the structured text snapshot of this account's page (URL, interactive refs, content).",
             parameters={"type": "object", "properties": {}},
             effect=Effect.READ,
         ),
         Tool(
-            name="click",
+            name="browser_click",
             description="Click an interactive ref from the snapshot (for example 1) or a visible name.",
             parameters={"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]},
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="type_text",
+            name="browser_type",
             description="Type into a textbox ref or labeled field that is not a password.",
             parameters={
                 "type": "object",
@@ -654,7 +793,7 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="select_option",
+            name="browser_select",
             description="Choose an option in a combobox or select ref.",
             parameters={
                 "type": "object",
@@ -664,7 +803,7 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="scroll",
+            name="browser_scroll",
             description="Scroll the page or a ref. Direction is up, down, top, or bottom.",
             parameters={
                 "type": "object",
@@ -677,7 +816,7 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="press_key",
+            name="browser_press",
             description="Press a key such as Enter, Tab, Escape, or ArrowDown.",
             parameters={
                 "type": "object",
@@ -687,7 +826,7 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="hover",
+            name="browser_hover",
             description="Hover an interactive ref or visible name to reveal menus.",
             parameters={
                 "type": "object",
@@ -697,7 +836,7 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="type_focused",
+            name="browser_type_focused",
             description="Type into the focused field when it has no useful label or ref.",
             parameters={
                 "type": "object",
@@ -707,13 +846,13 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="go_back",
+            name="browser_back",
             description="Go back one page in the browser history.",
             parameters={"type": "object", "properties": {}},
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="switch_page",
+            name="browser_switch",
             description="Focus another open page or popup by its Pages index from the snapshot.",
             parameters={
                 "type": "object",
@@ -723,14 +862,41 @@ class Browser(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="type_password",
-            description="Type a password. Waits for confirmation.",
+            name="browser_fill_username",
+            description=(
+                "Fill the saved username/email for this site into a textbox ref or label. "
+                "Use when the page shows a sign-in form and a saved sign-in exists."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
+            name="browser_fill_password",
+            description=(
+                "Fill the saved password for this site into a password field or ref. "
+                "Prefer a password ref from the snapshot, or call with target empty. "
+                "Waits for confirmation. The password never appears in the tool arguments."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+            },
+            effect=Effect.EXTERNAL,
+        ),
+        Tool(
+            name="browser_type_password",
+            description="Type a password the person just provided. Waits for confirmation.",
             parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             effect=Effect.EXTERNAL,
             drop_arguments=("text",),
         ),
         Tool(
-            name="submit",
+            name="browser_submit",
             description="Submit a form or send something from the screen.",
             parameters={"type": "object", "properties": {}},
             effect=Effect.EXTERNAL,
@@ -753,29 +919,7 @@ class Browser(Capability):
         self._codes: dict[tuple[str, str], str] = {}
         self._once: dict[str, list[str]] = {}
         self._refs: dict[str, dict[str, tuple[str, str]]] = {}
-
-    def prepare(self, account_id: str, task: str) -> str:
-        self._direct.pop(account_id, None)
-        url = _page_url(task)
-        if url is None:
-            return ""
-        try:
-            opened = self.invoke(account_id, "open_page", {"url": url})
-        except ValueError as exc:
-            self._direct[account_id] = str(exc)
-            return ""
-        if opened.startswith("could not open"):
-            self._direct[account_id] = opened
-            return ""
-        if self._sign_in_if_needed(account_id, url, task):
-            return ""
-        text = self._observe(account_id)
-        if len(text) > 4000:
-            text = text[:4000]
-        return text
-
-    def take_direct(self, account_id: str) -> str:
-        return self._direct.pop(account_id, "")
+        self._login_notes: dict[str, str] = {}
 
     def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
         waiting = self._wait(account_id, conversation_id)
@@ -788,7 +932,9 @@ class Browser(Capability):
         if waiting.get("kind") == "code":
             code = _parse_code(text)
             if code is None:
-                return SecretAccepted(reply=_ask_code(waiting["hosts"][0]))
+                # A new question abandons the code prompt so the conversation is not trapped.
+                self._clear_wait(account_id, conversation_id)
+                return None
             self._codes[(account_id, conversation_id)] = code
             self._clear_wait(account_id, conversation_id)
             return SecretAccepted(
@@ -798,7 +944,9 @@ class Browser(Capability):
             )
         parsed = _parse_credentials(text)
         if parsed is None:
-            return SecretAccepted(reply=_ask_text(waiting["hosts"][0]))
+            # Same escape: ordinary chat must not keep replaying the sign-in prompt.
+            self._clear_wait(account_id, conversation_id)
+            return None
         user, password = parsed
         self._save(account_id, list(waiting["hosts"]), user, password)
         self._clear_wait(account_id, conversation_id)
@@ -820,16 +968,15 @@ class Browser(Capability):
         cleaned = _CREDENTIALS.sub(" ", text).strip()
         return cleaned or f"open {url}"
 
-    def offered_tools(self, account_id: str, task: str) -> list[Tool]:
-        from robin.capabilities.desktop import _wants_desktop
-
-        if _wants_desktop(task) and not _wants_page(task):
-            return []
+    def available_tools(self, account_id: str) -> list[Tool]:
         if self._page_open(account_id):
             return list(self.tools)
-        if _wants_page(task):
-            return [tool for tool in self.tools if tool.name == "open_page"]
-        return []
+        return [tool for tool in self.tools if tool.name == "browser_open"]
+
+    def status(self, account_id: str) -> str:
+        if self._page_open(account_id):
+            return "browser: page open"
+        return "browser: available"
 
     def _page_open(self, account_id: str) -> bool:
         if self.desk is not None:
@@ -842,18 +989,15 @@ class Browser(Capability):
         return account_id == self.owner
 
     def records(self, account_id: str) -> list[dict[str, str]]:
-        try:
-            text, password = self._visible(account_id)
-        except RuntimeError:
-            return []
-        if len(text) > 800:
-            text = text[:800]
-        return [{"text": text, "password": password}]
+        # Do not re-read the live page on every decide(). An open tab would make
+        # ordinary chat wait on Playwright (and NER). The operator loop already
+        # sends the current page when the person is browsing.
+        return []
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
         if self.desk is None and account_id != self.owner:
             raise PermissionError(account_id)
-        if tool_name == "open_page":
+        if tool_name == "browser_open":
             url = str(arguments.get("url", ""))
             try:
                 if self.desk is not None:
@@ -865,9 +1009,15 @@ class Browser(Capability):
                 raise
             except Exception as exc:
                 return f"could not open the page. {_open_failure(exc)}"
-            return self._observe(account_id)
+            try:
+                if self._sign_in_if_needed(account_id, url, _active_text()):
+                    asked = self._direct.pop(account_id, "")
+                    return asked or self._observe(account_id)
+                return self._observe(account_id)
+            except Exception as exc:
+                return f"could not open the page. {_open_failure(exc)}"
         try:
-            if tool_name == "click":
+            if tool_name == "browser_click":
                 target = str(arguments.get("target", ""))
                 before = self._glance(account_id)
                 role, name, ref = self._resolve(account_id, target, prefer=("link", "button"))
@@ -875,7 +1025,7 @@ class Browser(Capability):
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"clicked {target}\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "type_text":
+            if tool_name == "browser_type":
                 target = str(arguments.get("target", ""))
                 text = str(arguments.get("text", ""))
                 before = self._glance(account_id)
@@ -884,7 +1034,7 @@ class Browser(Capability):
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"typed into {target}\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "select_option":
+            if tool_name == "browser_select":
                 target = str(arguments.get("target", ""))
                 value = str(arguments.get("value", ""))
                 before = self._glance(account_id)
@@ -893,7 +1043,7 @@ class Browser(Capability):
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"selected {value} in {target}\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "scroll":
+            if tool_name == "browser_scroll":
                 direction = str(arguments.get("direction", "down"))
                 target = str(arguments.get("target", ""))
                 before = self._glance(account_id)
@@ -904,14 +1054,14 @@ class Browser(Capability):
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"scrolled {direction}\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "press_key":
+            if tool_name == "browser_press":
                 key = str(arguments.get("key", ""))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _press_key(page, key))
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"pressed {key}\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "hover":
+            if tool_name == "browser_hover":
                 target = str(arguments.get("target", ""))
                 before = self._glance(account_id)
                 role, name, ref = self._resolve(account_id, target, prefer=("link", "button", "menuitem"))
@@ -919,62 +1069,113 @@ class Browser(Capability):
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"hovered {target}\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "type_focused":
+            if tool_name == "browser_type_focused":
                 text = str(arguments.get("text", ""))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _type_focused(page, text))
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"typed into focused field\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "go_back":
+            if tool_name == "browser_back":
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _go_back(page))
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"went back\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "switch_page":
+            if tool_name == "browser_switch":
                 index = int(arguments.get("index", 0))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _switch_page(page, index))
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"switched to page {index}\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "type_password":
+            if tool_name == "browser_type_password":
                 secret = str(arguments.get("text", ""))
                 self._use(account_id, lambda page: page.type_password(secret))
                 return "typed"
-            if tool_name == "submit":
+            if tool_name == "browser_fill_username":
+                return self._fill_saved(account_id, str(arguments.get("target", "")), kind="user")
+            if tool_name == "browser_fill_password":
+                return self._fill_saved(account_id, str(arguments.get("target", "")), kind="password")
+            if tool_name == "browser_submit":
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: page.submit())
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"submitted\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "read_screen":
+            if tool_name == "browser_read":
                 return self._observe(account_id)
-        except RuntimeError as exc:
-            return str(exc)
+        except Exception as exc:
+            return _action_failure(exc)
         raise NotImplementedError(tool_name)
 
     def _observe(self, account_id: str) -> str:
-        text, password = self._use(account_id, lambda page: page.read())
+        def work(page: Page) -> tuple[str, str, dict[str, tuple[str, str]], str]:
+            text, password = page.read()
+            refs = dict(getattr(page, "_refs", {}) or {})
+            located = ""
+            if not text.startswith("URL:"):
+                try:
+                    located = str(page.location() or "")
+                except Exception:
+                    located = ""
+            return text, password, refs, located
+
+        text, password, refs, located = self._use(account_id, work)
         for secret in password.split():
             text = text.replace(secret, "")
-        page = self._current(account_id)
-        refs = dict(getattr(page, "_refs", {}) or {})
         if not text.startswith("URL:"):
-            try:
-                located = str(page.location() or "")
-            except Exception:
-                located = ""
             text = _format_snapshot({"url": located, "title": "", "interactive": [], "content": text})
         if refs:
             self._refs[account_id] = refs
         else:
             self._refs[account_id] = _parse_refs(text)
         text = _hide(text, self._known_secrets(account_id) + self._once.pop(account_id, []))
+        note = self._login_notes.pop(account_id, "")
+        if note:
+            text = f"{note}\n\n{text}"
         if len(text) > 4000:
             text = text[:4000]
         return text
+
+    def _fill_saved(self, account_id: str, target: str, *, kind: str) -> str:
+        url = self._url(account_id)
+        hosts = _hosts(url, url)
+        creds = self._load(account_id, hosts)
+        if creds is None:
+            return "no saved sign-in for this site"
+        user, password = creds
+        secret = user if kind == "user" else password
+        prefer = ("textbox",) if kind == "user" else ("textbox",)
+        role, name, ref = self._resolve(account_id, target, prefer=prefer)
+        before = self._glance(account_id)
+        try:
+            if kind == "password":
+                # Prefer a real password input. Snapshot may hide it or show a nearby
+                # show-password toggle as button "Passord" / "Password".
+                def fill_password(page: Page) -> None:
+                    try:
+                        page.type_password(secret)
+                        return
+                    except Exception:
+                        pass
+                    if target.strip():
+                        _type_text(page, name or target, secret, role, ref=ref)
+                        return
+                    raise RuntimeError("no password field on this page")
+
+                self._use(account_id, fill_password)
+            else:
+                self._use(
+                    account_id,
+                    lambda page: _type_text(page, name or target, secret, role, ref=ref),
+                )
+        except Exception as exc:
+            return _action_failure(exc)
+        self._settle(account_id)
+        after = self._observe(account_id)
+        label = "username" if kind == "user" else "password"
+        return f"filled saved {label} into {target}\n{_action_diff(before, after)}\n{after}"
 
     def _resolve(self, account_id: str, target: str, *, prefer: tuple[str, ...]) -> tuple[str, str, str]:
         key = target.strip()
@@ -988,6 +1189,12 @@ class Browser(Capability):
         for ref, (role, name) in refs.items():
             if name == key:
                 return role, name, ref
+        lowered = key.lower()
+        for ref, (role, name) in refs.items():
+            if prefer and role not in prefer:
+                continue
+            if lowered and lowered in name.lower():
+                return role, name, ref
         return "", key, ""
 
     def _url(self, account_id: str) -> str:
@@ -997,27 +1204,32 @@ class Browser(Capability):
             return ""
 
     def _glance(self, account_id: str) -> dict[str, Any]:
-        page = self._current(account_id)
-        url = ""
-        try:
-            url = str(page.location() or "")
-        except Exception:
+        def work(page: Page) -> dict[str, Any]:
             url = ""
-        pages = 1
-        listing = getattr(page, "page_list", None)
-        if callable(listing):
             try:
-                pages = max(1, len(listing()))
+                url = str(page.location() or "")
             except Exception:
-                pages = 1
-        downloads = 0
-        downs = getattr(page, "downloads", None)
-        if callable(downs):
-            try:
-                downloads = len(downs())
-            except Exception:
-                downloads = 0
-        return {"url": url, "pages": pages, "downloads": downloads}
+                url = ""
+            pages = 1
+            listing = getattr(page, "page_list", None)
+            if callable(listing):
+                try:
+                    pages = max(1, len(listing()))
+                except Exception:
+                    pages = 1
+            downloads = 0
+            downs = getattr(page, "downloads", None)
+            if callable(downs):
+                try:
+                    downloads = len(downs())
+                except Exception:
+                    downloads = 0
+            return {"url": url, "pages": pages, "downloads": downloads}
+
+        try:
+            return self._use(account_id, work)
+        except Exception:
+            return {"url": "", "pages": 1, "downloads": 0}
 
     def _settle(self, account_id: str) -> None:
         try:
@@ -1065,22 +1277,42 @@ class Browser(Capability):
             return True
         user, password = creds
         try:
-            self._use(account_id, lambda page: page.sign_in(user, password))
-            still = bool(self._use(account_id, lambda page: page.needs_login()))
+            before = landed
+
+            def attempt(page: Page) -> str:
+                page.sign_in(user, password)
+                return _sign_in_result(page, before=before, timeout_ms=_SIGN_IN_WAIT_MS)
+
+            outcome = str(self._use(account_id, attempt))
         except Exception:
-            self._ask(account_id, hosts, task, failed=True)
-            return True
-        if still:
+            # Fall through to the adaptive operator loop with the saved secret.
+            self._login_notes[account_id] = (
+                "Saved sign-in exists for this site, but the automatic fill hit a browser error. "
+                "Use Interactive refs with fill_saved_username and fill_saved_password."
+            )
+            return False
+        if outcome == "ok":
+            if self._finish_code(account_id, hosts, task):
+                return True
+            try:
+                landed_after = str(self._use(account_id, lambda page: page.location()))
+            except Exception:
+                landed_after = landed
+            self._save(account_id, _hosts(url, landed_after), user, password)
+            return False
+        if outcome == "wrong":
             self._drop(account_id, hosts)
-            self._ask(account_id, hosts, task, failed=True)
+            self._ask(account_id, hosts, task, failed=True, reason="wrong")
             return True
-        if self._finish_code(account_id, hosts, task):
-            return True
-        try:
-            landed_after = str(self._use(account_id, lambda page: page.location()))
-        except Exception:
-            landed_after = landed
-        self._save(account_id, _hosts(url, landed_after), user, password)
+        # Auto-fill did not finish (blocked, stuck, or a glitch). Keep the secret and
+        # hand the live login form to the operator loop so the model can adapt with
+        # fill_saved_username / fill_saved_password on this site's refs.
+        self._login_notes[account_id] = (
+            "Saved sign-in exists for this site, but the automatic fill did not finish. "
+            "Use Interactive refs with fill_saved_username and fill_saved_password, "
+            "click Continue or Next between steps when needed, then submit. "
+            "Do not invent the password."
+        )
         return False
 
     def _finish_code(self, account_id: str, hosts: list[str], task: str) -> bool:
@@ -1112,7 +1344,17 @@ class Browser(Capability):
     def _screen(self, account_id: str) -> str:
         return self._observe(account_id)
 
-    def _ask(self, account_id: str, hosts: list[str], task: str, *, failed: bool = False, kind: str = "password") -> None:
+    def _ask(
+        self,
+        account_id: str,
+        hosts: list[str],
+        task: str,
+        *,
+        failed: bool = False,
+        kind: str = "password",
+        reason: str = "",
+        detail: str = "",
+    ) -> None:
         turn = current_task.get()
         conversation_id = turn.conversation_id if isinstance(turn, ActiveTurn) else ""
         record = {
@@ -1130,7 +1372,7 @@ class Browser(Capability):
         if kind == "code":
             self._direct[account_id] = _ask_code(host, failed=failed)
         else:
-            self._direct[account_id] = _ask_text(host, failed=failed)
+            self._direct[account_id] = _ask_text(host, failed=failed, reason=reason, detail=detail)
 
     def _wait(self, account_id: str, conversation_id: str) -> dict[str, Any] | None:
         found = self._waits.get((account_id, conversation_id))
@@ -1214,14 +1456,48 @@ def _open_failure(exc: Exception) -> str:
     return line[:180] or "the browser did not start"
 
 
+def _call_timeout(method: Any, timeout_ms: int, *args: Any) -> Any:
+    """Call a Playwright method with timeout when the binding accepts it."""
+    try:
+        return method(*args, timeout=timeout_ms)
+    except TypeError:
+        return method(*args)
+
+
+def _action_failure(exc: Exception) -> str:
+    text = str(exc).strip()
+    line = text.splitlines()[0].strip() if text else ""
+    if "Timeout" in type(exc).__name__ or "Timeout" in text:
+        if "get_by_label" in text:
+            return "could not find that field on the page"
+        return "the page did not respond in time"
+    return line[:180] or "the browser action failed"
+
+
 _CODE_SELECTOR = "input[autocomplete='one-time-code'], input[name*='otp' i], input[name*='totp' i], input[name*='mfa' i], input[id*='otp' i]"
 _TWO_FACTOR = re.compile(r"\b(?:two[- ]factor|2fa|authentication code|verification code|one[- ]time code|authenticator)\b", re.IGNORECASE)
 _CODE = re.compile(
     r"\b(?:(?:one[- ]time|authentication|verification|2fa|two[- ]factor|otp|mfa)\s+)?code\s*(?:is|:)?\s*([A-Za-z0-9]{4,10})\s*$",
     re.IGNORECASE,
 )
-_LOGIN_WORD = re.compile(r"\b(?:log\s*in|sign\s*in|login)\b", re.IGNORECASE)
-_LOGIN_LABELS = ("Log in", "Sign in", "Login", "Continue")
+_LOGIN_WORD = re.compile(r"\b(?:log\s*in|sign\s*in|login|logg\s*inn)\b", re.IGNORECASE)
+_LOGIN_FAIL = re.compile(
+    r"(?:incorrect|invalid|wrong)\s+(?:email|password|credentials)|"
+    r"couldn't find|cannot find your|try again|login failed|sign[- ]in failed|"
+    r"feil\s+(?:epassord|passord|brukernavn)|ugyldig\s+(?:epassord|passord)",
+    re.IGNORECASE,
+)
+_LOGIN_BLOCK = re.compile(
+    r"unusual activity|are you a robot|captcha|access denied|verify you are human|"
+    r"automated|suspicious|try again later|something went wrong|"
+    r"temporarily unavailable|not available in your|challenge",
+    re.IGNORECASE,
+)
+_SIGNED_IN_PATH = re.compile(r"/(?:browse|profiles?|kids|gateway)(?:/|$|\?)", re.IGNORECASE)
+_LOGIN_LABELS = ("Logg inn", "Log in", "Sign in", "Login", "Continue", "Fortsett")
+_LOGIN_CONTINUE = ("Continue", "Next", "Fortsett", "Neste", "Logg inn", "Log in", "Sign in")
+_LOGIN_SUBMIT = ("Logg inn", "Log in", "Sign in", "Continue", "Fortsett", "Submit", "Send")
+_SIGN_IN_WAIT_MS = 12000
 _USER_SELECTOR = (
     "input[type='email'], input[autocomplete='username'], "
     "input[name*='user' i], input[name*='email' i], input[name*='login' i], input[type='text']"
@@ -1248,6 +1524,118 @@ def _reach_login(page: Page, task: str) -> None:
             continue
         if page.needs_login():
             return
+
+
+def _await_signed_in(page: Page, *, before: str, timeout_ms: int | None = None) -> bool:
+    return _sign_in_result(page, before=before, timeout_ms=timeout_ms) == "ok"
+
+
+def _sign_in_result(page: Page, *, before: str, timeout_ms: int | None = None) -> str:
+    """Wait after submit. Returns ok, wrong, blocked, or stuck."""
+    limit = _SIGN_IN_WAIT_MS if timeout_ms is None else timeout_ms
+    deadline = time.monotonic() + limit / 1000
+    while True:
+        try:
+            landed = str(page.location() or "")
+            if _looks_signed_in(landed) or (before and landed and _login_path(landed) != _login_path(before) and not page.needs_login()):
+                return "ok"
+            if not page.needs_login() and not _login_error(page):
+                return "ok"
+            if _login_blocked(page):
+                return "blocked"
+            if _login_error(page):
+                return "wrong"
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            try:
+                landed = str(page.location() or "")
+                if _looks_signed_in(landed) or not page.needs_login():
+                    return "ok"
+                if _login_blocked(page):
+                    return "blocked"
+                if _login_error(page):
+                    return "wrong"
+            except Exception:
+                pass
+            return "stuck"
+        settle = getattr(page, "settle", None)
+        if callable(settle):
+            try:
+                settle()
+            except Exception:
+                pass
+        pause = getattr(page, "wait_for_timeout", None)
+        if callable(pause):
+            try:
+                pause(300)
+                continue
+            except Exception:
+                pass
+        time.sleep(0.3)
+
+
+def _looks_signed_in(url: str) -> bool:
+    path = urlparse(url).path or ""
+    return bool(_SIGNED_IN_PATH.search(path))
+
+
+def _login_path(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{(parsed.netloc or '').lower()}{(parsed.path or '').rstrip('/').lower()}"
+
+
+def _login_error(page: Page) -> bool:
+    sample = _page_sample(page)
+    return bool(sample and _LOGIN_FAIL.search(sample))
+
+
+def _login_blocked(page: Page) -> bool:
+    sample = _page_sample(page)
+    return bool(sample and _LOGIN_BLOCK.search(sample))
+
+
+def _page_sample(page: Page) -> str:
+    try:
+        text, _password = page.read()
+    except Exception:
+        return ""
+    return text[:1200]
+
+
+def _ask_text(host: str, *, failed: bool = False, reason: str = "", detail: str = "") -> str:
+    if reason in {"blocked", "stuck"}:
+        lead = (
+            f"Robin could not finish signing in to {host} from this machine's browser. "
+            f"Sites such as Netflix often block automated Chromium even when the password is correct. "
+            f"Your password was kept."
+        )
+        hint = " Say cancel to stop, or ask Robin to continue without signing in."
+        note = _failure_detail(detail)
+        return f"{lead}{hint}{note}"
+    if reason == "glitch":
+        lead = f"Robin hit a browser error while signing in to {host}."
+        return (
+            f"{lead} Your password was kept. Reply with the username and the password to try again, "
+            f"for example: username name@example.com password …. Or say cancel."
+        )
+    if failed:
+        lead = f"That sign-in to {host} did not work."
+    else:
+        lead = f"Sign in to {host} is needed."
+    return (
+        f"{lead} Reply with the username and the password, for example: "
+        f"username name@example.com password …. Or say cancel."
+    )
+
+
+def _failure_detail(detail: str) -> str:
+    text = " ".join(detail.split())
+    if not text:
+        return ""
+    if len(text) > 280:
+        text = text[:280] + "…"
+    return f" Page still shows: {text}"
 
 
 def _host(url: str) -> str:
@@ -1291,14 +1679,9 @@ def _pair(user: str, password: str) -> tuple[str, str] | None:
     return user, password
 
 
-def _ask_text(host: str, *, failed: bool = False) -> str:
-    lead = f"That sign-in to {host} did not work." if failed else f"Sign in to {host} is needed."
-    return f"{lead} Reply with the username and the password, for example: username name@example.com password …"
-
-
 def _ask_code(host: str, *, failed: bool = False) -> str:
     lead = f"That code for {host} did not work." if failed else f"{host} needs a verification code."
-    return f"{lead} Reply with the code, for example: code 123456"
+    return f"{lead} Reply with the code, for example: code 123456. Or say cancel."
 
 
 def _parse_code(text: str) -> str | None:
@@ -1338,7 +1721,7 @@ _REF_LINE = re.compile(
 _SNAPSHOT_JS = """() => {
   const cleanLabel = (value) => String(value || "").replace(/\\s+/g, " ").trim().slice(0, 120);
   const INTERACTIVE = new Set([
-    "link", "button", "textbox", "searchbox", "combobox", "listbox", "option",
+    "link", "button", "textbox", "password", "searchbox", "combobox", "listbox", "option",
     "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
     "slider", "spinbutton", "treeitem", "tabpanel", "menu", "menubar", "toolbar",
   ]);
@@ -1355,7 +1738,8 @@ _SNAPSHOT_JS = """() => {
       if (type === "range") return "slider";
       if (type === "number") return "spinbutton";
       if (type === "search") return "searchbox";
-      if (type === "hidden" || type === "file" || type === "password") return "";
+      if (type === "password") return "password";
+      if (type === "hidden" || type === "file") return "";
       return "textbox";
     }
     if (tag === "textarea") return "textbox";
@@ -1443,7 +1827,7 @@ _SNAPSHOT_JS = """() => {
       node.getAttribute("title"),
       node.getAttribute("alt"),
       node.value && (role === "button" || role === "link") ? node.value : "",
-      role === "textbox" || role === "searchbox" || role === "combobox" ? "" : (node.innerText || node.textContent || ""),
+      role === "textbox" || role === "searchbox" || role === "combobox" || role === "password" ? "" : (node.innerText || node.textContent || ""),
       node.getAttribute("name"),
       node.id,
     ];
@@ -1469,6 +1853,7 @@ _SNAPSHOT_JS = """() => {
     return states;
   };
   const valueOf = (node, role) => {
+    if (role === "password") return "";
     if (role === "textbox" || role === "searchbox" || role === "spinbutton" || role === "slider") {
       return cleanLabel(node.value || node.getAttribute("aria-valuetext") || node.getAttribute("aria-valuenow") || "");
     }
@@ -1477,6 +1862,13 @@ _SNAPSHOT_JS = """() => {
       return cleanLabel(node.value || "");
     }
     return "";
+  };
+  const passwordToggle = (node, role) => {
+    if (role !== "button") return false;
+    const own = cleanLabel(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+    if (own && !/^(show|hide|toggle|vis|skjul)\\b/i.test(own) && own.length > 2) return false;
+    const wrap = node.closest("div, form, label, fieldset");
+    return !!(wrap && wrap.querySelector("input[type='password']"));
   };
   const interactive = [];
   let nextRef = 1;
@@ -1491,7 +1883,7 @@ _SNAPSHOT_JS = """() => {
     if (!INTERACTIVE.has(role) && !(node.tabIndex >= 0 && role && !SKIP_ROLE.has(role))) return;
     if (!visible(node)) return;
     if (node.getAttribute("data-robin-ref")) return;
-    if (role === "textbox" && String(node.getAttribute("type") || "").toLowerCase() === "password") return;
+    if (passwordToggle(node, role)) return;
     const ref = String(nextRef++);
     try {
       node.setAttribute("data-robin-ref", ref);
@@ -1673,7 +2065,7 @@ def _format_snapshot(data: dict[str, Any]) -> str:
                 if text:
                     meta.append(text)
             value = str(item.get("value") or "").strip()
-            if value:
+            if value and role != "password":
                 meta.append(f"value={value.replace(chr(34), chr(39))}")
             suffix = f" ({', '.join(meta)})" if meta else ""
             lines.append(f'[{ref}] {role} "{name}"{suffix}')

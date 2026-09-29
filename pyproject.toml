@@ -5,11 +5,16 @@ description = "Privacy-first household assistant core"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = ["cryptography>=44"]
+dependencies = [
+    "cryptography>=44",
+    "playwright>=1.49",
+]
 
 [project.optional-dependencies]
-ner = ["gliner>=0.2.22"]
-browser = ["playwright>=1.49"]
+ner = [
+    "gliner>=0.2.22",
+    "protobuf>=7.36.2",
+]
 photos = ["open-clip-torch>=2.24", "pillow>=10"]
 
 [project.scripts]

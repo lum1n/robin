@@ -25,6 +25,7 @@ final class ShellModel: ObservableObject {
     @Published var vaultExport = ""
     @Published var failure: String?
     @Published private(set) var waiting = false
+    @Published private(set) var serverTiming = ""
 
     private let shell: Shell
 
@@ -130,6 +131,7 @@ final class ShellModel: ObservableObject {
         vaultPassphrase = ""
         vaultExport = ""
         scheduleOn = false
+        serverTiming = ""
         failure = nil
         phase = .signedOut
     }
@@ -142,6 +144,7 @@ final class ShellModel: ObservableObject {
         do {
             try await work()
             phase = await shell.phase
+            serverTiming = await shell.serverTiming
         } catch let error as RobinFailure {
             failure = error.message
         } catch {
@@ -211,6 +214,11 @@ private struct ConversationForm: View {
                 Text(threads.isEmpty ? "No threads yet" : threads.joined(separator: ", "))
                 if let reply {
                     Text(reply)
+                }
+                if !model.serverTiming.isEmpty {
+                    Text(model.serverTiming)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             case .confirm(_, let prompt, let tool):
                 Text(prompt)

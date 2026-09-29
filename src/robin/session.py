@@ -8,7 +8,16 @@ from datetime import datetime
 from typing import Any
 
 from robin.airlock import UNRESOLVED, VocabularyTerm, redact
-from robin.capability import Capability, DueWork, Effect, Registry, SecretAccepted, render_context
+from robin.capability import (
+    Capability,
+    DueWork,
+    Effect,
+    Registry,
+    Result,
+    SecretAccepted,
+    render_context,
+    render_result,
+)
 from robin.ner import Ner, UnavailableNer
 from robin.policy import Decision, Task, decide
 from robin.store import HouseholdStore
@@ -165,16 +174,11 @@ class Assistant:
     def scheduled_accounts(self) -> list[str]:
         return sorted(account_id for account_id, enabled in self.schedules.items() if enabled)
 
-    def tools(self, account_id: str, task: str = "") -> list[dict[str, Any]]:
-        return self.registry.schemas(account_id, task)
+    def tools(self, account_id: str) -> list[dict[str, Any]]:
+        return self.registry.schemas(account_id)
 
-    def prepare(self, account_id: str, task: str) -> str:
-        notes = [note for capability in self.registry.for_account(account_id) if (note := capability.prepare(account_id, task))]
-        return "\n".join(notes)
-
-    def take_direct(self, account_id: str) -> str:
-        notes = [note for capability in self.registry.for_account(account_id) if (note := capability.take_direct(account_id))]
-        return "\n".join(notes)
+    def statuses(self, account_id: str) -> list[str]:
+        return self.registry.statuses(account_id)
 
     def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
         for capability in self.registry.for_account(account_id):
@@ -240,10 +244,17 @@ class Assistant:
         arguments: dict[str, Any],
         *,
         confirmed: bool = False,
+        for_model: bool = False,
     ) -> dict[str, str]:
         capability, tool = self.registry.resolve(account_id, tool_name)
         vault = self.vaults.get(account_id, conversation_id)
-        raw = {key: vault.restore(str(value)) for key, value in arguments.items()}
+        vocabulary = self.vocabulary.get(account_id, ())
+        if tool.egress:
+            raw = {key: str(value) for key, value in arguments.items()}
+            if not confirmed and _egress_needs_restore(raw, vault):
+                return {"status": "confirm", "tool": tool_name, "reason": "egress"}
+        else:
+            raw = {key: vault.restore(str(value)) for key, value in arguments.items()}
         logged_input = {key: "" if key in tool.drop_arguments else value for key, value in raw.items()}
         logged, _ = redact(json.dumps(logged_input, sort_keys=True), Vault(account_id, "activity"))
         entry = {"tool": tool_name, "arguments": logged}
@@ -252,13 +263,26 @@ class Assistant:
             self.store.append_activity(account_id, entry)
         if tool.effect is Effect.EXTERNAL and not confirmed:
             return {"status": "confirm", "tool": tool_name}
-        result = capability.invoke(account_id, tool.name, raw)
-        redacted, _ = redact(result, vault, vocabulary=self.vocabulary.get(account_id, ()))
+        outcome = capability.invoke(account_id, tool.name, raw)
+        rendered, _ = render_result(
+            outcome,
+            capability.fields,
+            vault,
+            vocabulary=vocabulary,
+            ner=self.ner,
+            for_cloud=True,
+        )
+        if isinstance(outcome, Result) and outcome.records is not None:
+            text = rendered
+        else:
+            text = rendered if isinstance(outcome, Result) else str(outcome)
+            redacted, _ = redact(text, vault, vocabulary=vocabulary)
+            text = redacted
         if self.store is not None:
             self.store.save_vault(vault)
-        if tool.effect is Effect.EXTERNAL:
-            return {"status": "done", "result": redacted}
-        return {"status": "done", "result": vault.restore(redacted)}
+        if for_model or tool.effect is Effect.EXTERNAL:
+            return {"status": "done", "result": text}
+        return {"status": "done", "result": vault.restore(text)}
 
     def _restore_store(self) -> None:
         assert self.store is not None
@@ -271,3 +295,13 @@ class Assistant:
         for account_id, name, value in self.store.load_secrets():
             self.broker._secrets[(account_id, name)] = value
         self.schedules.update(self.store.load_schedules())
+
+
+def _egress_needs_restore(arguments: dict[str, str], vault: Vault) -> bool:
+    """True when an egress argument still holds a placeholder the person must approve."""
+    for value in arguments.values():
+        if "[" in value and "]" in value:
+            restored = vault.restore(value)
+            if restored != value:
+                return True
+    return False

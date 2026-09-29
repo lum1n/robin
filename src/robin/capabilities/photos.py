@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import threading
 from pathlib import Path
 from typing import Any, Protocol
@@ -11,15 +10,6 @@ from robin.capabilities.files import IMAGE_SUFFIXES, Workspace
 from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
 from robin.store import HouseholdStore
 
-_PHOTO_WORD = re.compile(r"\b(?:photos?|pictures?|images?|photographs?)\b", re.IGNORECASE)
-_SUBJECT = re.compile(
-    r"\b(?:with|of|containing|showing)\s+(?:(?:a|an|the|all|some)\s+)?(.+)",
-    re.IGNORECASE,
-)
-_STRIP = re.compile(
-    r"\b(?:find|search|show|list|all|my|the|some|me|photos?|pictures?|images?|photographs?|please|for)\b",
-    re.IGNORECASE,
-)
 _NEEDS_MODEL = "Photo search needs a local model. Run uv sync --extra photos in the Robin environment, then try again."
 _MISSING = object()
 
@@ -34,12 +24,11 @@ class Photos(Capability):
     id = "photos"
     tools = [
         Tool(
-            name="search_photos",
-            description="Find photos this user owns on this machine that match a description, such as dogs.",
+            name="photos_search",
+            description="Find photos this user owns on this machine that match a description, such as dogs. Empty query lists photos.",
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
-                "required": ["query"],
             },
             effect=Effect.READ,
         ),
@@ -65,24 +54,14 @@ class Photos(Capability):
             for account_id, rows in store.load_photo_index().items():
                 self._index[account_id] = {str(row["path"]): {"stamp": row["stamp"], "vector": row["vector"]} for row in rows}
 
-    def offered_tools(self, account_id: str, task: str) -> list[Tool]:
-        if _PHOTO_WORD.search(task):
-            return list(self.tools)
-        return []
-
-    def prepare(self, account_id: str, task: str) -> str:
-        query = _photo_query(task)
-        if query is None:
-            return ""
-        if not query:
-            return self._list(account_id)
-        return self._search(account_id, query)
+    def status(self, account_id: str) -> str:
+        return "photos: available"
 
     def records(self, account_id: str) -> list[dict[str, str]]:
         return []
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        if tool_name == "search_photos":
+        if tool_name == "photos_search":
             query = str(arguments.get("query", "")).strip()
             if not query:
                 return self._list(account_id)
@@ -209,16 +188,6 @@ def _local_embedder() -> Embedder | None:
         return ClipEmbedder.load()
     except ImportError:
         return None
-
-
-def _photo_query(task: str) -> str | None:
-    if not _PHOTO_WORD.search(task):
-        return None
-    match = _SUBJECT.search(task)
-    if match:
-        query = re.sub(r"\b(?:in them|in it|please|for me)\b", " ", match.group(1), flags=re.IGNORECASE)
-        return re.sub(r"\s+", " ", query).strip(" .?")
-    return re.sub(r"\s+", " ", _STRIP.sub(" ", task)).strip(" .?")
 
 
 def _cosine(left: list[float], right: list[float]) -> float:

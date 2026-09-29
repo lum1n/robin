@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import pwd
-import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -34,11 +33,6 @@ _SYSTEM_ROOTS = {
     Path("/var/lib/docker"),
     Path("/var/lib/containerd"),
 }
-_FILE_WORD = re.compile(r"\b(?:files?|folders?|directories|documents?)\b", re.IGNORECASE)
-_FILE_ASK = re.compile(r"\b(?:list|show|find|browse|search|what|which|where)\b", re.IGNORECASE)
-_FILE_READ = re.compile(r"\b(?:read|open|show)\b", re.IGNORECASE)
-_FILE_CHANGE = re.compile(r"\b(?:write|create|save|delete|remove|edit)\b", re.IGNORECASE)
-_FILE_PATH = re.compile(r"(?<![:/])(/(?!/)[^\s\"']+)")
 
 
 class Workspace:
@@ -60,13 +54,28 @@ class Workspace:
         if not base.is_dir():
             return []
         found: list[str] = []
-        for path in base.rglob("*"):
-            if not path.is_file():
-                continue
-            resolved = path.resolve()
-            if resolved != base and base not in resolved.parents:
-                continue
-            found.append(resolved.relative_to(base).as_posix())
+        for dirpath, dirnames, filenames in os.walk(base):
+            current = Path(dirpath)
+            # The Playwright profile sits at files/<account>/browser. Walking it
+            # on every decide() turns "Hei" into a multi-second cache scan.
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name not in _SKIP_NAMES and not (current == base and name == "browser")
+            ]
+            for filename in filenames:
+                if filename in _BLOCKED_NAMES:
+                    continue
+                path = current / filename
+                try:
+                    resolved = path.resolve()
+                except OSError:
+                    continue
+                if resolved != base and base not in resolved.parents:
+                    continue
+                if not resolved.is_file():
+                    continue
+                found.append(resolved.relative_to(base).as_posix())
         return sorted(found)
 
     def owned_files(self, account_id: str, *, suffixes: set[str] | None = None) -> list[Path]:
@@ -251,13 +260,13 @@ class Files(Capability):
     id = "files"
     tools = [
         Tool(
-            name="list_files",
+            name="files_list",
             description="List files owned by this user on this machine. Another user's files are left out.",
             parameters={"type": "object", "properties": {}},
             effect=Effect.READ,
         ),
         Tool(
-            name="read_file",
+            name="files_read",
             description="Read a file this user owns. Another user's path is refused.",
             parameters={
                 "type": "object",
@@ -267,7 +276,17 @@ class Files(Capability):
             effect=Effect.READ,
         ),
         Tool(
-            name="write_file",
+            name="files_search",
+            description="Search file names and text contents owned by this user for a query.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            effect=Effect.READ,
+        ),
+        Tool(
+            name="files_write",
             description="Write a file in this account's directory.",
             parameters={
                 "type": "object",
@@ -277,8 +296,8 @@ class Files(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
-            name="delete_file",
-            description="Delete a file in this account's directory.",
+            name="files_delete",
+            description="Delete a file in this account's directory. Waits for confirmation.",
             parameters={
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -292,21 +311,14 @@ class Files(Capability):
     def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
 
-    def prepare(self, account_id: str, task: str) -> str:
-        if _FILE_CHANGE.search(task):
-            return ""
-        named = _FILE_PATH.search(task)
-        if named and _FILE_READ.search(task):
-            return self.workspace.read(account_id, named.group(1).rstrip(".,"))
-        if _FILE_WORD.search(task) and _FILE_ASK.search(task):
-            return self.invoke(account_id, "list_files", {})
-        return ""
+    def status(self, account_id: str) -> str:
+        return "files: available"
 
     def records(self, account_id: str) -> list[dict[str, str]]:
         return [{"name": name} for name in self.workspace.names(account_id)]
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        if tool_name == "list_files":
+        if tool_name == "files_list":
             paths = self.workspace.owned_files(account_id)
             if not paths:
                 return "no files"
@@ -315,14 +327,40 @@ class Files(Capability):
             if len(paths) > len(shown):
                 body += f"\n{len(shown)} of {len(paths)}"
             return body
-        if tool_name == "read_file":
+        if tool_name == "files_read":
             return self.workspace.read(account_id, str(arguments.get("path", "")))
-        if tool_name == "write_file":
+        if tool_name == "files_search":
+            return self._search(account_id, str(arguments.get("query", "")))
+        if tool_name == "files_write":
             self.workspace.write(account_id, str(arguments.get("path", "")), str(arguments.get("text", "")))
             return "wrote"
-        if tool_name == "delete_file":
+        if tool_name == "files_delete":
             return self.workspace.delete(account_id, str(arguments.get("path", "")))
         raise NotImplementedError(tool_name)
+
+    def _search(self, account_id: str, query: str) -> str:
+        needle = query.strip().casefold()
+        if not needle:
+            return "query is required"
+        hits: list[str] = []
+        for path in self.workspace.owned_files(account_id):
+            name = str(path)
+            if needle in name.casefold():
+                hits.append(name)
+                continue
+            if path.suffix.lower() in IMAGE_SUFFIXES:
+                continue
+            try:
+                text = path.read_text(errors="replace")[:_LIMIT]
+            except OSError:
+                continue
+            if needle in text.casefold():
+                hits.append(name)
+            if len(hits) >= 50:
+                break
+        if not hits:
+            return "no files matched"
+        return "\n".join(hits)
 
 
 def _owner_uid(path: Path) -> int:
