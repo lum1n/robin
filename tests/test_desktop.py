@@ -132,12 +132,55 @@ def test_unavailable_surface_says_so():
             raise AssertionError("no")
 
     desktop = Desktop(Dead())
-    try:
-        desktop.invoke("a1", "desktop_read", {})
-    except RuntimeError as exc:
-        assert "not available" in str(exc)
-    else:
-        raise AssertionError("expected unavailable")
+    assert desktop.available_tools("a1") == []
+    assert desktop.status("a1") == "desktop: not available"
+    result = desktop.invoke("a1", "desktop_read", {})
+    assert "not available" in result
+    assert "browser" in result.lower()
+
+
+def test_unavailable_desktop_does_not_crash_the_turn():
+    class Dead:
+        def available(self) -> bool:
+            return False
+
+        def snapshot(self, app: str = ""):
+            raise AssertionError("no")
+
+        def click(self, ref: str) -> None:
+            raise AssertionError("no")
+
+        def type_text(self, ref: str, text: str) -> None:
+            raise AssertionError("no")
+
+        def press_key(self, key: str) -> None:
+            raise AssertionError("no")
+
+        def focus_window(self, index: int) -> None:
+            raise AssertionError("no")
+
+    class ReadyNer(UnavailableNer):
+        def available(self) -> bool:
+            return True
+
+    class Scripted:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, *, messages, tools):
+            self.calls += 1
+            names = {tool["name"] for tool in tools}
+            assert "desktop_read" not in names
+            if self.calls == 1 and "browser_open" in names:
+                return ModelTurn("", (ToolCall("browser_open", {"url": "https://vethjem.no/"}),))
+            return ModelTurn("opened")
+
+    assistant = Assistant(ner=ReadyNer())
+    assistant.add(Desktop(Dead()))
+    assistant.add(Browser(owner="a1", page=_EmptyPage()))
+    reply = converse(assistant, Task("a1", "t", "log in to vethjem.no"), Scripted())
+    assert reply.status == "reply"
+    assert "request failed" not in reply.text.lower()
 
 
 class _EmptyPage:

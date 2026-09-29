@@ -58,7 +58,10 @@ class Web(Capability):
         ),
         Tool(
             name="web_fetch",
-            description="Fetch readable text from a public http(s) URL without a browser session.",
+            description=(
+                "Fetch readable text from a public http(s) URL without a browser session. "
+                "For booking, forms, or clicking on a site, use browser_open instead."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
@@ -100,7 +103,10 @@ class Web(Capability):
         if tool_name == "web_fetch":
             url = str(arguments.get("url", "")).strip()
             if not url.startswith(("http://", "https://")):
-                return "url must be http or https"
+                if re.fullmatch(r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/.*)?", url, re.IGNORECASE):
+                    url = "https://" + url
+                else:
+                    return "url must be http or https"
             body = self._fetch(url)
             text = _readable(body)[:8000]
             return text or "empty page"

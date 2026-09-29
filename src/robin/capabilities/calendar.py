@@ -167,7 +167,10 @@ class Calendar(Capability):
         ),
         Tool(
             name="calendar_add",
-            description="Add an event on this account's calendar. Waits for confirmation.",
+            description=(
+                "Add an event on this account's own calendar (CalDAV). Waits for confirmation. "
+                "Do not use this to book appointments on a website — open the site with browser_open instead."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"title": {"type": "string"}, "when": {"type": "string"}},

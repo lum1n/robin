@@ -147,6 +147,35 @@ struct ClientTests {
         #expect(!listed.contains("mailbox-password-ada"))
     }
 
+    @Test func profileRoundTripsWithoutLeakingIntoOtherCalls() async throws {
+        let transport = ScriptedTransport(responses: [
+            RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"fields":{"email":"ada@example.com","given_name":"Ada","family_name":"","full_name":"Ada","phone":"","address":"","city":"","postal_code":"","country":""},"present":["given_name","full_name","email"]}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"fields":{"email":"ada@example.com","given_name":"Ada","family_name":"Lovelace","full_name":"Ada Lovelace","phone":"+47 900 00 000","address":"","city":"","postal_code":"","country":""},"present":["given_name","family_name","full_name","email","phone"]}"#.utf8)),
+        ])
+        let client = RobinClient(
+            baseURL: URL(string: "http://127.0.0.1:8787")!,
+            accountID: "ada",
+            transport: transport
+        )
+        try await client.login(password: "correct-horse")
+        let loaded = try await client.profile()
+        #expect(loaded["email"] == "ada@example.com")
+        let saved = try await client.saveProfile([
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+            "email": "ada@example.com",
+            "phone": "+47 900 00 000",
+        ])
+        #expect(saved["full_name"] == "Ada Lovelace")
+        let calls = await transport.calls
+        #expect(calls[1].url.absoluteString == "http://127.0.0.1:8787/v1/profile?account_id=ada")
+        #expect(calls[2].url.absoluteString == "http://127.0.0.1:8787/v1/profile")
+        let posted = String(decoding: calls[2].body ?? Data(), as: UTF8.self)
+        #expect(posted.contains("ada@example.com"))
+        #expect(calls[2].token == "sess-1")
+    }
+
     @Test func aMessageBeforeLoginFailsLocally() async throws {
         let transport = ScriptedTransport(responses: [])
         let client = RobinClient(

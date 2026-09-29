@@ -90,8 +90,13 @@ class Scripted:
         self.seen.append(messages)
         names = {tool["name"] for tool in tools}
         has_tool_result = any(message.get("role") == "tool" for message in messages)
-        if not has_tool_result and "browser_open" in names:
-            return ModelTurn("", (ToolCall("browser_open", {"url": STORE}),))
+        person = _person_text(messages)
+        if (
+            not has_tool_result
+            and "browser_open" in names
+            and _wants_browser(person)
+        ):
+            return ModelTurn("", (ToolCall("browser_open", {"url": _browser_url(person)}),))
         for message in reversed(messages):
             if message.get("role") == "tool":
                 content = str(message.get("content") or "")
@@ -105,6 +110,35 @@ class Scripted:
         return ModelTurn("Sales were 42.")
 
 
+def _person_text(messages: list[dict]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content") or "")
+        if "Person:" in content:
+            return content.rsplit("Person:", 1)[-1].strip()
+        return content
+    return ""
+
+
+def _wants_browser(text: str) -> bool:
+    lowered = text.lower()
+    if "http://" in lowered or "https://" in lowered:
+        return True
+    if "store.example" in lowered or "news.example" in lowered:
+        return True
+    return any(word in lowered for word in ("log in", "sign in", "login", "open ", "read ", "find "))
+
+
+def _browser_url(text: str) -> str:
+    for token in text.split():
+        if token.startswith("http://") or token.startswith("https://"):
+            return token.rstrip(".,)")
+    if "news.example" in text.lower():
+        return "https://news.example/story"
+    return STORE
+
+
 def _assistant(store: HouseholdStore | None = None) -> tuple[Assistant, Gate, Scripted]:
     page = Gate()
     assistant = Assistant(store=store, ner=ReadyNer())
@@ -112,7 +146,6 @@ def _assistant(store: HouseholdStore | None = None) -> tuple[Assistant, Gate, Sc
     return assistant, page, Scripted()
 
 
-@pytest.mark.xfail(reason="site sign-in needs follow-up under model-driven loop", strict=False)
 def test_a_site_asks_once_then_signs_in_from_the_vault(tmp_path) -> None:
     path = tmp_path / "house.sqlite"
     key = new_key()
@@ -151,15 +184,15 @@ def test_a_site_asks_once_then_signs_in_from_the_vault(tmp_path) -> None:
     store.close()
 
     again_page = Gate()
-    restored = Assistant(store=HouseholdStore(path, key))
+    restored = Assistant(store=HouseholdStore(path, key), ner=ReadyNer())
     restored.add(Browser(desk=Desk(lambda url: again_page), broker=restored.broker))
     later = Scripted()
     reply = converse(restored, Task("ada", "home", "yesterday's sales on store.example"), later)
     assert "Yesterday sales were 42" in reply.text
     assert again_page.password_typed == PASSWORD
     assert not any(item.startswith("Sign in to") for item in [reply.text])
-    assert PASSWORD not in "\n".join(later.seen)
-    assert USER not in "\n".join(later.seen)
+    assert PASSWORD not in str(later.seen)
+    assert USER not in str(later.seen)
 
 
 def test_a_sign_in_accepts_the_name_and_password_on_two_lines() -> None:
@@ -174,7 +207,6 @@ def test_a_sign_in_accepts_the_name_and_password_on_two_lines() -> None:
     assert PASSWORD not in given.text
 
 
-@pytest.mark.xfail(reason="site sign-in needs follow-up under model-driven loop", strict=False)
 def test_sign_in_waits_for_the_form_to_leave() -> None:
     class Slow(Gate):
         def __init__(self) -> None:
@@ -201,7 +233,7 @@ def test_sign_in_waits_for_the_form_to_leave() -> None:
             return "Welcome. Log in", ""
 
     page = Slow()
-    assistant = Assistant()
+    assistant = Assistant(ner=ReadyNer())
     assistant.add(Browser(desk=Desk(lambda url: page), broker=assistant.broker))
     model = Scripted()
     ask = converse(assistant, Task("ada", "home", "log in to store.example"), model)
@@ -218,10 +250,10 @@ def test_sign_in_waits_for_the_form_to_leave() -> None:
     assert not freed.text.startswith("Sign in to")
     assert not freed.text.startswith("That sign-in")
     assert model.seen
-    assert "2+2" in model.seen[0] or "Person:" in model.seen[0]
+    latest = str(model.seen[-1])
+    assert "2+2" in latest or "Person:" in latest
 
 
-@pytest.mark.xfail(reason="site sign-in needs follow-up under model-driven loop", strict=False)
 def test_a_blocked_sign_in_keeps_the_password_and_hands_the_form_to_the_model() -> None:
     class Blocked(Gate):
         def sign_in(self, user: str, password: str) -> None:
@@ -243,10 +275,10 @@ def test_a_blocked_sign_in_keeps_the_password_and_hands_the_form_to_the_model() 
             )
 
     page = Blocked()
-    assistant = Assistant()
+    assistant = Assistant(ner=ReadyNer())
     assistant.add(Browser(desk=Desk(lambda url: page), broker=assistant.broker))
 
-    class Scripted:
+    class BlockedScripted:
         def __init__(self) -> None:
             self.seen: list[tuple[str, list[str]]] = []
             self.calls = 0
@@ -255,20 +287,24 @@ def test_a_blocked_sign_in_keeps_the_password_and_hands_the_form_to_the_model() 
             self.calls += 1
             names = [tool["name"] for tool in tools]
             self.seen.append((messages, names))
-            if self.calls == 1:
-                assert "browser_fill_username" in names
+            person = _person_text(messages)
+            has_tool_result = any(message.get("role") == "tool" for message in messages)
+            if not has_tool_result and "browser_open" in names and _wants_browser(person):
+                return ModelTurn("", (ToolCall("browser_open", {"url": STORE}),))
+            joined = "\n".join(str(message.get("content") or "") for message in messages)
+            filled_user = any(
+                message.get("role") == "tool"
+                and "filled saved username" in str(message.get("content") or "").lower()
+                for message in messages
+            )
+            if "Saved sign-in" in joined and "browser_fill_username" in names and not filled_user:
                 assert "browser_fill_password" in names
-                assert "Saved sign-in" in user
-                from robin.model import ToolCall
-
                 return ModelTurn("", (ToolCall("browser_fill_username", {"target": "1"}),))
-            if self.calls == 2:
-                from robin.model import ToolCall
-
+            if filled_user:
                 return ModelTurn("", (ToolCall("browser_fill_password", {"target": "2"}),))
             return ModelTurn("Stopped at the site challenge.")
 
-    model = Scripted()
+    model = BlockedScripted()
     converse(assistant, Task("ada", "home", "log in to store.example"), model)
     held = converse(assistant, Task("ada", "home", f"username {USER} password {PASSWORD}"), model)
     # Password fill waits for confirm instead of crashing the turn.
@@ -280,7 +316,6 @@ def test_a_blocked_sign_in_keeps_the_password_and_hands_the_form_to_the_model() 
     assert stored["password"] == PASSWORD
 
 
-@pytest.mark.xfail(reason="site sign-in needs follow-up under model-driven loop", strict=False)
 def test_a_wrong_password_is_not_kept_and_a_long_page_is_not_a_login(tmp_path, monkeypatch) -> None:
     import robin.capabilities.browser as browser_mod
 
@@ -293,7 +328,7 @@ def test_a_wrong_password_is_not_kept_and_a_long_page_is_not_a_login(tmp_path, m
             return super().read()
 
     page = Rejected()
-    assistant = Assistant()
+    assistant = Assistant(ner=ReadyNer())
     assistant.add(Browser(desk=Desk(lambda url: page), broker=assistant.broker))
     model = Scripted()
     converse(assistant, Task("ada", "home", "open https://store.example/report"), model)
@@ -344,13 +379,13 @@ def test_a_wrong_password_is_not_kept_and_a_long_page_is_not_a_login(tmp_path, m
             return None
 
     article = Article()
-    news = Assistant()
+    news = Assistant(ner=ReadyNer())
     news.add(Browser(desk=Desk(lambda url: article), broker=news.broker))
     reader = Scripted()
     reply = converse(news, Task("ada", "home", "read https://news.example/story"), reader)
     assert "market report" in reply.text
     assert article.clicks == []
-    assert reader.seen == []
+    assert reader.seen
     assert not reply.text.startswith("Sign in to")
 
 
@@ -406,13 +441,12 @@ class TwoFactor(Gate):
         return super().read()
 
 
-@pytest.mark.xfail(reason="site sign-in needs follow-up under model-driven loop", strict=False)
 def test_a_verification_code_is_asked_every_time_and_not_stored(tmp_path) -> None:
     path = tmp_path / "house.sqlite"
     key = new_key()
     store = HouseholdStore(path, key)
     page = TwoFactor()
-    assistant = Assistant(store=store)
+    assistant = Assistant(store=store, ner=ReadyNer())
     assistant.add(Browser(desk=Desk(lambda url: page), broker=assistant.broker))
     model = Scripted()
     code = "482193"

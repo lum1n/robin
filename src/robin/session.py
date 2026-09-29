@@ -171,6 +171,27 @@ class Assistant:
     def schedule_enabled(self, account_id: str) -> bool:
         return self.schedules.get(account_id, False)
 
+    def get_profile(self, account_id: str) -> dict[str, str]:
+        from robin.profile import PROFILE_SECRET, empty_profile, parse_profile
+
+        try:
+            raw = self.broker.reveal(account_id, PROFILE_SECRET)
+        except KeyError:
+            return empty_profile()
+        return parse_profile(raw)
+
+    def set_profile(self, account_id: str, updates: dict) -> dict[str, str]:
+        from robin.profile import PROFILE_SECRET, dump_profile, merge_profile
+
+        merged = merge_profile(self.get_profile(account_id), updates)
+        self.broker.put(account_id, PROFILE_SECRET, dump_profile(merged))
+        return merged
+
+    def profile_presence(self, account_id: str) -> list[str]:
+        from robin.profile import filled_keys
+
+        return filled_keys(self.get_profile(account_id))
+
     def scheduled_accounts(self) -> list[str]:
         return sorted(account_id for account_id, enabled in self.schedules.items() if enabled)
 
@@ -253,6 +274,7 @@ class Assistant:
             raw = {key: str(value) for key, value in arguments.items()}
             if not confirmed and _egress_needs_restore(raw, vault):
                 return {"status": "confirm", "tool": tool_name, "reason": "egress"}
+            raw = {key: vault.restore(value) for key, value in raw.items()}
         else:
             raw = {key: vault.restore(str(value)) for key, value in arguments.items()}
         logged_input = {key: "" if key in tool.drop_arguments else value for key, value in raw.items()}
@@ -263,7 +285,13 @@ class Assistant:
             self.store.append_activity(account_id, entry)
         if tool.effect is Effect.EXTERNAL and not confirmed:
             return {"status": "confirm", "tool": tool_name}
-        outcome = capability.invoke(account_id, tool.name, raw)
+        try:
+            outcome = capability.invoke(account_id, tool.name, raw)
+        except Exception as exc:
+            text = str(exc).strip() or "that action failed"
+            if self.store is not None:
+                self.store.save_vault(vault)
+            return {"status": "done", "result": text}
         rendered, _ = render_result(
             outcome,
             capability.fields,

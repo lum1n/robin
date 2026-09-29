@@ -173,6 +173,54 @@ def test_a_page_snapshot_keeps_refs_after_the_airlock() -> None:
     assert "Content:" in released
 
 
+def test_form_field_labels_stay_targetable_after_airlock() -> None:
+    from robin.airlock import Entity, VocabularyTerm
+    from robin.loop import _release_labels, _release_snapshot
+    from robin.vault import Vault
+
+    class FormNer(UnavailableNer):
+        def available(self) -> bool:
+            return True
+
+        def detect(self, text: str):
+            found: list[Entity] = []
+            email = "ada@example.com"
+            phone = "+47 900 00 000"
+            if email in text:
+                start = text.index(email)
+                found.append(Entity(start, start + len(email), "EMAIL"))
+            if phone in text:
+                start = text.index(phone)
+                found.append(Entity(start, start + len(phone), "PHONE"))
+            return tuple(found)
+
+    vault = Vault("ada", "t")
+    ner = FormNer()
+    labels = _release_labels(
+        ["ada@example.com", "+47 900 00 000", "Send bestilling"],
+        vault,
+        (),
+        ner,
+    )
+    assert labels == ["email", "phone", "Send bestilling"]
+    assert "[EMAIL" not in "".join(labels)
+    assert "[PHONE" not in "".join(labels)
+
+    snapshot = (
+        "URL: https://clinic.test/book\nTitle: Book\n\nInteractive:\n"
+        '[1] textbox "ada@example.com" (main)\n'
+        '[2] textbox "+47 900 00 000" (main)\n'
+        '[3] button "Send bestilling" (main, disabled)\n\n'
+        "Content:\nBook a visit."
+    )
+    released = _release_snapshot(snapshot, vault, (VocabularyTerm("clinic"),), ner)
+    assert '[1] textbox "email"' in released
+    assert '[2] textbox "phone"' in released
+    assert '[3] button "Send bestilling" (main, disabled)' in released
+    assert "[EMAIL_" not in released
+    assert "[PHONE_" not in released
+
+
 def test_reading_the_page_keeps_tools_for_the_next_step() -> None:
     assistant = Assistant(ner=StubNer())
     assistant.add(Screen(owner="ada", text="Astrid's funeral leads the front page.", password=""))
@@ -237,6 +285,28 @@ def test_model_url_error_is_a_plain_reply() -> None:
     assert "time" in turn.message or "not running" in turn.message
 
 
+def test_model_prompt_and_answer_are_logged(capsys, monkeypatch) -> None:
+    monkeypatch.delenv("ROBIN_LOG_MODEL", raising=False)
+    assistant = Assistant(ner=StubNer())
+    model = Scripted([ModelTurn("hello there")])
+    converse(assistant, Task("ada", "t", "hi", allow_cloud=True), model)
+    err = capsys.readouterr().err
+    assert "--- robin model prompt ---" in err
+    assert "Person: hi" in err
+    assert "--- robin model answer ---" in err
+    assert "hello there" in err
+
+
+def test_model_logging_can_be_disabled(capsys, monkeypatch) -> None:
+    monkeypatch.setenv("ROBIN_LOG_MODEL", "0")
+    assistant = Assistant(ner=StubNer())
+    model = Scripted([ModelTurn("quiet")])
+    converse(assistant, Task("ada", "t", "hi", allow_cloud=True), model)
+    err = capsys.readouterr().err
+    assert "--- robin model prompt ---" not in err
+    assert "--- robin model answer ---" not in err
+
+
 def test_thread_history_is_sent_redacted(tmp_path) -> None:
     store = HouseholdStore(tmp_path / "house.sqlite", new_key())
     assistant = Assistant(ner=StubNer(), store=store)
@@ -248,3 +318,91 @@ def test_thread_history_is_sent_redacted(tmp_path) -> None:
     prompt = _user_text(model.seen[0][0])
     assert "Jane Doe" not in prompt
     assert "[PERSON_1]" in prompt or "hello" in prompt
+
+
+def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
+    from robin.loop import _history
+    from robin.store import HouseholdStore
+    from robin.vault import new_key
+
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    assistant = Assistant(ner=StubNer(), store=store)
+    store.append_turn("ada", "t", "user", "book on vethjem.no")
+    store.append_turn(
+        "ada",
+        "t",
+        "assistant",
+        "Please choose: 1. At the clinic 2. Home visit 3. Video consultation. Which option?",
+    )
+    store.append_turn("ada", "t", "user", "clinic")
+    text = _history(assistant, Task("ada", "t", "clinic again", allow_cloud=True), assistant.vaults.get("ada", "t"), (), assistant.ner)
+    assert "1. At the clinic" not in text
+    assert "continue with browser tools" in text
+
+    from robin.capabilities.browser import Browser
+    from robin.capabilities.calendar import Calendar
+    from robin.loop import SYSTEM, _system
+
+    assert "browser tools" in SYSTEM
+    assert "own calendar" in SYSTEM or "third-party" in SYSTEM
+    assert "never ask the person to reply with 1, 2, or 3" in SYSTEM.lower()
+    assert "never invent a numbered menu" in SYSTEM.lower()
+    assert "page choices" in SYSTEM.lower() or "browser_click them" in SYSTEM.lower()
+    assert "do not invent contact details" in SYSTEM.lower() or "never invent contact details" in SYSTEM.lower()
+    assert "browser_fill_profile" in SYSTEM
+    assert "disabled" in SYSTEM.lower()
+    assert "interactive are available" in SYSTEM.lower() or "listed under interactive" in SYSTEM.lower()
+    assert "never say a button is missing" in SYSTEM.lower()
+    assistant = Assistant(ner=StubNer())
+    assistant.add(Browser(owner="ada", page=_LoopPage()))
+    assistant.add(Calendar(_NoCal()))
+    prompt = _system(assistant, "ada")
+    assert "browser" in prompt.lower()
+    tools = {tool["name"]: tool["description"] for tool in assistant.tools("ada")}
+    assert "browser_open" in tools
+    assert "website" in tools["browser_open"].lower() or "booking" in tools["browser_open"].lower()
+    assert "browser_fill_profile" in tools
+    assert "never appears" in tools["browser_fill_profile"].lower() or "never appear" in tools["browser_fill_profile"].lower()
+    assert "browser_fill_profile" in tools["browser_type"].lower()
+    assert "disabled" in tools["browser_click"].lower()
+    assert "interactive" in tools["browser_click"].lower()
+    assert "browser_click" in tools["browser_submit"].lower()
+    assert "calendar_add" in tools
+    assert "website" in tools["calendar_add"].lower()
+
+
+class _LoopPage:
+    def read(self):
+        return "URL: https://example.com/\n\nInteractive:\n(none)\n\nContent:\nhi", ""
+
+    def open(self, url: str) -> None:
+        return None
+
+    def location(self) -> str:
+        return "https://example.com/"
+
+    def needs_login(self) -> bool:
+        return False
+
+
+class _NoCal:
+    def connected(self, account_id: str) -> bool:
+        return False
+
+    def events(self, account_id: str, start: str = "", end: str = ""):
+        return []
+
+    def search(self, account_id: str, query: str):
+        return []
+
+    def free_busy(self, account_id: str, start: str, end: str, minutes: int):
+        return []
+
+    def add(self, account_id: str, title: str, when: str) -> str:
+        return "1"
+
+    def update(self, account_id: str, event_id: str, **fields) -> None:
+        return None
+
+    def delete(self, account_id: str, event_id: str) -> None:
+        return None

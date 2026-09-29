@@ -164,6 +164,7 @@ class PlaywrightPage:
     def open(self, url: str) -> None:
         self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
         self.clear_gate()
+        self.settle()
 
     def read(self) -> tuple[str, str]:
         data = self._collect()
@@ -232,44 +233,93 @@ class PlaywrightPage:
                 values.append(value)
         return [value for value in values if value]
 
-    def settle(self) -> None:
+    def settle(self, *, timeout_ms: int = 4000) -> None:
+        """Wait until a SPA route finishes painting, not just a fixed pause."""
         page = self._page
         wait = getattr(page, "wait_for_load_state", None)
         if callable(wait):
             try:
-                wait("domcontentloaded", timeout=5000)
+                wait("domcontentloaded", timeout=min(5000, timeout_ms))
             except Exception:
                 pass
-        pause = getattr(page, "wait_for_timeout", None)
-        if callable(pause):
+        deadline = time.monotonic() + timeout_ms / 1000
+        last = ""
+        stable = 0
+        while time.monotonic() < deadline:
             try:
-                pause(150)
+                if int(self._fields("input[type='password']").count()) > 0:
+                    return
             except Exception:
                 pass
+            try:
+                url = str(getattr(page, "url", "") or "")
+                inputs = int(self._fields("input, textarea, select").count())
+                try:
+                    body_len = len(str(page.locator("body").inner_text())[:800])
+                except Exception:
+                    body_len = 0
+                fingerprint = f"{url}|{inputs}|{body_len}"
+            except Exception:
+                url = ""
+                inputs = 0
+                fingerprint = last
+            # A /login URL with no fields yet is still loading the SPA form.
+            waiting_for_form = inputs == 0 and bool(_LOGIN_PATH.search(url))
+            if fingerprint and fingerprint == last:
+                stable += 1
+                if stable >= 2 and not waiting_for_form:
+                    return
+            else:
+                stable = 0
+                last = fingerprint
+            pause = getattr(page, "wait_for_timeout", None)
+            if callable(pause):
+                try:
+                    pause(200)
+                    continue
+                except Exception:
+                    pass
+            time.sleep(0.2)
 
     def click(self, target: str, role: str = "", ref: str = "") -> None:
-        if ref and self._act_ref(ref, "click"):
-            return
+        if ref:
+            if self._act_ref(ref, "click"):
+                return
         if role in {"link", "button"}:
             try:
                 control = self._page.get_by_role(role, name=target)
-                if int(control.count()) > 0:
+                count = int(control.count())
+                if count > 1:
+                    raise RuntimeError(_ambiguous_message(target, count, role))
+                if count > 0:
+                    _raise_if_disabled(control.first, target)
                     _call_timeout(control.first.click, 5000)
                     return
+            except RuntimeError:
+                raise
             except Exception:
                 pass
         try:
             control = self._page.get_by_text(target, exact=True)
-            if int(control.count()) > 0:
+            count = int(control.count())
+            if count > 1 and not ref:
+                raise RuntimeError(_ambiguous_message(target, count, "control"))
+            if count > 0:
+                _raise_if_disabled(control.first, target)
                 _call_timeout(control.first.click, 5000)
                 return
+        except RuntimeError:
+            raise
         except Exception:
             pass
         try:
             control = self._page.get_by_text(target)
             if int(control.count()) > 0:
+                _raise_if_disabled(control.first, target)
                 _call_timeout(control.first.click, 5000)
                 return
+        except RuntimeError:
+            raise
         except Exception:
             pass
         raise RuntimeError(f'no clickable control matching "{target}"')
@@ -392,6 +442,15 @@ class PlaywrightPage:
                     continue
                 target = locator.first
                 if action == "click":
+                    try:
+                        disabled = target.get_attribute("disabled")
+                        aria = target.get_attribute("aria-disabled")
+                    except Exception:
+                        disabled, aria = None, None
+                    if disabled is not None or aria == "true":
+                        raise RuntimeError(
+                            f'control [{ref}] is disabled — fill required fields first, then click again'
+                        )
                     _call_timeout(target.click, 5000)
                 elif action == "select":
                     _call_timeout(target.select_option, 5000, text)
@@ -400,6 +459,8 @@ class PlaywrightPage:
                 else:
                     _call_timeout(target.fill, 5000, text)
                 return True
+            except RuntimeError:
+                raise
             except Exception:
                 continue
         return False
@@ -441,7 +502,56 @@ class PlaywrightPage:
         return False
 
     def submit(self) -> None:
-        self._page.locator("button[type='submit'], input[type='submit']").first.click()
+        if self._submit_in_password_form():
+            return
+        buttons = self._page.locator("button[type='submit'], input[type='submit']")
+        chosen = _pick_submit_button(buttons)
+        if chosen is not None:
+            chosen.click()
+            return
+        if self._click_named_submit():
+            return
+        if self._click_submit_ref():
+            return
+        raise RuntimeError(
+            "no type=submit control — if Interactive lists a send/book button, browser_click that ref"
+        )
+
+    def _click_named_submit(self) -> bool:
+        """Click a visible booking/send button that is not type=submit."""
+        for label in _FORM_SUBMIT_LABELS:
+            try:
+                control = self._page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE))
+                count = int(control.count())
+                if count <= 0:
+                    control = self._page.get_by_role("button", name=re.compile(label, re.IGNORECASE))
+                    count = int(control.count())
+                if count <= 0:
+                    continue
+                target = control.nth(count - 1)
+                _raise_if_disabled(target, label)
+                _call_timeout(target.click, 5000)
+                return True
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
+        return False
+
+    def _click_submit_ref(self) -> bool:
+        """Use the latest Interactive snapshot to find a submit-like button."""
+        best_ref = ""
+        best_score = 0
+        for ref, (role, name) in self._refs.items():
+            if role != "button":
+                continue
+            score = _submit_score(name)
+            if score > best_score:
+                best_score = score
+                best_ref = ref
+        if not best_ref:
+            return False
+        return bool(self._act_ref(best_ref, "click"))
 
     def needs_login(self) -> bool:
         if int(self._fields("input[type='password']").count()) > 0:
@@ -527,18 +637,31 @@ class PlaywrightPage:
         return found
 
     def _press(self, labels: tuple[str, ...]) -> None:
+        if self._press_in_password_form(labels):
+            return
         for label in labels:
             try:
                 control = self._page.get_by_role("button", name=label)
-                if int(control.count()) > 0:
-                    control.first.click()
+                count = int(control.count())
+                if count > 0:
+                    # Prefer the last match: header/nav often repeats the label first.
+                    control.nth(count - 1).click()
                     return
             except Exception:
                 pass
             try:
                 control = self._page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE))
-                if int(control.count()) > 0:
-                    control.first.click()
+                count = int(control.count())
+                if count > 0:
+                    control.nth(count - 1).click()
+                    return
+            except Exception:
+                pass
+            try:
+                control = self._page.get_by_text(label, exact=True)
+                count = int(control.count())
+                if count > 0:
+                    control.nth(count - 1).click()
                     return
             except Exception:
                 pass
@@ -550,6 +673,47 @@ class PlaywrightPage:
             except Exception:
                 continue
         self.submit()
+
+    def _press_in_password_form(self, labels: tuple[str, ...]) -> bool:
+        try:
+            forms = self._page.locator("form:has(input[type='password'])")
+            if int(forms.count()) == 0:
+                return False
+            form = forms.first
+        except Exception:
+            return False
+        for label in labels:
+            try:
+                buttons = form.get_by_role("button", name=label)
+                count = int(buttons.count())
+                if count > 0:
+                    buttons.nth(count - 1).click()
+                    return True
+            except Exception:
+                continue
+        try:
+            submits = form.locator("button[type='submit'], input[type='submit']")
+            chosen = _pick_submit_button(submits)
+            if chosen is not None:
+                chosen.click()
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _submit_in_password_form(self) -> bool:
+        try:
+            forms = self._page.locator("form:has(input[type='password'])")
+            if int(forms.count()) == 0:
+                return False
+            submits = forms.first.locator("button[type='submit'], input[type='submit']")
+            chosen = _pick_submit_button(submits)
+            if chosen is not None:
+                chosen.click()
+                return True
+        except Exception:
+            return False
+        return False
 
     def needs_code(self) -> bool:
         if int(self._page.locator(_CODE_SELECTOR).count()) > 0:
@@ -608,34 +772,56 @@ def open_chromium(url: str, profile: Path | None = None) -> PlaywrightPage:
     if executable is None:
         raise RuntimeError("Chromium is not installed. Run playwright install chromium on this machine.")
     playwright = sync_playwright().start()
-    if profile is not None:
-        profile.mkdir(parents=True, exist_ok=True)
-        context = playwright.chromium.launch_persistent_context(
-            str(profile),
-            headless=True,
-            executable_path=str(executable),
-            accept_downloads=True,
-        )
-        page = context.pages[0] if context.pages else context.new_page()
+    browser = None
+    context = None
+    try:
+        if profile is not None:
+            profile.mkdir(parents=True, exist_ok=True)
+            context = playwright.chromium.launch_persistent_context(
+                str(profile),
+                headless=True,
+                executable_path=str(executable),
+                accept_downloads=True,
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            opened = PlaywrightPage(page)
+            opened._profile = str(profile)
+            opened.bind_context(context)
+            opened._playwright = playwright
+            opened._context = context
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            opened.clear_gate()
+            return opened
+        browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
+        context = browser.new_context(accept_downloads=True)
+        page = context.new_page()
         opened = PlaywrightPage(page)
-        opened._profile = str(profile)
         opened.bind_context(context)
         opened._playwright = playwright
+        opened._browser = browser
         opened._context = context
         page.goto(url, wait_until="domcontentloaded", timeout=25000)
         opened.clear_gate()
         return opened
-    browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
-    context = browser.new_context(accept_downloads=True)
-    page = context.new_page()
-    opened = PlaywrightPage(page)
-    opened.bind_context(context)
-    opened._playwright = playwright
-    opened._browser = browser
-    opened._context = context
-    page.goto(url)
-    opened.clear_gate()
-    return opened
+    except Exception:
+        # A failed goto must not leave sync Playwright's asyncio loop running on
+        # this thread — the next open would raise "Sync API inside the asyncio loop".
+        _abandon_playwright(playwright, browser=browser, context=context)
+        raise
+
+
+def _abandon_playwright(playwright: Any, *, browser: Any = None, context: Any = None) -> None:
+    for closer in (context, browser):
+        if closer is None:
+            continue
+        try:
+            closer.close()
+        except Exception:
+            pass
+    try:
+        playwright.stop()
+    except Exception:
+        pass
 
 
 class _BrowserCalls:
@@ -680,15 +866,15 @@ class Desk:
 
     def open(self, account_id: str, url: str) -> Page:
         def work() -> Page:
-            _web_url(url)
+            target = _web_url(url)
             with self._lock:
                 current = self.pages.get(account_id)
             if current is None:
-                current = self._launch(account_id, url)
+                current = self._launch(account_id, target)
                 with self._lock:
                     self.pages[account_id] = current
                 return current
-            current.open(url)
+            current.open(target)
             return current
 
         return self._calls.run(work)
@@ -726,7 +912,8 @@ _CREDENTIALS = re.compile(
     r"(?:user(?:name)?|e-?mail|login)\s*(?:is|:)?\s*(\S+)\s+(?:and\s+)?(?:my\s+)?(?:password|passcode)\s*(?:is|:)?\s*(\S.*?)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
-_CANCEL = re.compile(r"^\s*(?:cancel|stop|never mind|nevermind)\s*\.?\s*$", re.IGNORECASE)
+_CANCEL_ONLY = re.compile(r"^\s*(?:cancel|stop|never mind|nevermind)\s*\.?\s*$", re.IGNORECASE)
+_CANCEL_LEAD = re.compile(r"^\s*(?:cancel|stop|never mind|nevermind)\b", re.IGNORECASE)
 
 
 def _page_url(task: str) -> str | None:
@@ -755,12 +942,18 @@ class Browser(Capability):
             name="browser_open",
             description=(
                 "Open an http or https URL and return a text snapshot with URL, Interactive refs, and Content. "
+                "Use this for any website task: booking, shopping, reading, signing in, filling forms. "
+                "Pass a full URL such as https://example.com (a bare host is accepted and treated as https). "
+                "If this site is already open, prefer browser_click/read on the current page instead of opening the homepage again. "
+                "Never pass a booking choice word (clinic, home visit, consultation) as the url — click that option on the page. "
+                "Pass a real host or https URL; do not invent hosts from placeholders like https://[ORG_1]. "
                 "To click or type, use Interactive refs (for example target 1) or the visible name. "
                 "Use browser_select for dropdowns, browser_scroll to reveal more, browser_press for Enter or Tab, "
                 "browser_back to leave a page. Use browser_hover for menus, browser_type_focused when the caret is already in a field. "
                 "When a snapshot says a saved sign-in exists, use browser_fill_username and browser_fill_password; never invent the password. "
+                "When a snapshot lists saved profile fields, use browser_fill_profile for those — never type email, phone, or name yourself. "
                 "When Pages lists more than one entry, browser_switch focuses that popup by index. "
-                "If Content ends with (more below), scroll before answering."
+                "If Content ends with (more below), scroll only to read more Content — Interactive refs are already listed and clickable."
             ),
             parameters={
                 "type": "object",
@@ -778,13 +971,26 @@ class Browser(Capability):
         ),
         Tool(
             name="browser_click",
-            description="Click an interactive ref from the snapshot (for example 1) or a visible name.",
+            description=(
+                "Click an interactive ref from the snapshot (for example 1) or a visible name. "
+                "Prefer a ref when the same name appears more than once. "
+                "Use this to follow booking buttons, menus, and links on the open page. "
+                "When the person describes a choice in plain language (clinic, home visit, consultation), "
+                "match it to a control and click — do not ask them to pick 1/2/3. "
+                "If the snapshot marks a control disabled, fill required fields first. "
+                "A button listed under Interactive is available — click its ref; do not claim it is missing."
+            ),
             parameters={"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]},
             effect=Effect.MUTATE,
         ),
         Tool(
             name="browser_type",
-            description="Type into a textbox ref or labeled field that is not a password.",
+            description=(
+                "Type into a textbox ref or labeled field that is not a password. "
+                "Prefer an Interactive ref number (for example 12). "
+                "For email, phone, or name, prefer browser_fill_profile when a saved profile exists — "
+                "never invent contact information."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"target": {"type": "string"}, "text": {"type": "string"}},
@@ -889,6 +1095,24 @@ class Browser(Capability):
             effect=Effect.EXTERNAL,
         ),
         Tool(
+            name="browser_fill_profile",
+            description=(
+                "Fill one saved personal detail into a textbox ref or label. "
+                "field is given_name, family_name, full_name, email, phone, address, city, postal_code, or country. "
+                "The value is loaded from this account's profile and never appears in the tool arguments. "
+                "Use when the snapshot lists saved profile fields."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "target": {"type": "string"},
+                },
+                "required": ["field", "target"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
             name="browser_type_password",
             description="Type a password the person just provided. Waits for confirmation.",
             parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
@@ -897,7 +1121,10 @@ class Browser(Capability):
         ),
         Tool(
             name="browser_submit",
-            description="Submit a form or send something from the screen.",
+            description=(
+                "Submit a login-style form that has a type=submit control. "
+                "For booking or named buttons such as Send bestilling, prefer browser_click on that Interactive ref."
+            ),
             parameters={"type": "object", "properties": {}},
             effect=Effect.EXTERNAL,
         ),
@@ -925,10 +1152,15 @@ class Browser(Capability):
         waiting = self._wait(account_id, conversation_id)
         if waiting is None:
             return None
-        if _CANCEL.match(text):
+        if _CANCEL_ONLY.match(text):
             self._codes.pop((account_id, conversation_id), None)
             self._clear_wait(account_id, conversation_id)
             return SecretAccepted(reply="Sign-in cancelled.")
+        if _CANCEL_LEAD.match(text):
+            # "never mind, what is 2+2?" abandons the prompt and continues as ordinary chat.
+            self._codes.pop((account_id, conversation_id), None)
+            self._clear_wait(account_id, conversation_id)
+            return None
         if waiting.get("kind") == "code":
             code = _parse_code(text)
             if code is None:
@@ -975,8 +1207,8 @@ class Browser(Capability):
 
     def status(self, account_id: str) -> str:
         if self._page_open(account_id):
-            return "browser: page open"
-        return "browser: available"
+            return "browser: page open — use click/type/submit to finish website tasks here"
+        return "browser: available — use browser_open for websites"
 
     def _page_open(self, account_id: str) -> bool:
         if self.desk is not None:
@@ -1000,13 +1232,21 @@ class Browser(Capability):
         if tool_name == "browser_open":
             url = str(arguments.get("url", ""))
             try:
+                url = _web_url(url)
+            except ValueError as exc:
+                if self._page_open(account_id):
+                    return (
+                        f"{exc}. A page is already open — use browser_click with an Interactive ref "
+                        "for the person's choice, not browser_open."
+                    )
+                return str(exc)
+            try:
                 if self.desk is not None:
                     self.desk.open(account_id, url)
                 else:
-                    _web_url(url)
                     self._current(account_id).open(url)
-            except ValueError:
-                raise
+            except ValueError as exc:
+                return str(exc)
             except Exception as exc:
                 return f"could not open the page. {_open_failure(exc)}"
             try:
@@ -1020,8 +1260,14 @@ class Browser(Capability):
             if tool_name == "browser_click":
                 target = str(arguments.get("target", ""))
                 before = self._glance(account_id)
-                role, name, ref = self._resolve(account_id, target, prefer=("link", "button"))
-                self._use(account_id, lambda page: _click(page, name, role, ref=ref))
+                try:
+                    role, name, ref = self._resolve(account_id, target, prefer=("link", "button"))
+                except RuntimeError as exc:
+                    return str(exc)
+                try:
+                    self._use(account_id, lambda page: _click(page, name, role, ref=ref))
+                except Exception as exc:
+                    return _action_failure(exc)
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"clicked {target}\n{_action_diff(before, after)}\n{after}"
@@ -1029,8 +1275,14 @@ class Browser(Capability):
                 target = str(arguments.get("target", ""))
                 text = str(arguments.get("text", ""))
                 before = self._glance(account_id)
-                role, name, ref = self._resolve(account_id, target, prefer=("textbox",))
-                self._use(account_id, lambda page: _type_text(page, name, text, role, ref=ref))
+                try:
+                    role, name, ref = self._resolve(account_id, target, prefer=("textbox", "searchbox", "combobox"))
+                except RuntimeError as exc:
+                    return str(exc)
+                try:
+                    self._use(account_id, lambda page: _type_text(page, name, text, role, ref=ref))
+                except Exception as exc:
+                    return _action_failure(exc)
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"typed into {target}\n{_action_diff(before, after)}\n{after}"
@@ -1038,7 +1290,10 @@ class Browser(Capability):
                 target = str(arguments.get("target", ""))
                 value = str(arguments.get("value", ""))
                 before = self._glance(account_id)
-                role, name, ref = self._resolve(account_id, target, prefer=("combobox",))
+                try:
+                    role, name, ref = self._resolve(account_id, target, prefer=("combobox",))
+                except RuntimeError as exc:
+                    return str(exc)
                 self._use(account_id, lambda page: _select_option(page, name, value, ref=ref))
                 self._settle(account_id)
                 after = self._observe(account_id)
@@ -1049,7 +1304,10 @@ class Browser(Capability):
                 before = self._glance(account_id)
                 ref = ""
                 if target:
-                    _role, _name, ref = self._resolve(account_id, target, prefer=())
+                    try:
+                        _role, _name, ref = self._resolve(account_id, target, prefer=())
+                    except RuntimeError as exc:
+                        return str(exc)
                 self._use(account_id, lambda page: _scroll(page, direction, ref=ref))
                 self._settle(account_id)
                 after = self._observe(account_id)
@@ -1064,7 +1322,10 @@ class Browser(Capability):
             if tool_name == "browser_hover":
                 target = str(arguments.get("target", ""))
                 before = self._glance(account_id)
-                role, name, ref = self._resolve(account_id, target, prefer=("link", "button", "menuitem"))
+                try:
+                    role, name, ref = self._resolve(account_id, target, prefer=("link", "button", "menuitem"))
+                except RuntimeError as exc:
+                    return str(exc)
                 self._use(account_id, lambda page: _hover(page, name, role, ref=ref))
                 self._settle(account_id)
                 after = self._observe(account_id)
@@ -1097,9 +1358,24 @@ class Browser(Capability):
                 return self._fill_saved(account_id, str(arguments.get("target", "")), kind="user")
             if tool_name == "browser_fill_password":
                 return self._fill_saved(account_id, str(arguments.get("target", "")), kind="password")
+            if tool_name == "browser_fill_profile":
+                return self._fill_profile(
+                    account_id,
+                    str(arguments.get("field", "")),
+                    str(arguments.get("target", "")),
+                )
             if tool_name == "browser_submit":
                 before = self._glance(account_id)
-                self._use(account_id, lambda page: page.submit())
+                try:
+                    self._use(account_id, lambda page: page.submit())
+                except Exception as exc:
+                    role, name, ref = self._submit_from_refs(account_id)
+                    if not ref:
+                        return _action_failure(exc)
+                    try:
+                        self._use(account_id, lambda page: _click(page, name, role, ref=ref))
+                    except Exception as click_exc:
+                        return _action_failure(click_exc)
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"submitted\n{_action_diff(before, after)}\n{after}"
@@ -1132,11 +1408,81 @@ class Browser(Capability):
             self._refs[account_id] = _parse_refs(text)
         text = _hide(text, self._known_secrets(account_id) + self._once.pop(account_id, []))
         note = self._login_notes.pop(account_id, "")
+        profile_note = self._profile_note(account_id, text)
         if note:
             text = f"{note}\n\n{text}"
+        if profile_note:
+            text = f"{profile_note}\n\n{text}"
         if len(text) > 4000:
             text = text[:4000]
         return text
+
+    def _profile_note(self, account_id: str, snapshot: str) -> str:
+        if self.broker is None:
+            return ""
+        from robin.profile import filled_keys, parse_profile, PROFILE_SECRET
+
+        try:
+            fields = parse_profile(self.broker.reveal(account_id, PROFILE_SECRET))
+        except KeyError:
+            return ""
+        present = filled_keys(fields)
+        if not present:
+            return ""
+        lowered = snapshot.lower()
+        if not any(
+            needle in lowered
+            for needle in (
+                "textbox",
+                "email",
+                "phone",
+                "fornavn",
+                "etternavn",
+                "name",
+                "navn",
+                "address",
+                "adresse",
+            )
+        ):
+            return ""
+        return (
+            "Saved profile can fill: "
+            + ", ".join(present)
+            + ". Use browser_fill_profile with field and target ref — never type these values."
+        )
+
+    def _fill_profile(self, account_id: str, field: str, target: str) -> str:
+        from robin.profile import normalize_field, profile_value, parse_profile, PROFILE_SECRET
+
+        if self.broker is None:
+            return "no saved profile for this account"
+        try:
+            fields = parse_profile(self.broker.reveal(account_id, PROFILE_SECRET))
+        except KeyError:
+            return "no saved profile for this account — set personal details in the app"
+        key = normalize_field(field) or field.strip()
+        secret = profile_value(fields, key)
+        if not secret:
+            label = normalize_field(field) or field.strip() or "that field"
+            return f"no saved {label} in profile — ask the person or set it in the app"
+        prefer = ("textbox", "searchbox", "combobox")
+        needle = target.strip() or key
+        try:
+            role, name, ref = self._resolve(account_id, needle, prefer=prefer)
+        except RuntimeError as exc:
+            return str(exc)
+        before = self._glance(account_id)
+        try:
+            self._use(
+                account_id,
+                lambda page: _type_text(page, name or needle, secret, role, ref=ref),
+            )
+        except Exception as exc:
+            return _action_failure(exc)
+        self._settle(account_id)
+        after = self._observe(account_id)
+        label = normalize_field(field) or field.strip() or "profile"
+        return f"filled saved {label} into {needle}\n{_action_diff(before, after)}\n{after}"
 
     def _fill_saved(self, account_id: str, target: str, *, kind: str) -> str:
         url = self._url(account_id)
@@ -1183,19 +1529,49 @@ class Browser(Capability):
         if key in refs:
             role, name = refs[key]
             return role, name, key
-        for ref, (role, name) in refs.items():
-            if name == key and (not prefer or role in prefer):
-                return role, name, ref
-        for ref, (role, name) in refs.items():
-            if name == key:
-                return role, name, ref
+        exact = [(ref, role, name) for ref, (role, name) in refs.items() if name == key]
+        preferred = [item for item in exact if not prefer or item[1] in prefer]
+        chosen = preferred or exact
+        if len(chosen) > 1:
+            listing = ", ".join(f'[{ref}] {role} "{name}"' for ref, role, name in chosen[:6])
+            raise RuntimeError(
+                f'"{key}" matches {len(chosen)} controls ({listing}). Use a ref number to choose one.'
+            )
+        if len(chosen) == 1:
+            ref, role, name = chosen[0]
+            return role, name, ref
         lowered = key.lower()
-        for ref, (role, name) in refs.items():
-            if prefer and role not in prefer:
-                continue
-            if lowered and lowered in name.lower():
-                return role, name, ref
+        fuzzy = [
+            (ref, role, name)
+            for ref, (role, name) in refs.items()
+            if lowered and lowered in name.lower() and (not prefer or role in prefer)
+        ]
+        if len(fuzzy) > 1:
+            listing = ", ".join(f'[{ref}] {role} "{name}"' for ref, role, name in fuzzy[:6])
+            raise RuntimeError(
+                f'"{key}" matches {len(fuzzy)} controls ({listing}). Use a ref number to choose one.'
+            )
+        if len(fuzzy) == 1:
+            ref, role, name = fuzzy[0]
+            return role, name, ref
+        generic = _generic_field_match(key, refs, prefer=prefer)
+        if generic is not None:
+            return generic
         return "", key, ""
+
+    def _submit_from_refs(self, account_id: str) -> tuple[str, str, str]:
+        """Pick the best Interactive submit-like button when type=submit is missing."""
+        refs = self._refs.get(account_id) or {}
+        best: tuple[str, str, str] | None = None
+        best_score = 0
+        for ref, (role, name) in refs.items():
+            if role != "button":
+                continue
+            score = _submit_score(name)
+            if score > best_score:
+                best_score = score
+                best = (role, name, ref)
+        return best or ("", "", "")
 
     def _url(self, account_id: str) -> str:
         try:
@@ -1307,6 +1683,11 @@ class Browser(Capability):
         # Auto-fill did not finish (blocked, stuck, or a glitch). Keep the secret and
         # hand the live login form to the operator loop so the model can adapt with
         # fill_saved_username / fill_saved_password on this site's refs.
+        try:
+            landed_after = str(self._use(account_id, lambda page: page.location()))
+        except Exception:
+            landed_after = landed
+        self._save(account_id, _hosts(url, landed_after), user, password)
         self._login_notes[account_id] = (
             "Saved sign-in exists for this site, but the automatic fill did not finish. "
             "Use Interactive refs with fill_saved_username and fill_saved_password, "
@@ -1429,7 +1810,15 @@ class Browser(Capability):
         if self.broker is None:
             return []
         found: list[str] = []
+        from robin.profile import PROFILE_SECRET, parse_profile, secret_values
+
         for name in self.broker.names(account_id):
+            if name == PROFILE_SECRET:
+                try:
+                    found.extend(secret_values(parse_profile(self.broker.reveal(account_id, name))))
+                except KeyError:
+                    pass
+                continue
             if not name.startswith("site:"):
                 continue
             try:
@@ -1464,9 +1853,23 @@ def _call_timeout(method: Any, timeout_ms: int, *args: Any) -> Any:
         return method(*args)
 
 
+def _raise_if_disabled(locator: Any, target: str) -> None:
+    try:
+        disabled = locator.get_attribute("disabled")
+        aria = locator.get_attribute("aria-disabled")
+    except Exception:
+        return
+    if disabled is not None or aria == "true":
+        raise RuntimeError(
+            f'"{target}" is disabled — fill required fields first, then click again'
+        )
+
+
 def _action_failure(exc: Exception) -> str:
     text = str(exc).strip()
     line = text.splitlines()[0].strip() if text else ""
+    if "disabled" in line.lower() and "fill required" in line.lower():
+        return line[:180]
     if "Timeout" in type(exc).__name__ or "Timeout" in text:
         if "get_by_label" in text:
             return "could not find that field on the page"
@@ -1494,6 +1897,7 @@ _LOGIN_BLOCK = re.compile(
     re.IGNORECASE,
 )
 _SIGNED_IN_PATH = re.compile(r"/(?:browse|profiles?|kids|gateway)(?:/|$|\?)", re.IGNORECASE)
+_LOGIN_PATH = re.compile(r"/(?:log[\s_-]*in|sign[\s_-]*in|auth|account|session)(?:/|$|\?)", re.IGNORECASE)
 _LOGIN_LABELS = ("Logg inn", "Log in", "Sign in", "Login", "Continue", "Fortsett")
 _LOGIN_CONTINUE = ("Continue", "Next", "Fortsett", "Neste", "Logg inn", "Log in", "Sign in")
 _LOGIN_SUBMIT = ("Logg inn", "Log in", "Sign in", "Continue", "Fortsett", "Submit", "Send")
@@ -1518,12 +1922,122 @@ def _reach_login(page: Page, task: str) -> None:
     if not asked and not (len(text) <= 400 and _LOGIN_WORD.search(text)):
         return
     for label in _LOGIN_LABELS:
-        try:
-            page.click(label)
-        except Exception:
+        if not _click_login_entry(page, label):
             continue
+        _settle(page)
+        awaiter = getattr(page, "_await_selector", None)
+        if callable(awaiter):
+            try:
+                awaiter(f"{_USER_SELECTOR}, input[type='password']", timeout_ms=5000)
+            except TypeError:
+                try:
+                    awaiter(f"{_USER_SELECTOR}, input[type='password']")
+                except Exception:
+                    pass
+            except Exception:
+                pass
         if page.needs_login():
             return
+
+
+def _click_login_entry(page: Page, label: str) -> bool:
+    """Open a sign-in form. Prefer the first matching control; ambiguity is ok here."""
+    raw = getattr(page, "_page", None)
+    if raw is not None:
+        for role in ("button", "link"):
+            try:
+                control = raw.get_by_role(role, name=label)
+                if int(control.count()) > 0:
+                    _call_timeout(control.first.click, 5000)
+                    return True
+            except Exception:
+                continue
+    click = getattr(page, "click", None)
+    if not callable(click):
+        return False
+    try:
+        click(label)
+        return True
+    except RuntimeError as exc:
+        # Ambiguous name: still take the first text match for navigation into login.
+        if "matches" not in str(exc) or raw is None:
+            return False
+        try:
+            control = raw.get_by_text(label, exact=True)
+            if int(control.count()) == 0:
+                control = raw.get_by_text(label)
+            if int(control.count()) > 0:
+                _call_timeout(control.first.click, 5000)
+                return True
+        except Exception:
+            return False
+        return False
+    except Exception:
+        return False
+
+
+_FORGOT_LABEL = re.compile(r"forgot|glemt|reset\s+password|glemt\s+passord", re.IGNORECASE)
+_FORM_SUBMIT_SKIP = re.compile(
+    r"tilbake|back|cancel|avbryt|close|lukk|forgot|glemt|min side|bestill time",
+    re.IGNORECASE,
+)
+_FORM_SUBMIT_LABELS = (
+    "Send bestilling",
+    "Send booking",
+    "Send",
+    "Submit",
+    "Book",
+    "Bestill",
+    "Confirm",
+    "Bekreft",
+    "Place order",
+    "Complete",
+    "Fullfør",
+)
+_SUBMIT_SCORE = (
+    (re.compile(r"\bsend\b", re.IGNORECASE), 10),
+    (re.compile(r"\bsubmit\b", re.IGNORECASE), 10),
+    (re.compile(r"\bbekreft\b|\bconfirm\b", re.IGNORECASE), 8),
+    (re.compile(r"\bbook\b|\bbestill\b", re.IGNORECASE), 5),
+    (re.compile(r"\bfullf[oø]r\b|\bcomplete\b|\bplace order\b", re.IGNORECASE), 7),
+    (re.compile(r"\bfortsett\b|\bcontinue\b|\bnext\b|\bneste\b", re.IGNORECASE), 3),
+)
+
+
+def _submit_score(name: str) -> int:
+    text = (name or "").strip()
+    if not text or _FORM_SUBMIT_SKIP.search(text) or _FORGOT_LABEL.search(text):
+        return 0
+    return sum(weight for pattern, weight in _SUBMIT_SCORE if pattern.search(text))
+
+
+def _ambiguous_message(target: str, count: int, kind: str) -> str:
+    return f'"{target}" matches {count} {kind}s. Use a ref number from the snapshot to choose one.'
+
+
+def _pick_submit_button(buttons: Any) -> Any | None:
+    """Prefer a real submit control; skip forgot-password style buttons."""
+    try:
+        total = int(buttons.count())
+    except Exception:
+        return None
+    if total <= 0:
+        return None
+    for index in range(total - 1, -1, -1):
+        button = buttons.nth(index)
+        try:
+            text = str(button.inner_text() or "")
+        except Exception:
+            text = ""
+        if not text:
+            try:
+                text = str(button.get_attribute("value") or button.get_attribute("aria-label") or "")
+            except Exception:
+                text = ""
+        if _FORGOT_LABEL.search(text):
+            continue
+        return button
+    return buttons.nth(total - 1)
 
 
 def _await_signed_in(page: Page, *, before: str, timeout_ms: int | None = None) -> bool:
@@ -1596,10 +2110,19 @@ def _login_blocked(page: Page) -> bool:
 
 
 def _page_sample(page: Page) -> str:
+    """Text used to detect login errors. Prefer body/Content over Interactive refs."""
+    raw = getattr(page, "_page", None)
+    if raw is not None:
+        try:
+            return str(raw.locator("body").inner_text())[:2500]
+        except Exception:
+            pass
     try:
         text, _password = page.read()
     except Exception:
         return ""
+    if "\nContent:\n" in text:
+        return text.split("\nContent:\n", 1)[1][:2500]
     return text[:1200]
 
 
@@ -1705,11 +2228,50 @@ def _wait_name(conversation_id: str) -> str:
     return f"login-wait:{conversation_id}"
 
 
-def _web_url(url: str) -> None:
-    if not (url.startswith("https://") or url.startswith("http://")) or any(char.isspace() for char in url):
+def _web_url(url: str) -> str:
+    """Require http(s) with a real host. Bare hosts like vethjem.no become https://vethjem.no."""
+    cleaned = url.strip()
+    if any(char.isspace() for char in cleaned):
         raise ValueError("url must be http or https")
-    if not url.split("://", 1)[1]:
-        raise ValueError("url must be http or https")
+    if _PLACEHOLDER.search(cleaned):
+        raise ValueError(
+            "url still has an unresolved placeholder — pass a real http(s) URL or a site host, "
+            "not https://[ORG_n]; open the website first, then browser_click page options"
+        )
+    if cleaned.startswith("https://") or cleaned.startswith("http://"):
+        rest = cleaned.split("://", 1)[1]
+        if not rest:
+            raise ValueError("url must be http or https")
+        host = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        if "@" in host:
+            host = host.rsplit("@", 1)[-1]
+        if host.startswith("[") and "]" in host:
+            host = host[1 : host.index("]")]
+        elif ":" in host:
+            host = host.rsplit(":", 1)[0]
+        if not _host_ok(host):
+            raise ValueError(
+                "url must be a real website host — do not open booking choices "
+                "(clinic, home visit) as URLs; use browser_click on the open page"
+            )
+        return cleaned
+    if _SITE.fullmatch(cleaned.lower()) or _SITE.fullmatch(cleaned.split("/", 1)[0].lower()):
+        return "https://" + cleaned
+    raise ValueError("url must be http or https")
+
+
+def _host_ok(host: str) -> bool:
+    name = host.strip().lower().rstrip(".")
+    if not name:
+        return False
+    if name == "localhost":
+        return True
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", name):
+        return True
+    return _SITE.fullmatch(name) is not None
+
+
+_PLACEHOLDER = re.compile(r"\[[A-Z]+_\d+\]")
 
 
 _MAX_INTERACTIVE = 80
@@ -1819,17 +2381,30 @@ _SNAPSHOT_JS = """() => {
     return "";
   };
   const nameOf = (node, role) => {
+    const isField = role === "textbox" || role === "searchbox" || role === "combobox" || role === "password" || role === "spinbutton";
+    const placeholder = cleanLabel(node.getAttribute("placeholder") || "");
+    const looksPrivate = (value) => {
+      const text = String(value || "");
+      if (!text) return false;
+      if (text.includes("@")) return true;
+      if (/\\+?\\d[\\d\\s-]{6,}\\d/.test(text)) return true;
+      return false;
+    };
     const from = [
       node.getAttribute("aria-label"),
       labeledBy(node),
       associatedLabel(node),
-      node.getAttribute("placeholder"),
+      // Prefer name/id over private-looking placeholders so airlock does not turn
+      // the only target string into [EMAIL_n] / [PHONE_n].
+      isField && !looksPrivate(placeholder) ? placeholder : "",
       node.getAttribute("title"),
       node.getAttribute("alt"),
       node.value && (role === "button" || role === "link") ? node.value : "",
-      role === "textbox" || role === "searchbox" || role === "combobox" || role === "password" ? "" : (node.innerText || node.textContent || ""),
+      isField ? "" : (node.innerText || node.textContent || ""),
       node.getAttribute("name"),
       node.id,
+      isField && looksPrivate(placeholder) ? (role === "password" ? "password" : (/@/.test(placeholder) ? "email" : "phone")) : "",
+      isField ? placeholder : "",
     ];
     for (const value of from) {
       const label = cleanLabel(value);
@@ -2114,6 +2689,40 @@ def _parse_refs(snapshot: str) -> dict[str, tuple[str, str]]:
         if match:
             refs[match.group(1)] = (match.group(2), match.group(3))
     return refs
+
+
+def _generic_field_match(
+    target: str,
+    refs: dict[str, tuple[str, str]],
+    *,
+    prefer: tuple[str, ...],
+) -> tuple[str, str, str] | None:
+    """Map airlock-stable labels like email/phone back to the real control."""
+    key = target.strip().lower()
+    predicates = {
+        "email": lambda name: "@" in name or "email" in name.lower() or "e-post" in name.lower() or "epost" in name.lower(),
+        "e-post": lambda name: "@" in name or "email" in name.lower() or "e-post" in name.lower() or "epost" in name.lower(),
+        "phone": lambda name: bool(re.search(r"(\+?\d[\d\s-]{5,}\d)|telefon|phone|mobil|tlf", name.lower())),
+        "telefon": lambda name: bool(re.search(r"(\+?\d[\d\s-]{5,}\d)|telefon|phone|mobil|tlf", name.lower())),
+        "name": lambda name: "name" in name.lower() or "navn" in name.lower() or "fornavn" in name.lower(),
+    }
+    predicate = predicates.get(key)
+    if predicate is None:
+        return None
+    matches = [
+        (ref, role, name)
+        for ref, (role, name) in refs.items()
+        if predicate(name) and (not prefer or role in prefer or role in {"textbox", "searchbox", "combobox"})
+    ]
+    if len(matches) == 1:
+        ref, role, name = matches[0]
+        return role, name, ref
+    if len(matches) > 1:
+        listing = ", ".join(f'[{ref}] {role} "{name}"' for ref, role, name in matches[:6])
+        raise RuntimeError(
+            f'"{target}" matches {len(matches)} controls ({listing}). Use a ref number to choose one.'
+        )
+    return None
 
 
 def _action_diff(before: dict[str, Any] | str, snapshot: str) -> str:

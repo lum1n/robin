@@ -633,7 +633,10 @@ class Desktop(Capability):
     tools = [
         Tool(
             name="desktop_read",
-            description="Read the structured text snapshot of the focused desktop window (URL, interactive refs, content).",
+            description=(
+                "Read the structured text snapshot of a focused desktop OS app window "
+                "(not a website — use browser_open for the web)."
+            ),
             parameters={"type": "object", "properties": {"app": {"type": "string"}}},
             effect=Effect.READ,
         ),
@@ -701,11 +704,16 @@ class Desktop(Capability):
         self._open = open_surface or open_atspi
         self._active = False
         self._last = ""
+        self._ready: bool | None = None
 
     def available_tools(self, account_id: str) -> list[Tool]:
+        if not self._accessible():
+            return []
         return list(self.tools)
 
     def status(self, account_id: str) -> str:
+        if not self._accessible():
+            return "desktop: not available"
         return "desktop: available" if self._active else "desktop: idle"
 
     def records(self, account_id: str) -> list[dict[str, str]]:
@@ -717,7 +725,16 @@ class Desktop(Capability):
         return [{"text": text}]
 
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        surface = self._ensure()
+        if not self._accessible():
+            return "desktop accessibility is not available. Use browser tools for websites."
+        surface = self._surface
+        assert surface is not None
+        try:
+            return self._run(surface, tool_name, arguments)
+        except RuntimeError as exc:
+            return str(exc).strip() or "desktop action failed"
+
+    def _run(self, surface: Surface, tool_name: str, arguments: dict[str, Any]) -> str:
         if tool_name == "desktop_read":
             data = surface.snapshot(str(arguments.get("app", "")))
             text = _format_snapshot(data)
@@ -750,15 +767,24 @@ class Desktop(Capability):
                 data = surface.snapshot()
                 target = _default_sensitive_target(data, tool_name)
             if not target:
-                raise RuntimeError(f"no target for {tool_name}")
+                return f"no target for {tool_name}"
             surface.click(self._resolve(surface, target))
             return self._after(surface, before, f"{tool_name} {target}")
         raise NotImplementedError(tool_name)
 
+    def _accessible(self) -> bool:
+        if self._ready is not None:
+            return self._ready
+        try:
+            if self._surface is None:
+                self._surface = self._open()
+            self._ready = bool(self._surface.available())
+        except Exception:
+            self._ready = False
+        return self._ready
+
     def _ensure(self) -> Surface:
-        if self._surface is None:
-            self._surface = self._open()
-        if not self._surface.available():
+        if not self._accessible() or self._surface is None:
             raise RuntimeError("desktop accessibility is not available")
         return self._surface
 

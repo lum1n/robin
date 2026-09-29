@@ -107,6 +107,27 @@ public actor RobinClient {
         return try JSONDecoder().decode(SecretList.self, from: accepted(raw, status: 200)).connected
     }
 
+    public func profile() async throws -> [String: String] {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/profile", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(ProfileBody.self, from: accepted(raw, status: 200)).fields
+    }
+
+    public func saveProfile(_ fields: [String: String]) async throws -> [String: String] {
+        let body = try encode(ProfileUpdate(accountID: accountID, fields: fields))
+        let raw = try await transport.call(
+            url: try url(path: "/v1/profile"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(ProfileBody.self, from: accepted(raw, status: 200)).fields
+    }
+
     public func threads() async throws -> [String] {
         let raw = try await transport.call(
             url: try url(path: "/v1/threads", query: ["account_id": accountID]),
@@ -307,6 +328,20 @@ private struct SecretBody: Encodable {
 
 private struct SecretList: Decodable {
     var connected: [String]
+}
+
+private struct ProfileUpdate: Encodable {
+    var accountID: String
+    var fields: [String: String]
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case fields
+    }
+}
+
+private struct ProfileBody: Decodable {
+    var fields: [String: String]
 }
 
 private struct ThreadList: Decodable {

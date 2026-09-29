@@ -69,6 +69,10 @@ def dispatch(
         return _post_secret(service, headers, body)
     if method == "GET" and path == "/v1/secrets":
         return _get_secrets(service, headers, query)
+    if method == "POST" and path == "/v1/profile":
+        return _post_profile(service, headers, body)
+    if method == "GET" and path == "/v1/profile":
+        return _get_profile(service, headers, query)
     if method == "POST" and path == "/v1/private":
         return _post_private(service, headers, body)
     if method == "GET" and path == "/v1/private":
@@ -289,6 +293,36 @@ def _get_secrets(service: Service, headers: dict[str, str], query: dict[str, str
         return denied
     names = [name for name in service.assistant.broker.names(query["account_id"]) if name in _CONNECTABLE]
     return 200, {"connected": names}
+
+
+def _post_profile(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    from robin.profile import PROFILE_FIELDS, filled_keys
+
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    fields = body.get("fields")
+    if not isinstance(fields, dict):
+        return 400, {"error": "fields are required"}
+    updates = {key: fields[key] for key in PROFILE_FIELDS if key in fields}
+    if not updates and fields:
+        return 400, {"error": "fields are required"}
+    saved = service.assistant.set_profile(account_id, updates)
+    return 200, {"fields": saved, "present": filled_keys(saved)}
+
+
+def _get_profile(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    from robin.profile import filled_keys
+
+    account_id = query.get("account_id")
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    fields = service.assistant.get_profile(account_id)
+    return 200, {"fields": fields, "present": filled_keys(fields)}
 
 
 def _post_private(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:

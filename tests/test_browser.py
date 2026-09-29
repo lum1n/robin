@@ -151,6 +151,73 @@ def test_the_model_sees_text_and_a_password_stays_out() -> None:
     assert PASSWORD not in bea.local_text
 
 
+def test_confirmed_egress_restores_placeholders_before_open() -> None:
+    """Confirm shows the real host; after confirm the open must use it, not [ORG_n]."""
+    opened: list[str] = []
+
+    class Track(MemoryPage):
+        def open(self, url: str) -> None:
+            opened.append(url)
+            self.text = f"URL: {url}\n\nInteractive:\n(none)\n\nContent:\nok"
+
+        def location(self) -> str:
+            return opened[-1] if opened else ""
+
+    page = Track(text="desk")
+    assistant = Assistant()
+    assistant.add(Browser("ada", page))
+    vault = assistant.vaults.get("ada", "book")
+    placeholder = vault.token("ORG", "vethjem.no")
+    held = assistant.invoke("ada", "book", "browser_open", {"url": placeholder})
+    assert held["status"] == "confirm"
+    assert opened == []
+    done = assistant.invoke("ada", "book", "browser_open", {"url": placeholder}, confirmed=True)
+    assert done["status"] == "done"
+    assert opened == ["https://vethjem.no"]
+    assert "url must be" not in done["result"]
+
+
+def test_choice_words_are_not_opened_as_urls() -> None:
+    from robin.capabilities.browser import _web_url
+
+    assert _web_url("vethjem.no") == "https://vethjem.no"
+    assert _web_url("https://vethjem.no/booking") == "https://vethjem.no/booking"
+    for bad in ("clinic", "https://clinic", "http://home", "consultation", "https://[ORG_104]", "[ORG_1]"):
+        try:
+            _web_url(bad)
+        except ValueError as exc:
+            assert "url" in str(exc).lower() or "placeholder" in str(exc).lower() or "host" in str(exc).lower()
+        else:
+            raise AssertionError(bad)
+
+    page = MemoryPage(
+        text=(
+            "URL: https://vethjem.no/booking\n\nInteractive:\n"
+            '[9] button "På klinikken" (page)\n\nContent:\nchoose\n'
+        )
+    )
+    assistant = Assistant()
+    assistant.add(Browser("ada", page))
+    assistant.invoke("ada", "book", "browser_open", {"url": "https://vethjem.no/booking"}, confirmed=True)
+    bad = assistant.invoke("ada", "book", "browser_open", {"url": "https://clinic"}, confirmed=True)
+    assert bad["status"] == "done"
+    assert "browser_click" in bad["result"] or "host" in bad["result"].lower() or "url must" in bad["result"]
+
+
+def test_failed_chromium_open_does_not_poison_the_browser_thread(tmp_path) -> None:
+    from robin.capabilities.browser import Desk, open_chromium, _chromium_executable
+
+    if _chromium_executable() is None:
+        return
+    desk = Desk(open_chromium, profiles=tmp_path)
+    try:
+        desk.open("ada", "https://this-host-definitely-does-not-exist-robin-test.invalid/")
+    except Exception as first:
+        assert "ERR_NAME_NOT_RESOLVED" in str(first) or "Name or service" in str(first) or "net::" in str(first)
+    page = desk.open("ada", "https://example.com/")
+    assert "example.com" in page.location()
+
+
 def test_submit_and_typing_a_password_wait_for_confirm() -> None:
     page = MemoryPage(text="desk", password="")
     assistant = Assistant()
@@ -255,12 +322,9 @@ def test_a_task_opens_one_accounts_page_and_does_not_launch_for_a_bad_url() -> N
     assert PASSWORD not in ada.local_text
     assert "ada page" not in bea.local_text
     before = len(opened)
-    try:
-        assistant.invoke("ada", "display", "browser_open", {"url": "file:///etc/robin/store.key"})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a file url opened a page")
+    denied = assistant.invoke("ada", "display", "browser_open", {"url": "file:///etc/robin/store.key"})
+    assert denied["status"] == "done"
+    assert "http" in denied["result"]
     assert len(opened) == before
     assistant.invoke("ada", "display", "browser_open", {"url": "https://example.test/next"})
     assert opened == ["https://example.test/ada"]
@@ -534,11 +598,11 @@ class _Step:
     def locator(self, selector: str) -> "_StepNode":
         return _StepNode(self, selector)
 
-    def get_by_text(self, target: str) -> "_StepNode":
+    def get_by_text(self, target: str, exact: bool = False) -> "_StepNode":
         return _StepNode(self, target, press=True)
 
     def get_by_role(self, role: str, name: str = "") -> "_StepNode":
-        return _StepNode(self, name, count=0)
+        return _StepNode(self, name if isinstance(name, str) else str(name), count=0)
 
     def get_by_label(self, target: str) -> "_StepNode":
         return _StepNode(self, target)
@@ -816,3 +880,452 @@ def test_page_methods_run_on_the_browser_thread() -> None:
     browser._glance("ada")
     assert seen
     assert all(name == "robin-browser" for name in seen)
+
+
+def test_settle_waits_for_a_late_password_field() -> None:
+    class Spa:
+        def __init__(self) -> None:
+            self.ticks = 0
+            self.url = "https://shop.test/login"
+            self.frames = ()
+            self.main_frame = None
+
+        def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            return None
+
+        def wait_for_timeout(self, ms: int) -> None:
+            self.ticks += 1
+
+        def locator(self, selector: str) -> "_SpaNode":
+            return _SpaNode(self, selector)
+
+    class _SpaNode:
+        def __init__(self, page: Spa, selector: str) -> None:
+            self.page = page
+            self.selector = selector
+
+        def count(self) -> int:
+            if "password" in self.selector:
+                return 1 if self.page.ticks >= 3 else 0
+            if "input" in self.selector or "textarea" in self.selector:
+                return 1 if self.page.ticks >= 3 else 0
+            return 0
+
+        def inner_text(self) -> str:
+            return "Velkommen" if self.page.ticks < 3 else "E-post Passord Logg inn"
+
+        @property
+        def first(self) -> "_SpaNode":
+            return self
+
+    spa = Spa()
+    PlaywrightPage(spa).settle(timeout_ms=5000)
+    assert spa.ticks >= 3
+
+
+def test_submit_skips_forgot_password_and_clicks_login() -> None:
+    class FormPage:
+        def __init__(self) -> None:
+            self.clicked: list[str] = []
+            self.frames = ()
+            self.main_frame = None
+
+        def locator(self, selector: str) -> "_FormNode":
+            return _FormNode(self, selector)
+
+    class _FormNode:
+        def __init__(self, page: FormPage, selector: str, rows: list[str] | None = None) -> None:
+            self.page = page
+            self.selector = selector
+            if rows is not None:
+                self.rows = rows
+            elif "form:has" in selector and "password" in selector:
+                self.rows = ["form"]
+            elif "submit" in selector:
+                self.rows = ["Glemt passord?", "Logg inn"]
+            else:
+                self.rows = []
+
+        def count(self) -> int:
+            return len(self.rows)
+
+        @property
+        def first(self) -> "_FormNode":
+            return self
+
+        @property
+        def last(self) -> "_FormNode":
+            return self.nth(len(self.rows) - 1)
+
+        def nth(self, index: int) -> "_FormNode":
+            return _FormNode(self.page, self.selector, rows=[self.rows[index]])
+
+        def locator(self, selector: str) -> "_FormNode":
+            return _FormNode(self.page, selector)
+
+        def inner_text(self) -> str:
+            return self.rows[0] if self.rows else ""
+
+        def get_attribute(self, name: str) -> str:
+            return ""
+
+        def click(self, timeout: int | None = None) -> None:
+            self.page.clicked.append(self.inner_text())
+
+    page = FormPage()
+    PlaywrightPage(page).submit()
+    assert page.clicked == ["Logg inn"]
+
+
+def test_sign_in_submits_the_form_login_not_the_header() -> None:
+    class LoginSpa:
+        def __init__(self) -> None:
+            self.stage = "ready"
+            self.filled: list[str] = []
+            self.clicked: list[str] = []
+            self.frames = ()
+            self.main_frame = None
+
+        def locator(self, selector: str) -> "_LoginNode":
+            return _LoginNode(self, selector)
+
+        def get_by_role(self, role: str, name: str = "") -> "_LoginNode":
+            label = name if isinstance(name, str) else getattr(name, "pattern", str(name))
+            if "form:has" in getattr(self, "_scope", ""):
+                return _LoginNode(self, f"form-button:{label}", rows=["Logg inn"] if label == "Logg inn" else [])
+            # Header + tab + submit all say Logg inn at page scope.
+            if label == "Logg inn":
+                return _LoginNode(self, f"button:{label}", rows=["header", "tab", "submit"])
+            return _LoginNode(self, f"button:{label}", rows=[])
+
+        def get_by_text(self, target: str, exact: bool = False) -> "_LoginNode":
+            return _LoginNode(self, f"text:{target}", rows=[])
+
+        def get_by_label(self, target: str) -> "_LoginNode":
+            return _LoginNode(self, target, rows=[])
+
+    class _LoginNode:
+        def __init__(self, page: LoginSpa, selector: str, rows: list[str] | None = None) -> None:
+            self.page = page
+            self.selector = selector
+            self.rows = list(rows) if rows is not None else self._default_rows(selector)
+
+        def _default_rows(self, selector: str) -> list[str]:
+            if selector.startswith("form:has") and "password" in selector:
+                return ["form"]
+            if "password" in selector:
+                return ["pw"]
+            if "email" in selector or "text" in selector or "user" in selector:
+                return ["user"]
+            if "submit" in selector:
+                return ["Glemt passord?", "Logg inn"]
+            return []
+
+        def count(self) -> int:
+            return len(self.rows)
+
+        @property
+        def first(self) -> "_LoginNode":
+            return self
+
+        def nth(self, index: int) -> "_LoginNode":
+            return _LoginNode(self.page, self.selector, rows=[self.rows[index]])
+
+        def locator(self, selector: str) -> "_LoginNode":
+            child = _LoginNode(self.page, selector)
+            return child
+
+        def get_by_role(self, role: str, name: str = "") -> "_LoginNode":
+            label = name if isinstance(name, str) else str(name)
+            if label == "Logg inn":
+                return _LoginNode(self.page, f"form-button:{label}", rows=["form-submit"])
+            return _LoginNode(self.page, f"form-button:{label}", rows=[])
+
+        def fill(self, text: str, timeout: int | None = None) -> None:
+            self.page.filled.append(text)
+
+        def click(self, timeout: int | None = None) -> None:
+            self.page.clicked.append(self.rows[0] if self.rows else self.selector)
+
+        def wait_for(self, timeout: int | None = None) -> None:
+            return None
+
+        def inner_text(self) -> str:
+            return self.rows[0] if self.rows else ""
+
+        def get_attribute(self, name: str) -> str:
+            return ""
+
+        def input_value(self) -> str:
+            return ""
+
+    page = LoginSpa()
+    PlaywrightPage(page).sign_in("ada@shop.com", "correct-horse-battery")
+    assert page.filled == ["ada@shop.com", "correct-horse-battery"]
+    assert page.clicked == ["form-submit"]
+
+
+def test_ambiguous_login_name_asks_for_a_ref() -> None:
+    page = MemoryPage(text="login")
+    browser = Browser("ada", page)
+    browser._refs["ada"] = {
+        "7": ("button", "Logg inn"),
+        "11": ("button", "Logg inn"),
+        "16": ("button", "Logg inn"),
+    }
+    result = browser.invoke("ada", "browser_click", {"target": "Logg inn"})
+    assert "matches 3 controls" in result
+    assert "[7]" in result and "[16]" in result
+    assert "ref number" in result
+    assert page.clicked == ""
+
+    chosen = browser.invoke("ada", "browser_click", {"target": "16"})
+    assert page.clicked == "Logg inn"
+    assert "clicked 16" in chosen
+
+
+def test_resolve_maps_stable_email_and_phone_labels() -> None:
+    from robin.capabilities.browser import _generic_field_match
+
+    refs = {
+        "1": ("textbox", "ada@example.com"),
+        "2": ("textbox", "Telefon"),
+        "3": ("button", "Send bestilling"),
+    }
+    assert _generic_field_match("email", refs, prefer=("textbox",)) == (
+        "textbox",
+        "ada@example.com",
+        "1",
+    )
+    assert _generic_field_match("phone", refs, prefer=("textbox",)) == (
+        "textbox",
+        "Telefon",
+        "2",
+    )
+    assert _generic_field_match("Send bestilling", refs, prefer=("button",)) is None
+
+    browser = Browser("ada", MemoryPage(text="form"))
+    browser._refs["ada"] = refs
+    assert browser._resolve("ada", "email", prefer=("textbox",)) == (
+        "textbox",
+        "ada@example.com",
+        "1",
+    )
+    assert browser._resolve("ada", "phone", prefer=("textbox",))[2] == "2"
+
+
+def test_click_reports_disabled_control() -> None:
+    class BookPage:
+        def __init__(self) -> None:
+            self.clicked = False
+            self.frames = ()
+            self.main_frame = None
+
+        def locator(self, selector: str) -> "_DisabledNode":
+            return _DisabledNode(self, selector, rows=["Send bestilling"] if "data-robin-ref" in selector else [])
+
+        def get_by_role(self, role: str, name: str = "") -> "_DisabledNode":
+            if role == "button" and name == "Send bestilling":
+                return _DisabledNode(self, f"button:{name}", rows=["Send bestilling"])
+            return _DisabledNode(self, f"{role}:{name}", rows=[])
+
+        def get_by_text(self, target: str, exact: bool = False) -> "_DisabledNode":
+            return _DisabledNode(self, f"text:{target}", rows=[])
+
+    class _DisabledNode:
+        def __init__(self, page: BookPage, selector: str, rows: list[str] | None = None) -> None:
+            self.page = page
+            self.selector = selector
+            self.rows = list(rows or [])
+
+        def count(self) -> int:
+            return len(self.rows)
+
+        @property
+        def first(self) -> "_DisabledNode":
+            return self
+
+        def get_attribute(self, name: str) -> str | None:
+            if name == "disabled":
+                return ""
+            if name == "aria-disabled":
+                return None
+            return None
+
+        def click(self, timeout: int | None = None) -> None:
+            self.page.clicked = True
+
+    page = BookPage()
+    pw = PlaywrightPage(page)
+    try:
+        pw.click("Send bestilling", role="button", ref="3")
+        raise AssertionError("expected disabled error")
+    except RuntimeError as exc:
+        assert "disabled" in str(exc)
+        assert "fill required" in str(exc)
+    assert page.clicked is False
+
+    browser = Browser("ada", PlaywrightPage(page))
+    browser._refs["ada"] = {"3": ("button", "Send bestilling")}
+    result = browser.invoke("ada", "browser_click", {"target": "3"})
+    assert "disabled" in result
+    assert "fill required" in result
+    assert page.clicked is False
+
+
+def test_submit_clicks_named_send_bestilling_button() -> None:
+    class BookPage:
+        def __init__(self) -> None:
+            self.clicked: list[str] = []
+            self.frames = ()
+            self.main_frame = None
+
+        def locator(self, selector: str) -> "_BookNode":
+            if "type='submit'" in selector or 'type="submit"' in selector:
+                return _BookNode(self, selector, rows=[])
+            if "data-robin-ref" in selector:
+                ref = selector.split('data-robin-ref="')[-1].rstrip('"]')
+                if ref == "17":
+                    return _BookNode(self, selector, rows=["Send bestilling"])
+                return _BookNode(self, selector, rows=[])
+            return _BookNode(self, selector, rows=[])
+
+        def get_by_role(self, role: str, name: str = "") -> "_BookNode":
+            pattern = name.pattern if hasattr(name, "pattern") else str(name)
+            if role == "button" and "Send bestilling" in pattern:
+                return _BookNode(self, f"button:{pattern}", rows=["Send bestilling"])
+            if role == "button" and "Bestill" in pattern:
+                return _BookNode(self, f"button:{pattern}", rows=["Bestill time"])
+            return _BookNode(self, f"{role}:{pattern}", rows=[])
+
+    class _BookNode:
+        def __init__(self, page: BookPage, selector: str, rows: list[str] | None = None) -> None:
+            self.page = page
+            self.selector = selector
+            self.rows = list(rows or [])
+
+        def count(self) -> int:
+            return len(self.rows)
+
+        @property
+        def first(self) -> "_BookNode":
+            return self
+
+        def nth(self, index: int) -> "_BookNode":
+            return _BookNode(self.page, self.selector, rows=[self.rows[index]])
+
+        def get_attribute(self, name: str) -> str | None:
+            return None
+
+        def click(self, timeout: int | None = None) -> None:
+            label = self.rows[0] if self.rows else self.selector
+            self.page.clicked.append(label)
+
+    page = BookPage()
+    pw = PlaywrightPage(page)
+    pw._refs = {
+        "9": ("button", "Bestill time"),
+        "16": ("button", "Tilbake"),
+        "17": ("button", "Send bestilling"),
+    }
+    pw.submit()
+    assert page.clicked == ["Send bestilling"]
+
+
+def test_browser_submit_falls_back_to_interactive_ref() -> None:
+    class Stub:
+        def __init__(self) -> None:
+            self.clicked = ""
+
+        def submit(self) -> None:
+            raise RuntimeError("no type=submit control — if Interactive lists a send/book button, browser_click that ref")
+
+        def click(self, target: str, role: str = "", ref: str = "") -> None:
+            self.clicked = ref or target
+
+        def read(self) -> tuple[str, str]:
+            return (
+                'URL: https://clinic.test/\n\nInteractive:\n'
+                '[17] button "Send bestilling" (page)\n\nContent:\nok',
+                "",
+            )
+
+        def location(self) -> str:
+            return "https://clinic.test/"
+
+    page = Stub()
+    browser = Browser("ada", page)
+    browser._refs["ada"] = {
+        "9": ("button", "Bestill time"),
+        "16": ("button", "Tilbake"),
+        "17": ("button", "Send bestilling"),
+    }
+    result = browser.invoke("ada", "browser_submit", {})
+    assert page.clicked == "17"
+    assert "submitted" in result
+
+
+def test_submit_score_prefers_send_over_header_bestill() -> None:
+    from robin.capabilities.browser import _submit_score
+
+    assert _submit_score("Send bestilling") > _submit_score("Bestill time")
+    assert _submit_score("Tilbake") == 0
+    assert _submit_score("Bestill time") == 0
+
+
+def test_browser_fill_profile_never_puts_values_in_tool_args() -> None:
+    from robin.session import Assistant
+
+    class FormPage:
+        def __init__(self) -> None:
+            self.typed: list[tuple[str, str]] = []
+
+        def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
+            self.typed.append((target, text))
+
+        def read(self) -> tuple[str, str]:
+            return (
+                'URL: https://clinic.test/book\nTitle: Book\n\nInteractive:\n'
+                '[10] textbox "Fornavn" (page)\n'
+                '[12] textbox "email" (page)\n'
+                '[13] textbox "phone" (page)\n\n'
+                "Content:\nFornavn\n",
+                "",
+            )
+
+        def location(self) -> str:
+            return "https://clinic.test/book"
+
+    page = FormPage()
+    assistant = Assistant()
+    assistant.set_profile(
+        "ada",
+        {
+            "given_name": "Ada",
+            "email": "ada@example.com",
+            "phone": "+47 900 00 000",
+        },
+    )
+    browser = Browser(owner="ada", page=page, broker=assistant.broker)
+    browser._refs["ada"] = {
+        "10": ("textbox", "Fornavn"),
+        "12": ("textbox", "email"),
+        "13": ("textbox", "phone"),
+    }
+    tools = {tool.name: tool for tool in browser.tools}
+    assert "browser_fill_profile" in tools
+    assert "text" not in tools["browser_fill_profile"].parameters.get("properties", {})
+
+    result = browser.invoke("ada", "browser_fill_profile", {"field": "email", "target": "12"})
+    assert page.typed == [("email", "ada@example.com")]
+    assert "ada@example.com" not in result
+    assert "filled saved email" in result
+    assert "Saved profile can fill:" in result
+    assert "ada@example.com" not in result
+
+    named = browser.invoke("ada", "browser_fill_profile", {"field": "given_name", "target": "10"})
+    assert ("Fornavn", "Ada") in page.typed
+    assert "Ada" not in named
+
+    missing = browser.invoke("ada", "browser_fill_profile", {"field": "address", "target": "12"})
+    assert "no saved address" in missing

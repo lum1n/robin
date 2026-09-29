@@ -58,6 +58,14 @@ public actor Shell {
         scheduleEnabled = enabled
     }
 
+    public func profile() async throws -> [String: String] {
+        try await signedIn().profile()
+    }
+
+    public func saveProfile(_ fields: [String: String]) async throws -> [String: String] {
+        try await signedIn().saveProfile(fields)
+    }
+
     public func send(conversationID: String, text: String) async throws {
         let current = try signedIn()
         let reply = try await current.send(conversationID: conversationID, text: text)

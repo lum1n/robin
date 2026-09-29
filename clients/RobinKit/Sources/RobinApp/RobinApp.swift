@@ -21,6 +21,14 @@ final class ShellModel: ObservableObject {
     @Published var calendarUser = ""
     @Published var calendarPassword = ""
     @Published var scheduleOn = false
+    @Published var givenName = ""
+    @Published var familyName = ""
+    @Published var profileEmail = ""
+    @Published var profilePhone = ""
+    @Published var profileAddress = ""
+    @Published var profileCity = ""
+    @Published var profilePostalCode = ""
+    @Published var profileCountry = ""
     @Published var vaultPassphrase = ""
     @Published var vaultExport = ""
     @Published var failure: String?
@@ -47,6 +55,7 @@ final class ShellModel: ObservableObject {
         do {
             try await shell.signIn(instance: url, accountID: accountID, password: secret)
             scheduleOn = await shell.scheduleEnabled
+            await loadProfile()
             phase = await shell.phase
         } catch let error as RobinFailure {
             failure = error.message
@@ -97,6 +106,22 @@ final class ShellModel: ObservableObject {
         }
     }
 
+    func saveProfile() async {
+        await perform {
+            let saved = try await self.shell.saveProfile([
+                "given_name": self.givenName,
+                "family_name": self.familyName,
+                "email": self.profileEmail,
+                "phone": self.profilePhone,
+                "address": self.profileAddress,
+                "city": self.profileCity,
+                "postal_code": self.profilePostalCode,
+                "country": self.profileCountry,
+            ])
+            self.applyProfile(saved)
+        }
+    }
+
     func exportVault() async {
         let secret = vaultPassphrase
         vaultPassphrase = ""
@@ -131,9 +156,40 @@ final class ShellModel: ObservableObject {
         vaultPassphrase = ""
         vaultExport = ""
         scheduleOn = false
+        clearProfile()
         serverTiming = ""
         failure = nil
         phase = .signedOut
+    }
+
+    private func loadProfile() async {
+        do {
+            applyProfile(try await shell.profile())
+        } catch {
+            clearProfile()
+        }
+    }
+
+    private func applyProfile(_ fields: [String: String]) {
+        givenName = fields["given_name"] ?? ""
+        familyName = fields["family_name"] ?? ""
+        profileEmail = fields["email"] ?? ""
+        profilePhone = fields["phone"] ?? ""
+        profileAddress = fields["address"] ?? ""
+        profileCity = fields["city"] ?? ""
+        profilePostalCode = fields["postal_code"] ?? ""
+        profileCountry = fields["country"] ?? ""
+    }
+
+    private func clearProfile() {
+        givenName = ""
+        familyName = ""
+        profileEmail = ""
+        profilePhone = ""
+        profileAddress = ""
+        profileCity = ""
+        profilePostalCode = ""
+        profileCountry = ""
     }
 
     private func perform(_ work: () async throws -> Void) async {
@@ -263,6 +319,25 @@ private struct ConversationForm: View {
             Toggle("Check mail and calendar", isOn: $model.scheduleOn)
             Button("Save schedule") {
                 Task { await model.saveSchedule() }
+            }
+            TextField("Given name", text: $model.givenName)
+                .robinField()
+            TextField("Family name", text: $model.familyName)
+                .robinField()
+            TextField("Email", text: $model.profileEmail)
+                .robinField()
+            TextField("Phone", text: $model.profilePhone)
+                .robinField()
+            TextField("Address", text: $model.profileAddress)
+                .robinField()
+            TextField("City", text: $model.profileCity)
+                .robinField()
+            TextField("Postal code", text: $model.profilePostalCode)
+                .robinField()
+            TextField("Country", text: $model.profileCountry)
+                .robinField()
+            Button("Save personal details") {
+                Task { await model.saveProfile() }
             }
             SecureField("Vault passphrase", text: $model.vaultPassphrase)
                 .robinField()
