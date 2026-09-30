@@ -20,7 +20,7 @@ from robin.capability import (
     render_context,
     render_result,
 )
-from robin.ner import Ner, UnavailableNer
+from robin.ner import Ner, PublicTerms, UnavailableNer
 from robin.policy import Decision, Task, decide
 from robin.store import HouseholdStore
 from robin.vault import Vault, VaultAccessError, VaultStore, open_export, seal_export
@@ -228,6 +228,11 @@ class Assistant:
     def tools(self, account_id: str) -> list[dict[str, Any]]:
         return self.registry.schemas(account_id)
 
+    def ner_for(self, account_id: str) -> Ner:
+        """NER that leaves this account's own setup names, such as MCP servers, unmasked."""
+        terms = self.registry.public_terms(account_id)
+        return PublicTerms(self.ner, terms) if terms else self.ner
+
     def statuses(self, account_id: str) -> list[str]:
         return self.registry.statuses(account_id)
 
@@ -298,13 +303,14 @@ class Assistant:
 
     def decide(self, task: Task, *, record: bool = True) -> Decision:
         vault = self.vaults.get(task.account_id, task.conversation_id)
+        ner = self.ner_for(task.account_id)
         vocabulary = self.vocabulary.get(task.account_id, ())
         context, context_report = render_context(
             self.registry.for_account(task.account_id),
             task.account_id,
             vault,
             vocabulary=vocabulary,
-            ner=self.ner,
+            ner=ner,
             for_cloud=True,
         )
         message, message_report = redact(
@@ -312,8 +318,8 @@ class Assistant:
             vault,
             vocabulary=vocabulary,
             free_text=task.free_text,
-            ner_available=self.ner.available(),
-            extra=self.ner.detect(task.text) if self.ner.available() else (),
+            ner_available=ner.available(),
+            extra=ner.detect(task.text) if ner.available() else (),
         )
         outgoing = UNRESOLVED if task.free_text and message_report.unresolved else message
         redacted = json.dumps({"message": outgoing, "context": context}, sort_keys=True)
@@ -322,7 +328,7 @@ class Assistant:
             task.account_id,
             vault,
             vocabulary=vocabulary,
-            ner=self.ner,
+            ner=ner,
             for_cloud=False,
         )
         local_message = vault.restore(message)
@@ -380,7 +386,7 @@ class Assistant:
             capability.fields,
             vault,
             vocabulary=vocabulary,
-            ner=self.ner,
+            ner=self.ner_for(account_id),
             for_cloud=True,
         )
         if isinstance(outcome, Result) and outcome.records is not None:

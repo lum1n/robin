@@ -157,7 +157,10 @@ class Mcp(Capability):
         ),
         Tool(
             name="mcp_remove",
-            description="Remove an attached MCP server and its secrets.",
+            description=(
+                "Remove (delete, uninstall, disconnect) an MCP server for this account, with its secrets and sign-in. "
+                "Use the server name from mcp_list, for example 'sentry' for 'the sentry MCP'. Also cancels a draft setup."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -234,6 +237,16 @@ class Mcp(Capability):
                 }
             )
         return rows
+
+    def public_terms(self, account_id: str) -> list[str]:
+        names = [str(row.get("name") or "") for row in self._servers.get(account_id, [])]
+        names.extend(self._drafts.get(account_id, {}))
+        names.extend(
+            str(row.get("name") or "")
+            for row in self.household
+            if account_id in (row.get("visible_to") or [account_id])
+        )
+        return [name for name in names if name]
 
     def status(self, account_id: str) -> str:
         servers = self._servers.get(account_id, [])
@@ -867,12 +880,38 @@ class Mcp(Capability):
         return f"{name}: {len(row['enabled'])} tool(s) enabled"
 
     def _remove(self, account_id: str, arguments: dict[str, Any]) -> str:
-        name = _sanitize(str(arguments.get("name") or ""))
         before = self._servers.get(account_id, [])
+        drafts = self._drafts.get(account_id, {})
+        known = [str(item.get("name") or "") for item in before] + list(drafts)
+        name = _match_server(str(arguments.get("name") or ""), known)
+        if name is None:
+            household = [
+                str(row.get("name") or "")
+                for row in self.household
+                if account_id in (row.get("visible_to") or [account_id])
+            ]
+            if _match_server(str(arguments.get("name") or ""), household) is not None:
+                return "That MCP server is set up for the whole household; a household admin removes it from the MCP config file."
+            if not known:
+                return "No MCP servers to remove."
+            return "No MCP server by that name. Attached: " + ", ".join(sorted(set(known)))
         row = next((item for item in before if item.get("name") == name), None)
-        kept = [item for item in before if item.get("name") != name]
-        self._servers[account_id] = kept
-        self._drafts.get(account_id, {}).pop(name, None)
+        self._servers[account_id] = [item for item in before if item.get("name") != name]
+        draft = drafts.pop(name, None)
+        self._verified.pop((account_id, name), None)
+        flow = self._oauth_flows.get(account_id)
+        if flow is not None and flow.name == name:
+            self._oauth_flows.pop(account_id, None)
+            if not flow.finished.is_set():
+                flow.cancelled = True
+                if flow.state:
+                    self._oauth_by_state.pop(flow.state, None)
+                flow.result_error = RuntimeError("cancelled")
+                flow.code = ""
+                flow.signal_code()
+        waiting = self._waits.get(account_id)
+        if waiting is not None and waiting.get("name") == name:
+            self._waits.pop(account_id, None)
         if row and self.registry is not None:
             mapped = [
                 _tool_name(name, str(tool.get("name") or ""))
@@ -895,7 +934,9 @@ class Mcp(Capability):
                 except Exception:
                     pass
         self._save(account_id)
-        return "removed" if row is not None else "not found"
+        if row is None and draft is not None:
+            return f"Removed the draft MCP {name}."
+        return f"Removed MCP {name}; its tools and saved sign-in are gone."
 
     def _save(self, account_id: str) -> None:
         if self.store is not None:
@@ -906,6 +947,19 @@ class Mcp(Capability):
                 copy["token"] = ""
                 safe.append(copy)
             self.store.save_mcp(account_id, safe)
+
+
+def _match_server(asked: str, known: list[str]) -> str | None:
+    """Find the server the person meant: exact, without an 'mcp'/'server' suffix, or one unique prefix."""
+    names = [name for name in known if name]
+    wanted = _sanitize(asked)
+    if wanted in names:
+        return wanted
+    trimmed = re.sub(r"(?:^(?:the|my)_)|(?:_?(?:mcp|mcp_server|server|integration|connector))+$", "", wanted).strip("_")
+    if trimmed in names:
+        return trimmed
+    close = [name for name in names if trimmed and (name.startswith(trimmed) or trimmed.startswith(name))]
+    return close[0] if len(set(close)) == 1 else None
 
 
 def _sanitize(name: str) -> str:

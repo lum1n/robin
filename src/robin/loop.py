@@ -219,10 +219,11 @@ def _converse(
     decision = assistant.decide(task, record=messages is None)
     vault = assistant.vaults.get(task.account_id, task.conversation_id)
     vocabulary = assistant.vocabulary.get(task.account_id, ())
+    ner = assistant.ner_for(task.account_id)
     trace = BrowserTrace(correction=looks_like_correction(task.text))
     if messages is None:
-        spoken = _release(task.text, vault, vocabulary, assistant.ner, free_text=task.free_text)
-        history = _history(assistant, task, vault, vocabulary, assistant.ner)
+        spoken = _release(task.text, vault, vocabulary, ner, free_text=task.free_text)
+        history = _history(assistant, task, vault, vocabulary, ner)
         messages = [
             {"role": "system", "content": _system(assistant, task.account_id, task.text)},
             {"role": "user", "content": _user_message(spoken, history)},
@@ -335,7 +336,7 @@ def _converse(
                     live_url=live,
                 )
                 return _after_turn(assistant, task, model, reply, trace)
-            result = _release_result(outcome["result"], vault, vocabulary, assistant.ner)
+            result = _release_result(outcome["result"], vault, vocabulary, ner)
             if len(result) > _TOOL_RESULT_CHARS:
                 result = result[:_TOOL_RESULT_CHARS]
             _mark_tainted(call.name)
@@ -670,7 +671,7 @@ def _system(assistant: Assistant, account_id: str, text: str = "") -> str:
         # Lessons are checked for secrets at save time; release with free_text=False so
         # missing NER does not turn the whole section into [UNRESOLVED].
         released = [
-            _release(line, vault, vocabulary, assistant.ner, free_text=False) for line in guidance
+            _release(line, vault, vocabulary, assistant.ner_for(account_id), free_text=False) for line in guidance
         ]
         released = [line for line in released if line and line != "[UNRESOLVED]"]
         if released:

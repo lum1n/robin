@@ -88,6 +88,37 @@ class Ner(Protocol):
     def detect(self, text: str) -> tuple[Entity, ...]: ...
 
 
+_PUBLIC_SUFFIX = re.compile(r"(?i)[\s_-]*(?:mcp|mcp[\s_-]*server|server|integration|connector)$")
+
+
+def _public_key(value: str) -> str:
+    cleaned = value.strip().strip("?.!,;:\"'“”()").casefold()
+    cleaned = re.sub(r"^(?:the|my|our)\s+", "", cleaned)
+    cleaned = _PUBLIC_SUFFIX.sub("", cleaned)
+    return re.sub(r"[\s_-]+", " ", cleaned).strip()
+
+
+class PublicTerms:
+    """NER that leaves this account's own setup names (for example MCP servers) in plain text."""
+
+    def __init__(self, inner: Ner, terms: list[str]) -> None:
+        self.inner = inner
+        self.terms = frozenset(key for key in (_public_key(term) for term in terms) if key)
+
+    def available(self) -> bool:
+        return self.inner.available()
+
+    def detect(self, text: str) -> tuple[Entity, ...]:
+        found = self.inner.detect(text)
+        if not self.terms:
+            return found
+        return tuple(
+            entity
+            for entity in found
+            if entity.label not in {"ORG", "PERSON"} or _public_key(text[entity.start : entity.end]) not in self.terms
+        )
+
+
 class UnavailableNer:
     def available(self) -> bool:
         return False

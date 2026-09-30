@@ -156,6 +156,10 @@ class Capability:
         """Short lines for the system prompt about this account's learned preferences."""
         return []
 
+    def public_terms(self, account_id: str) -> list[str]:
+        """Names this account set up (for example MCP servers) that NER must not mask."""
+        return []
+
     def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
         return None
 
@@ -250,6 +254,12 @@ class Registry:
         for capability in self.for_account(account_id):
             lines.extend(capability.guidance(account_id, text))
         return lines
+
+    def public_terms(self, account_id: str) -> list[str]:
+        terms: list[str] = []
+        for capability in self.for_account(account_id):
+            terms.extend(capability.public_terms(account_id))
+        return terms
 
     def pending_input(self, account_id: str, conversation_id: str) -> InputRequest | None:
         for capability in self.for_account(account_id):

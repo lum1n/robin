@@ -10,7 +10,7 @@ from robin.capabilities.bills import Bills
 from robin.capabilities.home import Home
 from robin.capabilities.mcp import Mcp
 from robin.capability import InputField, InputRequest
-from robin.loop import converse
+from robin.loop import converse, resume
 from robin.model import ModelTurn, ToolCall
 from robin.policy import Task
 from robin.session import Assistant
@@ -605,3 +605,51 @@ def test_bills_scan_parses_invoice() -> None:
     assert hasattr(result, "records")
     assert result.records[0]["amount"]
     assert "kid" not in result.records[0]
+
+
+class _OrgNer:
+    """Tags every capitalised or listed word as an organisation, like GLiNER does for product names."""
+
+    def __init__(self, words: set[str]) -> None:
+        self.words = words
+
+    def available(self) -> bool:
+        return True
+
+    def detect(self, text: str):
+        import re
+
+        from robin.airlock import Entity
+
+        pattern = "|".join(re.escape(word) for word in sorted(self.words, key=len, reverse=True))
+        return tuple(Entity(m.start(), m.end(), "ORG") for m in re.finditer(pattern, text, re.IGNORECASE))
+
+
+def test_mcp_remove_by_spoken_name_through_chat() -> None:
+    session = FakeMcpSession()
+    assistant, mcp = _active_notes(session)
+    assistant.ner = _OrgNer({"notes mcp", "Acme"})
+    model = Scripted(
+        [ModelTurn("", (ToolCall("mcp_remove", {"name": "Notes MCP"}, "c1"),)), ModelTurn("Removed.")]
+    )
+    reply = converse(assistant, Task("ada", "t", "Please remove the notes mcp from Acme"), model)
+    spoken = model.seen[0][0][1]["content"]
+    assert "notes mcp" in spoken
+    assert "Acme" not in spoken
+    assert reply.status == "confirm"
+    resume(assistant, "ada", "t", model)
+    assert mcp._servers["ada"] == []
+    assert "Removed MCP notes" in model.seen[-1][0][-1]["content"]
+    assert not [tool for tool in assistant.tools("ada") if tool["name"].startswith("mcp_notes_")]
+
+
+def test_mcp_remove_is_forgiving_and_explains() -> None:
+    assistant, mcp = _active_notes(FakeMcpSession())
+    assert "Attached: notes" in mcp.invoke("ada", "mcp_remove", {"name": "sentry"})
+    mcp.invoke("ada", "mcp_setup_start", {"name": "draft_one", "transport": "http", "url": "https://mcp.example/x"})
+    assert "draft" in mcp.invoke("ada", "mcp_remove", {"name": "draft one"})
+    assert "Removed MCP notes" in mcp.invoke("ada", "mcp_remove", {"name": "the notes mcp server"})
+    assert mcp.invoke("ada", "mcp_remove", {"name": "notes"}) == "No MCP servers to remove."
+    assert mcp.public_terms("ada") == []
+    household = Mcp(household=[{"name": "shared", "transport": "http"}])
+    assert "household admin" in household.invoke("ada", "mcp_remove", {"name": "shared"})
