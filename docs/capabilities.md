@@ -10,6 +10,16 @@ The grocery list lives on this server. `add_private` changes only that account's
 
 A website sign-in belongs to that account and to the site's host. The first time a page asks for a password, or for an email before the password, Robin asks for the username and password in the conversation. The person can reply with `username name@example.com password …` or with the username and password on two lines. That reply is stored in the broker, encrypted with the household key, and is not sent to a model. Robin may try one automatic fill, then hands the live login form to the operator loop with Interactive refs. The model adapts with `fill_saved_username` and `fill_saved_password` (password waits for confirm), clicks, and submits for that site's flow. A wrong-password message from the site drops the stored secret and asks again. A blocked or unfinished automatic fill keeps the secret. A verification code is asked for on every sign-in and is not stored. Another account cannot read it. `POST /v1/secrets` still accepts only mailbox and calendar names. Personal details for ordinary forms (name, email, phone, address) live in the same broker under `profile`, edited from the apps via `GET`/`POST /v1/profile`. The model fills them with `browser_fill_profile` (`field` + `target` only); the values never enter tool arguments or the prompt. When a page or an inbox was fetched and the model says the fetch failed, the fetched text is the reply.
 
+## Browser stealth and bot walls
+
+Robin opens pages with a **headed** Chromium (or Google Chrome when installed) on a per-account Xvfb display by default (`ROBIN_BROWSER_HEADLESS=0`). Automation flags are stripped. Optional engines: `ROBIN_BROWSER_ENGINE=playwright|patchright|camoufox` (patchright is preferred when installed via the `stealth` extra). Per-account persistent profiles keep cookies between visits.
+
+When a snapshot is a captcha or WAF wall, the turn returns status `handoff` with a `live_url`. The person opens that live view (Playwright screenshots over HTTP — pixels never go to a model), solves the check, then confirms. `resume` re-reads the page and continues.
+
+**IP reputation limit:** private exe.dev VMs use datacenter IPs that Akamai and PerimeterX often block even with a headed browser. The house box usually has a residential IP and fares better. A later option is to proxy VM browser traffic through the house.
+
+Measure with `robin browser-probe` (add `--headless` to compare modes).
+
 An automation is a sentence such as “create a summary of my day and deliver it to me every day at 08:00”, “check the news every hour”, or “remind me in 15 minutes”. Robin saves it for that account and runs it on this instance when the time arrives. A daily time that has already passed starts the next matching day. “Every hour” and “every 15 minutes” repeat. “In 15 minutes” runs once. “List my jobs”, “cancel the summary”, and “change the summary to 07:30” do those things. Another account does not see the list. Sending, paying, or deleting during a run still waits for a confirm.
 
 ## Declare one
@@ -51,6 +61,17 @@ Register it on an `Assistant`. The model receives the full tool catalog for this
 
 Credentials go in the `Broker` (`assistant.broker.put`). With a `HouseholdStore`, that write is encrypted and comes back after a restart. `POST /v1/secrets` is how a signed-in app connects `mailbox` or `calendar`. `GET`/`POST /v1/profile` is how the app edits personal form-fill details. The response does not leak secrets to other accounts. Tool code may `reveal` them at execution time. The decide path does not.
 
-External tools return `{"status": "confirm"}` until `invoke(..., confirmed=True)`.
+External tools return `{"status": "confirm"}` until `invoke(..., confirmed=True)`. Tools may also set `confirm=True` without being external (for example activating a proposed skill).
+
+## Learning and skills
+
+Robin remembers how this person wants things done.
+
+- **Lessons** are one-line preferences or corrections (`lesson_save`, `lesson_list`, `lesson_update`, `lesson_forget`). Optional tags (tool names or website hosts) scope when they apply. Matching lessons are injected into the system prompt on later turns, after the airlock. Untagged preferences always apply. Secrets and national IDs are refused at save time.
+- **Skills** are reusable procedures (`skill_list`, `skill_read`, `skill_propose`, `skill_activate`, `skill_retire`). A proposal is stored as a draft and is not followed until `skill_activate` (one confirm). Steps may only name tools that exist in the registry. Skills never load code.
+- **Browser sessions.** A successful multi-step browser turn records a trace (controls by role and name, host and path only, no passwords). Robin drafts a site skill such as `finn.no: search used bikes` and offers to remember it. Opening that host later gets a hint to `skill_read` the skill first.
+- **Steering.** When the person corrects a browser flow, a reflection pass saves a host-tagged lesson immediately and may propose a revised skill. Lessons beat skill steps when they conflict.
+- **Nightly review.** Around 03:00, accounts with new turns get a `learning` thread that merges lessons and proposes skills via `learning_digest`.
+- Lessons and skills are per account and encrypted in the household store. A turn that already saw page, mail, or file text must confirm before the model may write a lesson mid-turn (prompt-injection guard). The reflection pass never sees tool result bodies, so its lessons apply without that confirm.
 
 A downloaded plugin would sit inside the trust boundary, so the registry does not load third-party packages. The interface above is the one it will implement.

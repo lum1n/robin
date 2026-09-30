@@ -47,7 +47,10 @@ class Web(Capability):
     tools = [
         Tool(
             name="web_search",
-            description="Search the public web for a query. The query is sent to the configured search provider.",
+            description=(
+                "Search the public web for a query via the configured search provider. "
+                "When the person names a specific website (vg.no, finn.no), prefer browser_open on that host instead."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
@@ -60,7 +63,7 @@ class Web(Capability):
             name="web_fetch",
             description=(
                 "Fetch readable text from a public http(s) URL without a browser session. "
-                "For booking, forms, or clicking on a site, use browser_open instead."
+                "For news, booking, forms, or clicking on a site, use browser_open instead."
             ),
             parameters={
                 "type": "object",
@@ -96,9 +99,15 @@ class Web(Capability):
             query = str(arguments.get("query", "")).strip()
             if not query:
                 return "query is required"
-            rows = self._search(account_id, query)
+            try:
+                rows = self._search(account_id, query)
+            except Exception as exc:
+                return _search_failure(exc)
             if not rows:
-                return "No results."
+                return (
+                    "No results from the search provider. "
+                    "If the person named a website, browser_open that host and read the page."
+                )
             return Result(text="Search results:", records=rows)
         if tool_name == "web_fetch":
             url = str(arguments.get("url", "")).strip()
@@ -107,7 +116,10 @@ class Web(Capability):
                     url = "https://" + url
                 else:
                     return "url must be http or https"
-            body = self._fetch(url)
+            try:
+                body = self._fetch(url)
+            except Exception as exc:
+                return _fetch_failure(exc, url)
             text = _readable(body)[:8000]
             return text or "empty page"
         raise NotImplementedError(tool_name)
@@ -178,6 +190,28 @@ def urllib_get(url: str, headers: dict[str, str] | None = None) -> str:
     request = Request(url, headers=headers or {"User-Agent": "Robin/1.0"}, method="GET")
     with urlopen(request, timeout=20) as response:  # noqa: S310
         return response.read().decode(errors="replace")
+
+
+def _search_failure(exc: Exception) -> str:
+    text = str(exc).strip() or type(exc).__name__
+    if "111" in text or "Connection refused" in text or "Name or service not known" in text:
+        return (
+            "search provider is unreachable. "
+            "Do not say you lack web access — browser_open the website the person named "
+            "(for example https://www.vg.no) and read the page."
+        )
+    return (
+        f"search failed ({text[:120]}). "
+        "If the person named a website, browser_open that host instead."
+    )
+
+
+def _fetch_failure(exc: Exception, url: str) -> str:
+    text = str(exc).strip() or type(exc).__name__
+    return (
+        f"could not fetch {url} ({text[:100]}). "
+        "Use browser_open for that site instead of saying you lack access."
+    )
 
 
 def _readable(html: str) -> str:

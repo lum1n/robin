@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from robin.auth import Auth, AuthError
@@ -95,12 +97,136 @@ def dispatch(
         if denied is not None:
             return denied
         return 200, {"entries": service.assistant.activity.read(query["account_id"])}
+    if method == "GET" and path == "/v1/browser/live":
+        return _get_browser_live(service, headers, query)
+    if method == "GET" and path == "/v1/browser/frame":
+        return _get_browser_frame(service, headers, query)
     return 404, {"error": "not found"}
+
+
+# Client closed the socket while we were still writing (common on long browser turns).
+_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)
+# Phone/NAT paths often drop sockets that stay quiet for ~60–90s while a turn runs.
+_HEARTBEAT_SECONDS = 5.0
+_HEARTBEAT_GRACE_SECONDS = 1.0
+
+
+def _arm_keepalive(connection: socket.socket | None) -> None:
+    if connection is None:
+        return
+    try:
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 20)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
+    except OSError:
+        return
+
+
+def _write_chunk(handler: BaseHTTPRequestHandler, data: bytes) -> None:
+    handler.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+    handler.wfile.flush()
+
+
+def _send(handler: BaseHTTPRequestHandler, status: int, body: bytes, content_type: str) -> None:
+    """Write an HTTP response; ignore disconnects from the peer."""
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Connection", "close")
+        if content_type != "application/json":
+            handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(body)
+        handler.wfile.flush()
+    except _CLIENT_GONE:
+        return
+
+
+def _send_json_with_heartbeat(
+    handler: BaseHTTPRequestHandler,
+    compute: Callable[[], tuple[int, dict[str, Any]]],
+) -> None:
+    """Run compute(); if it takes long, keep the socket warm with chunked whitespace.
+
+    JSON allows leading whitespace, so phone clients can decode the final object.
+    Status is frozen at 200 once heartbeats start (auth failures return sooner).
+    Requires HTTP/1.1 — chunked transfer is not valid on HTTP/1.0.
+    """
+    done = threading.Event()
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["result"] = compute()
+        except Exception:
+            traceback.print_exc()
+            box["result"] = (500, {"error": "request failed"})
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=run, name="robin-http-turn", daemon=True)
+    worker.start()
+    if done.wait(_HEARTBEAT_GRACE_SECONDS):
+        status, response = box["result"]
+        _send(handler, status, json.dumps(response).encode(), "application/json")
+        return
+
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.flush()
+        # Immediate first byte so the phone's idle timer resets before the first wait.
+        _write_chunk(handler, b"\n")
+    except _CLIENT_GONE:
+        done.wait()
+        return
+
+    while not done.wait(_HEARTBEAT_SECONDS):
+        try:
+            _write_chunk(handler, b"\n")
+        except _CLIENT_GONE:
+            done.wait()
+            return
+
+    status, response = box["result"]
+    payload = response if status == 200 else {"error": response.get("error", "request failed")}
+    try:
+        _write_chunk(handler, json.dumps(payload).encode())
+        _write_chunk(handler, b"")
+    except _CLIENT_GONE:
+        return
 
 
 def serve(service: Service, host: str = "127.0.0.1", port: int = 8787) -> None:
     class Handler(BaseHTTPRequestHandler):
+        # Chunked heartbeats for long /v1/messages turns require HTTP/1.1.
+        protocol_version = "HTTP/1.1"
+
+        def setup(self) -> None:
+            super().setup()
+            _arm_keepalive(getattr(self, "connection", None))
+
         def do_GET(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+            headers = {key.lower(): value for key, value in self.headers.items()}
+            if parsed.path == "/v1/browser/live":
+                status, body, content_type = _browser_live_page(service, headers, query)
+                _send(self, status, body, content_type)
+                return
+            if parsed.path == "/v1/browser/frame":
+                status, body, content_type = _browser_frame_bytes(service, headers, query)
+                _send(self, status, body, content_type)
+                return
             self._respond("GET")
 
         def do_POST(self) -> None:  # noqa: N802
@@ -114,20 +240,22 @@ def serve(service: Service, host: str = "127.0.0.1", port: int = 8787) -> None:
             try:
                 payload = json.loads(raw.decode()) if raw else {}
             except json.JSONDecodeError:
-                status, response = 400, {"error": "json is required"}
-            else:
-                headers = {key.lower(): value for key, value in self.headers.items()}
+                _send(self, 400, json.dumps({"error": "json is required"}).encode(), "application/json")
+                return
+            headers = {key.lower(): value for key, value in self.headers.items()}
+
+            def compute() -> tuple[int, dict[str, Any]]:
                 try:
-                    status, response = dispatch(service, method, parsed.path, query=query, body=payload, headers=headers)
+                    return dispatch(service, method, parsed.path, query=query, body=payload, headers=headers)
                 except Exception:
                     traceback.print_exc()
-                    status, response = 500, {"error": "request failed"}
-            data = json.dumps(response).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+                    return 500, {"error": "request failed"}
+
+            if method == "POST" and parsed.path == "/v1/messages":
+                _send_json_with_heartbeat(self, compute)
+                return
+            status, response = compute()
+            _send(self, status, json.dumps(response).encode(), "application/json")
 
         def log_message(self, fmt: str, *args: object) -> None:
             return
@@ -409,6 +537,79 @@ def _get_private(service: Service, headers: dict[str, str], query: dict[str, str
     return 200, {"https_url": record["https_url"], "ready": record["ready"]}
 
 
+def _get_browser_live(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """JSON metadata for tests and clients that do not want the HTML page."""
+    denied = _require(service, headers, query.get("account_id"))
+    if denied is not None:
+        return denied
+    account_id = query["account_id"]
+    return 200, {
+        "account_id": account_id,
+        "live_path": f"/v1/browser/live?account_id={account_id}",
+        "frame_path": f"/v1/browser/frame?account_id={account_id}",
+    }
+
+
+def _get_browser_frame(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    denied = _require(service, headers, query.get("account_id"))
+    if denied is not None:
+        return denied
+    return 200, {"ok": True}
+
+
+def _browser_capability(service: Service, account_id: str) -> Any:
+    for capability in service.assistant.registry.for_account(account_id):
+        if getattr(capability, "id", "") == "display" and hasattr(capability, "screenshot"):
+            return capability
+    return None
+
+
+def _browser_live_page(
+    service: Service, headers: dict[str, str], query: dict[str, str]
+) -> tuple[int, bytes, str]:
+    denied = _require(service, headers, query.get("account_id"))
+    if denied is not None:
+        return denied[0], json.dumps(denied[1]).encode(), "application/json"
+    account_id = query["account_id"]
+    token = _bearer(headers)
+    # Token in query lets a WebView load the img without custom headers.
+    frame = f"/v1/browser/frame?account_id={account_id}&access_token={token}"
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Robin live view</title>
+<meta http-equiv="refresh" content="2">
+<style>
+body{{margin:0;background:#111;color:#eee;font:14px system-ui,sans-serif}}
+img{{max-width:100%;height:auto;display:block;margin:0 auto}}
+p{{padding:12px}}
+</style></head><body>
+<p>Solve any captcha or security check here, then tap Done in Robin.</p>
+<img src="{frame}" alt="live page">
+</body></html>
+"""
+    return 200, html.encode(), "text/html; charset=utf-8"
+
+
+def _browser_frame_bytes(
+    service: Service, headers: dict[str, str], query: dict[str, str]
+) -> tuple[int, bytes, str]:
+    account_id = query.get("account_id")
+    # Prefer Authorization; fall back to access_token for <img> loads.
+    if not headers.get("authorization") and query.get("access_token"):
+        headers = {**headers, "authorization": f"Bearer {query['access_token']}"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied[0], json.dumps(denied[1]).encode(), "application/json"
+    assert account_id is not None
+    browser = _browser_capability(service, account_id)
+    if browser is None:
+        return 404, b"no browser", "text/plain"
+    try:
+        png = browser.screenshot(account_id)
+    except Exception as exc:
+        return 409, str(exc).encode(), "text/plain"
+    return 200, png, "image/png"
+
+
 def _require(service: Service, headers: dict[str, str], account_id: str | None) -> tuple[int, dict[str, Any]] | None:
     if not account_id:
         return 400, {"error": "account_id is required"}
@@ -427,10 +628,14 @@ def _bearer(headers: dict[str, str]) -> str:
 
 
 def _public_reply(reply: Any) -> dict[str, Any]:
-    return {
+    payload = {
         "status": reply.status,
         "text": reply.text,
         "route": reply.route.value,
         "tool": reply.tool,
         "timing": getattr(reply, "timing", "") or "",
     }
+    live = getattr(reply, "live_url", "") or ""
+    if live:
+        payload["live_url"] = live
+    return payload

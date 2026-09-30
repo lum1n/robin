@@ -5,6 +5,7 @@ public enum ShellPhase: Equatable, Sendable {
     case signedOut
     case ready(threads: [String], reply: String?)
     case confirm(threads: [String], prompt: String, tool: String)
+    case handoff(threads: [String], prompt: String, liveURL: String)
 }
 
 public actor Shell {
@@ -68,14 +69,48 @@ public actor Shell {
 
     public func send(conversationID: String, text: String) async throws {
         let current = try signedIn()
-        let reply = try await current.send(conversationID: conversationID, text: text)
-        try await show(reply, on: current)
+        do {
+            let reply = try await current.send(conversationID: conversationID, text: text)
+            try await show(reply, on: current)
+        } catch {
+            guard isTimeout(error) else { throw error }
+            // Long browser turns often finish on the server after the phone drops the socket.
+            if let recovered = try await current.awaitStoredReply(
+                conversationID: conversationID,
+                afterUserText: text
+            ) {
+                try await show(recovered, on: current)
+                return
+            }
+            throw error
+        }
     }
 
     public func confirm(conversationID: String) async throws {
         let current = try signedIn()
-        let reply = try await current.confirm(conversationID: conversationID)
-        try await show(reply, on: current)
+        do {
+            let reply = try await current.confirm(conversationID: conversationID)
+            try await show(reply, on: current)
+        } catch {
+            guard isTimeout(error) else { throw error }
+            let turns = try await current.turns(conversationID: conversationID)
+            if let robin = turns.last(where: { $0.role == "reply" && !$0.text.isEmpty }) {
+                try await show(
+                    Reply(status: robin.role, text: robin.text, route: "local", tool: nil),
+                    on: current
+                )
+                return
+            }
+            throw error
+        }
+    }
+
+    private func isTimeout(_ error: Error) -> Bool {
+        if let urlError = error as? URLError, urlError.code == .timedOut {
+            return true
+        }
+        let text = String(describing: error).lowercased()
+        return text.contains("timed out") || text.contains("timeout") || text.contains("-1001")
     }
 
     private func signedIn() throws -> RobinClient {
@@ -95,6 +130,8 @@ public actor Shell {
         serverTiming = reply.timing ?? ""
         if reply.status == "confirm" {
             phase = .confirm(threads: threads, prompt: reply.text, tool: reply.tool ?? "")
+        } else if reply.status == "handoff" {
+            phase = .handoff(threads: threads, prompt: reply.text, liveURL: reply.liveURL ?? "")
         } else {
             phase = .ready(threads: threads, reply: reply.text)
         }

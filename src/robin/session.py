@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -15,6 +16,7 @@ from robin.capability import (
     Registry,
     Result,
     SecretAccepted,
+    current_task,
     render_context,
     render_result,
 )
@@ -70,8 +72,31 @@ class Assistant:
         self.store = store
         self._pending: dict[tuple[str, str], dict] = {}
         self.schedules: dict[str, bool] = {}
+        self._turn_lock = threading.Lock()
+        self._turn_gen: dict[tuple[str, str], int] = {}
+        self._turn_busy: dict[tuple[str, str], threading.Lock] = {}
         if store is not None:
             self._restore_store()
+
+    def begin_turn(self, account_id: str, conversation_id: str) -> int:
+        """Bump the conversation generation so an older in-flight turn can stop."""
+        key = (account_id, conversation_id)
+        with self._turn_lock:
+            gen = self._turn_gen.get(key, 0) + 1
+            self._turn_gen[key] = gen
+            if key not in self._turn_busy:
+                self._turn_busy[key] = threading.Lock()
+            return gen
+
+    def turn_active(self, account_id: str, conversation_id: str, generation: int) -> bool:
+        return self._turn_gen.get((account_id, conversation_id)) == generation
+
+    def conversation_lock(self, account_id: str, conversation_id: str) -> threading.Lock:
+        key = (account_id, conversation_id)
+        with self._turn_lock:
+            if key not in self._turn_busy:
+                self._turn_busy[key] = threading.Lock()
+            return self._turn_busy[key]
 
     def add(self, capability: Capability) -> None:
         self.registry.add(capability)
@@ -283,7 +308,13 @@ class Assistant:
         self.activity.append(account_id, entry)
         if self.store is not None:
             self.store.append_activity(account_id, entry)
-        if tool.effect is Effect.EXTERNAL and not confirmed:
+        if (tool.effect is Effect.EXTERNAL or tool.confirm) and not confirmed:
+            return {"status": "confirm", "tool": tool_name}
+        if (
+            tool_name in {"lesson_save", "lesson_update", "memory_remember"}
+            and not confirmed
+            and _lesson_needs_confirm()
+        ):
             return {"status": "confirm", "tool": tool_name}
         try:
             outcome = capability.invoke(account_id, tool.name, raw)
@@ -333,3 +364,13 @@ def _egress_needs_restore(arguments: dict[str, str], vault: Vault) -> bool:
             if restored != value:
                 return True
     return False
+
+
+def _lesson_needs_confirm() -> bool:
+    """Lesson writes from a turn that saw untrusted tool results need a confirm."""
+    turn = current_task.get()
+    if turn is None:
+        return False
+    if turn.learning_source != "person":
+        return False
+    return bool(turn.tainted)

@@ -66,9 +66,20 @@ def main(argv: list[str] | None = None) -> int:
         help="GLiNER checkpoint. Empty uses the default; 'no' selects the Norwegian model.",
     )
 
+    probe_cmd = sub.add_parser("browser-probe", help="Open known sites and report bot walls vs ok.")
+    probe_cmd.add_argument("--headless", action="store_true", help="Force headless Chromium.")
+    probe_cmd.add_argument(
+        "--url",
+        action="append",
+        dest="urls",
+        help="Extra URL to probe (repeatable). Defaults to a fixed list when omitted.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "boot":
         return _boot(args)
+    if args.command == "browser-probe":
+        return _browser_probe(args)
     if args.command == "tick":
         return _tick(args)
     if args.command == "exe-token":
@@ -206,7 +217,16 @@ def _boot(args: argparse.Namespace) -> int:
     ner.warm()
     assistant = Assistant(store=store, ner=ner)
     install(assistant)
-    if ner._installed and not ner._failed:
+    if not ner._installed:
+        print(
+            "robin: WARNING local NER is not installed (uv sync --extra ner). "
+            "Without it, conversation history and free-text tool results stay [UNRESOLVED] "
+            "and browser controls become unusable labels.",
+            flush=True,
+        )
+    elif ner._failed:
+        print("robin: WARNING local NER failed to load — free-text cloud egress stays blocked", flush=True)
+    else:
         print("robin: loading local NER in the background", flush=True)
     model = ChatModel(args.model_url, model=args.model_name, api_key=os.environ.get("ROBIN_MODEL_KEY", ""))
     _start_clock(assistant, model)
@@ -222,6 +242,91 @@ def _boot(args: argparse.Namespace) -> int:
         port=args.port,
     )
     return 0
+
+
+_PROBE_URLS = (
+    "https://www.skyscanner.com/",
+    "https://www.lot.com/",
+    "https://www.kiwi.com/",
+    "https://flybillet.no/",
+    "https://www.google.com/travel/flights",
+    "https://www.finn.no/",
+    "https://www.vg.no/",
+    "https://bot.sannysoft.com/",
+)
+
+
+def _browser_probe(args: argparse.Namespace) -> int:
+    import os
+
+    from robin.capabilities.browser import _bot_wall_note, launch_options, open_chromium
+    from robin.capabilities.vdisplay import browser_engine
+
+    if args.headless:
+        os.environ["ROBIN_BROWSER_HEADLESS"] = "1"
+    urls = tuple(args.urls) if args.urls else _PROBE_URLS
+    options = launch_options()
+    print(
+        json.dumps(
+            {
+                "engine": browser_engine(),
+                "headless": options["headless"],
+                "channel": options.get("channel"),
+                "ignore_default_args": options["ignore_default_args"],
+            }
+        ),
+        flush=True,
+    )
+    rows: list[dict[str, str]] = []
+    for url in urls:
+        row: dict[str, str] = {"url": url, "status": "error", "detail": ""}
+        page = None
+        try:
+            page = open_chromium(url, account_id="probe")
+            text, _ = page.read()
+            landed = ""
+            try:
+                landed = page.location()
+            except Exception:
+                landed = ""
+            wall = _bot_wall_note(text)
+            empty = "content:\n(empty)" in text.lower()
+            if wall:
+                row["status"] = "walled"
+                row["detail"] = wall.split("\n", 1)[0][:200]
+            elif empty:
+                row["status"] = "empty"
+            else:
+                row["status"] = "ok"
+            row["landed"] = landed
+        except Exception as exc:
+            row["detail"] = str(exc)[:300]
+        finally:
+            if page is not None:
+                for closer in ("_context", "_browser"):
+                    obj = getattr(page, closer, None)
+                    if obj is None:
+                        continue
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
+                pw = getattr(page, "_playwright", None)
+                if pw is not None:
+                    try:
+                        pw.stop()
+                    except Exception:
+                        pass
+        rows.append(row)
+        print(json.dumps(row), flush=True)
+    summary = {
+        "ok": sum(1 for row in rows if row["status"] == "ok"),
+        "walled": sum(1 for row in rows if row["status"] == "walled"),
+        "empty": sum(1 for row in rows if row["status"] == "empty"),
+        "error": sum(1 for row in rows if row["status"] == "error"),
+    }
+    print(json.dumps({"summary": summary}), flush=True)
+    return 0 if summary["error"] == 0 else 1
 
 
 if __name__ == "__main__":

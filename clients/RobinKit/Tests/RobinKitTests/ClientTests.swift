@@ -202,4 +202,16 @@ struct ClientTests {
         #expect(!source.contains("redact"))
         #expect(!source.contains("gliner"))
     }
+
+    @Test func latestRobinReplyFindsAnswerAfterMatchingUserTurn() {
+        let turns = [
+            Turn(role: "user", text: "earlier"),
+            Turn(role: "reply", text: "old"),
+            Turn(role: "user", text: "find cars"),
+            Turn(role: "reply", text: "Found GLC listings."),
+        ]
+        let reply = latestRobinReply(in: turns, afterUserText: "find cars")
+        #expect(reply?.text == "Found GLC listings.")
+        #expect(latestRobinReply(in: turns, afterUserText: "missing") == nil)
+    }
 }

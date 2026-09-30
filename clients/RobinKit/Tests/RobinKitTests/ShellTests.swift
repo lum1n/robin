@@ -4,6 +4,38 @@ import Testing
 @testable import RobinKit
 
 struct ShellTests {
+    @Test func sendRecoversStoredReplyAfterTimeout() async throws {
+        actor RecoverTransport: RobinTransport {
+            var messageAttempts = 0
+            var calls = 0
+            var responses: [RobinRaw]
+            init(responses: [RobinRaw]) {
+                self.responses = responses
+            }
+            func call(url: URL, method: String, body: Data?, token: String?) async throws -> RobinRaw {
+                calls += 1
+                if url.path.hasSuffix("/v1/messages") {
+                    messageAttempts += 1
+                    if messageAttempts == 1 {
+                        throw URLError(.timedOut)
+                    }
+                }
+                return responses.removeFirst()
+            }
+        }
+        let transport = RecoverTransport(responses: [
+            raw(200, #"{"token":"sess-1"}"#),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, #"{"enabled":false}"#),
+            raw(200, #"{"turns":[{"role":"user","text":"find cars"},{"role":"reply","text":"Found GLC listings."}]}"#),
+            raw(200, #"{"threads":["home"]}"#),
+        ])
+        let shell = Shell(transport: transport)
+        try await shell.signIn(instance: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", password: "pw")
+        try await shell.send(conversationID: "home", text: "find cars")
+        #expect(await shell.phase == .ready(threads: ["home"], reply: "Found GLC listings."))
+    }
+
     @Test func aConfirmWaitsAndLeavingDropsTheSession() async throws {
         let transport = ScriptedTransport(responses: [
             raw(200, #"{"token":"sess-1"}"#),

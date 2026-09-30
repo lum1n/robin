@@ -177,11 +177,37 @@ def test_confirmed_egress_restores_placeholders_before_open() -> None:
     assert "url must be" not in done["result"]
 
 
+def test_confirmed_egress_restores_google_org_name() -> None:
+    opened: list[str] = []
+
+    class Track(MemoryPage):
+        def open(self, url: str) -> None:
+            opened.append(url)
+            self.text = f"URL: {url}\n\nInteractive:\n(none)\n\nContent:\nok"
+
+        def location(self) -> str:
+            return opened[-1] if opened else ""
+
+    page = Track(text="desk")
+    assistant = Assistant()
+    assistant.add(Browser("ada", page))
+    vault = assistant.vaults.get("ada", "book")
+    placeholder = vault.token("ORG", "Google")
+    held = assistant.invoke("ada", "book", "browser_open", {"url": placeholder})
+    assert held["status"] == "confirm"
+    done = assistant.invoke("ada", "book", "browser_open", {"url": placeholder}, confirmed=True)
+    assert done["status"] == "done"
+    assert opened == ["https://www.google.com/"]
+
+
 def test_choice_words_are_not_opened_as_urls() -> None:
     from robin.capabilities.browser import _web_url
 
     assert _web_url("vethjem.no") == "https://vethjem.no"
     assert _web_url("https://vethjem.no/booking") == "https://vethjem.no/booking"
+    assert _web_url("Google") == "https://www.google.com/"
+    assert _web_url("Google Flights") == "https://www.google.com/travel/flights"
+    assert _web_url("LOT") == "https://www.lot.com/"
     for bad in ("clinic", "https://clinic", "http://home", "consultation", "https://[ORG_104]", "[ORG_1]"):
         try:
             _web_url(bad)
@@ -1273,6 +1299,138 @@ def test_submit_score_prefers_send_over_header_bestill() -> None:
     assert _submit_score("Bestill time") == 0
 
 
+def test_stale_ref_click_does_not_fall_through_to_name() -> None:
+    class EmptyPage:
+        def __init__(self) -> None:
+            self.frames = ()
+            self.main_frame = None
+
+        def locator(self, selector: str):
+            return _EmptyNode()
+
+        def get_by_role(self, role: str, name: str = ""):
+            raise AssertionError("must not fall through to name matching")
+
+        def get_by_text(self, target: str, exact: bool = False):
+            raise AssertionError("must not fall through to name matching")
+
+    class _EmptyNode:
+        def count(self) -> int:
+            return 0
+
+        @property
+        def first(self):
+            return self
+
+    page = EmptyPage()
+    try:
+        PlaywrightPage(page).click("Bil , Ikon av", role="link", ref="22")
+        raise AssertionError("expected stale ref error")
+    except RuntimeError as exc:
+        assert "[22]" in str(exc)
+        assert "browser_read" in str(exc)
+        assert "do not retry" in str(exc)
+
+
+def test_ref_click_force_when_normal_click_blocked() -> None:
+    class Blocked:
+        def __init__(self) -> None:
+            self.frames = ()
+            self.main_frame = None
+            self.forced = False
+            self.js = False
+
+        def locator(self, selector: str):
+            return _BlockedNode(self)
+
+    class _BlockedNode:
+        def __init__(self, page: Blocked) -> None:
+            self.page = page
+
+        def count(self) -> int:
+            return 1
+
+        @property
+        def first(self):
+            return self
+
+        def get_attribute(self, name: str):
+            return None
+
+        def scroll_into_view_if_needed(self, timeout: int | None = None) -> None:
+            return None
+
+        def click(self, timeout: int | None = None, force: bool = False) -> None:
+            if force:
+                self.page.forced = True
+                return
+            raise RuntimeError("intercepts pointer events")
+
+        def evaluate(self, script: str):
+            self.page.js = True
+
+    page = Blocked()
+    PlaywrightPage(page).click("Bil", role="link", ref="22")
+    assert page.forced is True
+
+
+def test_clear_gate_accepts_cookies_inside_an_iframe() -> None:
+    import re
+
+    class Frame:
+        def __init__(self, labels: list[str]) -> None:
+            self.labels = labels
+            self.clicked: list[str] = []
+
+        def get_by_role(self, role: str, name: str = ""):
+            pattern = name.pattern if hasattr(name, "pattern") else str(name)
+            rows = [label for label in self.labels if re.search(pattern, label, re.I)]
+            return _GateNode(self, rows)
+
+        def get_by_text(self, target: str, exact: bool = False):
+            rows = [label for label in self.labels if label == target or (not exact and target in label)]
+            return _GateNode(self, rows)
+
+    class Page(Frame):
+        def __init__(self) -> None:
+            super().__init__(["Cookieinnstillinger"])
+            self.frames = [self, Frame(["X", "Tilpass eller avvis", "Godta alle"])]
+            self.main_frame = None
+            self.timeouts = 0
+
+        def wait_for_timeout(self, ms: int) -> None:
+            self.timeouts += 1
+
+    class _GateNode:
+        def __init__(self, owner: Frame, rows: list[str]) -> None:
+            self.owner = owner
+            self.rows = rows
+
+        def count(self) -> int:
+            return len(self.rows)
+
+        @property
+        def first(self):
+            return self
+
+        def click(self, timeout: int | None = None) -> None:
+            self.owner.clicked.append(self.rows[0])
+
+    page = Page()
+    PlaywrightPage(page).clear_gate()
+    assert page.frames[1].clicked == ["Godta alle"]
+
+
+def test_click_fragment_shortens_autocomplete_labels() -> None:
+    from robin.capabilities.browser import _click_fragment
+
+    long = (
+        "glc 2027 i Bil (108 treff) glc 2027 i Utstyr til bil, båt og MC "
+        "(128 treff) glc 2027 i Torget (129 treff) Finn flere res"
+    )
+    assert _click_fragment(long) == "glc 2027"
+
+
 def test_browser_fill_profile_never_puts_values_in_tool_args() -> None:
     from robin.session import Assistant
 
@@ -1329,3 +1487,24 @@ def test_browser_fill_profile_never_puts_values_in_tool_args() -> None:
 
     missing = browser.invoke("ada", "browser_fill_profile", {"field": "address", "target": "12"})
     assert "no saved address" in missing
+
+
+def test_bot_wall_note_flags_captcha_and_empty_iframe() -> None:
+    from robin.capabilities.browser import _bot_wall_note
+
+    captcha = (
+        "URL: https://www.skyscanner.com/sttc/px/captcha-v2/index.html\nTitle: Skyscanner\n\n"
+        "Interactive:\n(none)\n\nContent:\n# Are you a human or a robot?\nPlease don’t take this personally"
+    )
+    note = _bot_wall_note(captcha)
+    assert "Bot/captcha wall" in note
+    assert "web_search" in note
+
+    empty = (
+        "URL: https://flybillet.no/\nTitle: flybillet.no\n\nInteractive:\n\n"
+        "[1] button \"iframe\" (main, focused)\n\nContent:\n(empty)"
+    )
+    assert "no usable content" in _bot_wall_note(empty)
+
+    ok = "URL: https://example.com/\nTitle: Hi\n\nInteractive:\n[1] link \"Home\"\n\nContent:\nHello"
+    assert _bot_wall_note(ok) == ""

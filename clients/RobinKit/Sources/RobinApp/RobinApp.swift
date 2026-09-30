@@ -79,6 +79,17 @@ final class ShellModel: ObservableObject {
         }
     }
 
+    func liveViewURL(path: String) -> URL? {
+        let base = instance.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty, !path.isEmpty else { return nil }
+        if path.hasPrefix("http://") || path.hasPrefix("https://") {
+            return URL(string: path)
+        }
+        let root = base.hasSuffix("/") ? String(base.dropLast()) : base
+        let suffix = path.hasPrefix("/") ? path : "/" + path
+        return URL(string: root + suffix)
+    }
+
     func connectMail() async {
         let secret = mailPassword
         mailPassword = ""
@@ -210,8 +221,11 @@ final class ShellModel: ObservableObject {
 }
 
 private func _reach(_ error: Error) -> String {
+    if let urlError = error as? URLError, urlError.code == .timedOut {
+        return "Robin took too long to answer."
+    }
     let text = String(describing: error).lowercased()
-    if text.contains("timed out") || text.contains("timeout") {
+    if text.contains("timed out") || text.contains("timeout") || text.contains("-1001") {
         return "Robin took too long to answer."
     }
     return "Could not reach Robin."
@@ -225,7 +239,7 @@ struct RobinRootView: View {
             switch model.phase {
             case .signedOut:
                 SignInForm(model: model)
-            case .ready, .confirm:
+            case .ready, .confirm, .handoff:
                 ConversationForm(model: model)
             }
         }
@@ -280,6 +294,18 @@ private struct ConversationForm: View {
                 Text(prompt)
                 Text(tool)
                 Button("Confirm") {
+                    Task { await model.confirm() }
+                }
+                .buttonStyle(.borderedProminent)
+                if let failure = model.failure {
+                    Text(failure)
+                }
+            case .handoff(_, let prompt, let liveURL):
+                Text(prompt)
+                if !liveURL.isEmpty, let url = model.liveViewURL(path: liveURL) {
+                    Link("Open live view", destination: url)
+                }
+                Button("Done") {
                     Task { await model.confirm() }
                 }
                 .buttonStyle(.borderedProminent)

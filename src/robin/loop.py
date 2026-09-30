@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextvars
+import importlib
 import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -15,6 +17,15 @@ from zoneinfo import ZoneInfo
 
 from robin.airlock import Entity, redact, release
 from robin.capability import ActiveTurn, current_task
+from robin.learning import (
+    BrowserTrace,
+    draft_site_skill,
+    is_tool_failure,
+    is_untrusted_tool,
+    looks_like_correction,
+    schedule_reflect,
+    skill_hint_for_open,
+)
 from robin.model import Model, ToolCall
 from robin.policy import Route, Task
 from robin.session import Assistant
@@ -29,11 +40,16 @@ SYSTEM = (
     "Placeholders such as [PERSON_1] or [EMAIL_1] stand for real values. Pass them verbatim in tool arguments. "
     "[UNRESOLVED] means text was withheld; do not guess its contents. "
     "Never invent passwords or national IDs. "
-    "When the person names a website or URL, use browser tools to open it and finish the task on that page "
-    "(click, type, book, buy, sign in). "
+    "When the person corrects how you did something or states a lasting preference, call lesson_save "
+    "with one imperative line and optional tags (tool names or website hosts). "
+    "Follow Learned lessons over your defaults, and over skill steps when they conflict. "
+    "When a Learned skill matches the task, skill_read it before acting. "
+    "When the person names a website or URL (vg.no, finn.no, https://…), browser_open that host "
+    "and finish the task on the page — do not use web_search as a substitute for opening the site. "
     "calendar_* tools are only this account's own calendar, not a third-party booking site. "
     "mail_* tools are only this account's mailbox. "
-    "Do not say you lack access to a website when browser tools are available — use them. "
+    "Do not say you lack access to a website or the web when browser tools are available — use browser_open. "
+    "If web_search fails, browser_open the named site instead of giving up. "
     "Prefer Interactive refs from the latest page snapshot when a name matches more than one control. "
     "Never ask the person to reply with 1, 2, or 3, and never invent a numbered menu from memory. "
     "Map their plain language to an Interactive control and browser_click that ref. Only ask when no control matches. "
@@ -47,7 +63,17 @@ SYSTEM = (
     "Controls listed under Interactive are available now — browser_click their ref. "
     "Never say a button is missing or not visible when it appears in Interactive. "
     "(more below) only means Content text is truncated; do not scroll away from a form to find a button that is already listed. "
-    "For named actions such as Send bestilling, use browser_click on that ref; browser_submit is only for type=submit login forms."
+    "For named actions such as Send bestilling, use browser_click on that ref; browser_submit is only for type=submit login forms. "
+    "If a browser tool fails, do not repeat the same target — browser_read or try a different Interactive ref. "
+    "If a page snapshot says bot/captcha wall or has empty Content behind an iframe, stop hopping sites — "
+    "tell the person automation was blocked and use web_search for a rough estimate or ask which site to try. "
+    "If conversation history already says a host blocked Robin's automated browser, do not browser_open that "
+    "same host again — say it is still blocked from this machine and offer web_search or another site. "
+    "When the Person line names a site as [ORG_n], pass that placeholder to browser_open — do not invent another host. "
+    "The latest Person line is the current task. Conversation history is context only — "
+    "do not resume an earlier website, news, or booking task unless the person asks again. "
+    "Greetings and identity questions (who are you, what is Robin) need a short plain-text "
+    "answer — do not open websites or search the web for them."
 )
 
 DEFAULT_MAX_STEPS = 24
@@ -72,6 +98,7 @@ class Reply:
     allow_cloud: bool = False
     free_text: bool = False
     timing: str = ""
+    live_url: str = ""
 
 
 class _Clock:
@@ -90,24 +117,44 @@ _clock: contextvars.ContextVar[_Clock | None] = contextvars.ContextVar("robin_cl
 
 
 def converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int = DEFAULT_MAX_STEPS) -> Reply:
-    clock = _Clock()
-    clock_token = _clock.set(clock)
-    token = current_task.set(
-        ActiveTurn(task.account_id, task.conversation_id, task.allow_cloud, task.free_text, task.text)
-    )
-    try:
-        reply = _with_site_login(assistant, task, model, max_steps=max_steps)
-    finally:
-        current_task.reset(token)
-        _clock.reset(clock_token)
-    assistant.remember(task.account_id, task.conversation_id, reply.status, reply.text)
-    assistant.persist_vault(task.account_id, task.conversation_id)
-    timing = clock.line()
-    print(f"robin timing: {timing}", file=sys.stderr, flush=True)
-    return replace(reply, timing=timing)
+    generation = assistant.begin_turn(task.account_id, task.conversation_id)
+    lock = assistant.conversation_lock(task.account_id, task.conversation_id)
+    with lock:
+        if not assistant.turn_active(task.account_id, task.conversation_id, generation):
+            return Reply("reply", "That turn was replaced by a newer message.", Route.LOCAL)
+        clock = _Clock()
+        clock_token = _clock.set(clock)
+        token = current_task.set(
+            ActiveTurn(task.account_id, task.conversation_id, task.allow_cloud, task.free_text, task.text)
+        )
+        try:
+            reply = _with_site_login(
+                assistant,
+                task,
+                model,
+                max_steps=max_steps,
+                generation=generation,
+            )
+        finally:
+            current_task.reset(token)
+            _clock.reset(clock_token)
+        if not assistant.turn_active(task.account_id, task.conversation_id, generation):
+            return Reply("reply", "That turn was replaced by a newer message.", Route.LOCAL)
+        assistant.remember(task.account_id, task.conversation_id, reply.status, reply.text)
+        assistant.persist_vault(task.account_id, task.conversation_id)
+        timing = clock.line()
+        print(f"robin timing: {timing}", file=sys.stderr, flush=True)
+        return replace(reply, timing=timing)
 
 
-def _with_site_login(assistant: Assistant, task: Task, model: Model, *, max_steps: int) -> Reply:
+def _with_site_login(
+    assistant: Assistant,
+    task: Task,
+    model: Model,
+    *,
+    max_steps: int,
+    generation: int,
+) -> Reply:
     accepted = assistant.accept_secret(task.account_id, task.conversation_id, task.text)
     if accepted is not None and accepted.reply:
         return Reply("reply", accepted.reply, Route.LOCAL)
@@ -131,7 +178,7 @@ def _with_site_login(assistant: Assistant, task: Task, model: Model, *, max_step
                 free_text=task.free_text,
             )
             _bind_turn(task)
-    return _converse(assistant, task, model, max_steps=max_steps)
+    return _converse(assistant, task, model, max_steps=max_steps, generation=generation)
 
 
 def _bind_turn(task: Task) -> None:
@@ -147,17 +194,19 @@ def _converse(
     model: Model,
     *,
     max_steps: int,
+    generation: int = 0,
     messages: list[dict[str, Any]] | None = None,
     seed_calls: list[dict[str, Any]] | None = None,
 ) -> Reply:
     decision = assistant.decide(task, record=messages is None)
     vault = assistant.vaults.get(task.account_id, task.conversation_id)
     vocabulary = assistant.vocabulary.get(task.account_id, ())
+    trace = BrowserTrace(correction=looks_like_correction(task.text))
     if messages is None:
         spoken = _release(task.text, vault, vocabulary, assistant.ner, free_text=task.free_text)
         history = _history(assistant, task, vault, vocabulary, assistant.ner)
         messages = [
-            {"role": "system", "content": _system(assistant, task.account_id)},
+            {"role": "system", "content": _system(assistant, task.account_id, task.text)},
             {"role": "user", "content": _user_message(spoken, history)},
         ]
         _trim_messages(messages)
@@ -172,12 +221,25 @@ def _converse(
                 }
             )
 
+    def _superseded() -> bool:
+        return generation != 0 and not assistant.turn_active(
+            task.account_id, task.conversation_id, generation
+        )
+
+    repeats: dict[str, int] = {}
+    steps_used = 0
     for _ in range(max_steps):
+        steps_used += 1
+        if _superseded():
+            return Reply("reply", "That turn was replaced by a newer message.", decision.route)
         tools = assistant.tools(task.account_id)
         allowed = {tool["name"] for tool in tools}
         turn = _complete(model, messages=messages, tools=tools)
+        if _superseded():
+            return Reply("reply", "That turn was replaced by a newer message.", decision.route)
         if not turn.tool_calls:
-            return _reply_text(turn.message, vault, vocabulary, decision.route)
+            reply = _reply_text(turn.message, vault, vocabulary, decision.route)
+            return _after_turn(assistant, task, model, reply, trace)
 
         assistant_message: dict[str, Any] = {
             "role": "assistant",
@@ -197,6 +259,8 @@ def _converse(
         messages.append(assistant_message)
 
         for index, call in enumerate(turn.tool_calls):
+            if _superseded():
+                return Reply("reply", "That turn was replaced by a newer message.", decision.route)
             if call.name not in allowed:
                 return Reply("reply", "That action is not available.", decision.route)
             outcome = assistant.invoke(
@@ -235,11 +299,57 @@ def _converse(
                     allow_cloud=task.allow_cloud,
                     free_text=task.free_text,
                 )
+            if _is_handoff(outcome.get("result") or ""):
+                prior = messages[:-1]
+                pending_calls = [
+                    {
+                        "id": remaining.id,
+                        "name": remaining.name,
+                        "arguments": dict(remaining.arguments),
+                    }
+                    for remaining in turn.tool_calls[index:]
+                ]
+                # Resume re-reads the page after the person clears the wall — do not re-open.
+                record_call = ToolCall(id=call.id, name="browser_read", arguments={})
+                _store_handoff(
+                    assistant,
+                    task,
+                    prior,
+                    record_call,
+                    pending_calls,
+                    decision.route.value,
+                    snapshot=str(outcome["result"]),
+                )
+                live = _live_url(assistant, task.account_id)
+                trace.handoff = True
+                reply = Reply(
+                    "handoff",
+                    _handoff_text(str(outcome["result"])),
+                    decision.route,
+                    tool="browser_read",
+                    arguments={},
+                    task_text=task.text,
+                    allow_cloud=task.allow_cloud,
+                    free_text=task.free_text,
+                    live_url=live,
+                )
+                return _after_turn(assistant, task, model, reply, trace)
             result = _release_result(outcome["result"], vault, vocabulary, assistant.ner)
             if len(result) > _TOOL_RESULT_CHARS:
                 result = result[:_TOOL_RESULT_CHARS]
+            _mark_tainted(call.name)
+            failed = is_tool_failure(result)
+            trace.note_call(call.name, call.arguments, result, failed=failed)
+            if call.name == "browser_open" and not failed:
+                hint = skill_hint_for_open(assistant, task.account_id, str(call.arguments.get("url") or ""))
+                if hint:
+                    result = f"{result}\n{hint}"
             if _credential_prompt(assistant, task.account_id, task.conversation_id, outcome["result"]):
-                return Reply("reply", outcome["result"], decision.route)
+                reply = _reply_text(outcome["result"], vault, vocabulary, decision.route)
+                return _after_turn(assistant, task, model, reply, trace)
+            result, stuck = _note_repeated_failure(repeats, call.name, call.arguments, result)
+            if stuck:
+                trace.stuck = True
             messages.append(
                 {
                     "role": "tool",
@@ -247,8 +357,22 @@ def _converse(
                     "content": result,
                 }
             )
+            if stuck:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "That same browser action failed repeatedly. Do not retry it. "
+                            "browser_read for a fresh snapshot, try a different Interactive ref, "
+                            "or answer the person with what you already know."
+                        ),
+                    }
+                )
         _trim_messages(messages)
 
+    if _superseded():
+        return Reply("reply", "That turn was replaced by a newer message.", decision.route)
+    trace.hit_max_steps = True
     messages.append(
         {
             "role": "user",
@@ -256,7 +380,73 @@ def _converse(
         }
     )
     turn = _complete(model, messages=messages, tools=[])
-    return _reply_text(turn.message, vault, vocabulary, decision.route)
+    reply = _reply_text(turn.message, vault, vocabulary, decision.route)
+    return _after_turn(assistant, task, model, reply, trace)
+
+
+def _mark_tainted(tool_name: str) -> None:
+    if not is_untrusted_tool(tool_name):
+        return
+    turn = current_task.get()
+    if turn is not None:
+        turn.tainted = True
+
+
+def _after_turn(
+    assistant: Assistant,
+    task: Task,
+    model: Model,
+    reply: Reply,
+    trace: BrowserTrace,
+) -> Reply:
+    if reply.status == "reply" and trace.should_draft_site_skill(
+        reply_status=reply.status, reply_text=reply.text
+    ):
+        account_id = task.account_id
+        conversation_id = task.conversation_id
+        person_text = task.text
+        hosts = list(trace.hosts)
+
+        def _draft() -> None:
+            try:
+                draft_site_skill(assistant, account_id, conversation_id, person_text, trace)
+            except Exception:
+                return
+
+        threading.Thread(target=_draft, name="robin-site-skill", daemon=True).start()
+        if hosts:
+            # Offer immediately; the draft lands in the background before the next turn.
+            offer = f"I can remember how I did this on {hosts[0]} for next time."
+            if offer not in reply.text:
+                reply = replace(reply, text=f"{reply.text}\n\n{offer}".strip())
+    if reply.status in {"reply", "handoff"} and trace.should_reflect(
+        reply_status=reply.status, reply_text=reply.text
+    ):
+        schedule_reflect(
+            assistant,
+            model,
+            account_id=task.account_id,
+            conversation_id=task.conversation_id,
+            person_text=task.text,
+            reply_text=reply.text,
+            trace=trace,
+            allow_cloud=task.allow_cloud,
+            free_text=task.free_text,
+            sync=False,
+        )
+    _mark_lessons_used(assistant, task)
+    return reply
+
+
+def _mark_lessons_used(assistant: Assistant, task: Task) -> None:
+    for capability in assistant.registry._capabilities:
+        select = getattr(capability, "select", None)
+        mark = getattr(capability, "mark_used", None)
+        if not callable(select) or not callable(mark):
+            continue
+        selected = select(task.account_id, task.text)
+        mark(task.account_id, [row["id"] for row in selected])
+        return
 
 
 def _store_transcript(
@@ -283,14 +473,130 @@ def _store_transcript(
         assistant.store.save_pending(task.account_id, task.conversation_id, record)
 
 
-def _system(assistant: Assistant, account_id: str) -> str:
+def _store_handoff(
+    assistant: Assistant,
+    task: Task,
+    messages: list[dict[str, Any]],
+    call: ToolCall,
+    pending_calls: list[dict[str, Any]],
+    route: str,
+    *,
+    snapshot: str,
+) -> None:
+    record = {
+        "tool": "browser_read",
+        "arguments": {},
+        "route": route,
+        "text": task.text,
+        "allow_cloud": task.allow_cloud,
+        "free_text": task.free_text,
+        "messages": messages,
+        "pending_calls": pending_calls,
+        "call_id": call.id,
+        "kind": "handoff",
+        "snapshot": snapshot[:2000],
+    }
+    assistant._pending[(task.account_id, task.conversation_id)] = record
+    if assistant.store is not None:
+        assistant.store.save_pending(task.account_id, task.conversation_id, record)
+
+
+def _is_handoff(result: str) -> bool:
+    try:
+        browser = importlib.import_module("robin.capabilities.browser")
+        return browser.is_handoff_result(result)
+    except Exception:
+        return result.lstrip().startswith("HANDOFF:")
+
+
+def _handoff_text(snapshot: str) -> str:
+    try:
+        browser = importlib.import_module("robin.capabilities.browser")
+        return browser.handoff_prompt(snapshot)
+    except Exception:
+        return (
+            "A captcha or security check is blocking the page. "
+            "Open the live view, solve it, then tap Done so Robin can continue."
+        )
+
+
+def _live_url(assistant: Assistant, account_id: str) -> str:
+    try:
+        capability = assistant.registry.for_account(account_id)
+    except Exception:
+        capability = ()
+    for item in capability:
+        live = getattr(item, "live_path", None)
+        if callable(live):
+            path = live(account_id)
+            if path:
+                return path
+    return f"/v1/browser/live?account_id={account_id}"
+
+
+_FAILURE_LEAD = re.compile(
+    r"^(no |could not |control \[|not (found|available)|the page did not|url must|Chromium)",
+    re.IGNORECASE,
+)
+
+
+def _note_repeated_failure(
+    repeats: dict[str, int],
+    name: str,
+    arguments: dict[str, Any],
+    result: str,
+) -> tuple[str, bool]:
+    """Detect identical failing tool calls so the model stops retrying the same dead end."""
+    line = (result or "").strip().splitlines()[0].strip() if result else ""
+    failed = bool(line) and (
+        bool(_FAILURE_LEAD.match(line))
+        or "not clickable" in line.lower()
+        or "gone or not clickable" in line.lower()
+        or "could not be clicked" in line.lower()
+        or "no clickable" in line.lower()
+        or "no text field" in line.lower()
+        or "no type=submit" in line.lower()
+    )
+    key = json.dumps({"name": name, "arguments": arguments}, sort_keys=True, default=str)
+    if not failed:
+        repeats.pop(key, None)
+        return result, False
+    count = repeats.get(key, 0) + 1
+    repeats[key] = count
+    if count < 2:
+        return result, False
+    notice = (
+        f"{line}\n"
+        "Same action failed again — do not retry these arguments. "
+        "browser_read or pick a different Interactive ref."
+    )
+    return notice, count >= 3
+
+
+def _system(assistant: Assistant, account_id: str, text: str = "") -> str:
     now = datetime.now().astimezone()
     stamp = now.strftime("%Y-%m-%d %H:%M %Z")
     lines = [SYSTEM, f"Current local time: {stamp}."]
-    statuses = assistant.statuses(account_id)
+    statuses = list(assistant.statuses(account_id))
+    if not assistant.ner.available():
+        statuses.append(
+            "ner: unavailable — prior conversation turns and free-text tool results are [UNRESOLVED]"
+        )
     if statuses:
         lines.append("Connectors:")
         lines.extend(f"- {line}" for line in statuses)
+    guidance = assistant.registry.guidance(account_id, text)
+    if guidance:
+        vault = assistant.vaults.get(account_id, "guidance")
+        vocabulary = assistant.vocabulary.get(account_id, ())
+        # Lessons are checked for secrets at save time; release with free_text=False so
+        # missing NER does not turn the whole section into [UNRESOLVED].
+        released = [
+            _release(line, vault, vocabulary, assistant.ner, free_text=False) for line in guidance
+        ]
+        released = [line for line in released if line and line != "[UNRESOLVED]"]
+        if released:
+            lines.extend(released)
     return "\n".join(lines)
 
 
@@ -635,7 +941,16 @@ def _history(assistant: Assistant, task: Task, vault, vocabulary, ner) -> str:
             continue
         who = "person" if turn["role"] == "user" else "robin"
         if who == "robin" and _menu_spam(body):
-            body = "opened or described the booking page — continue with browser tools, do not re-list options"
+            body = "earlier reply listed booking choices instead of clicking — ignore that list"
+        if who == "robin" and _bot_block_spam(body):
+            body = (
+                "earlier attempt: that host blocked Robin's automated browser — "
+                "do not retry the same host; use web_search or ask for another site"
+            )
+        elif who == "robin" and _access_spam(body):
+            body = "earlier reply wrongly said a website was unreachable — ignore that"
+        if who == "robin" and _news_spam(body):
+            body = "earlier reply listed news headlines — ignore unless the person asks for news"
         lines.append(f"{who}: {body}")
     return "\n".join(lines)
 
@@ -647,6 +962,64 @@ def _menu_spam(body: str) -> bool:
     if numbered < 2:
         return False
     return any(word in lower for word in ("clinic", "klinikk", "home visit", "hjemme", "video", "option", "appointment", "bestill"))
+
+
+def _bot_block_spam(body: str) -> bool:
+    """True when a past reply reported a real WAF/captcha/automation block (keep that fact)."""
+    lower = body.lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "bot/captcha",
+            "captcha wall",
+            "blocking automated",
+            "blocked automated",
+            "blocks automation",
+            "blocked automation",
+            "security polic",
+            "security policies",
+            "has been blocked",
+            "access to the website has been blocked",
+            "access to the website has been denied",
+            "waf",
+            "are you a human or a robot",
+            "verify you are human",
+        )
+    )
+
+
+def _access_spam(body: str) -> bool:
+    """True when a past reply wrongly claimed the web was unreachable without trying tools."""
+    lower = body.lower()
+    if "browser_open" in lower or _bot_block_spam(body):
+        return False
+    # Only the lazy "I have no web access" refusals — not real site/WAF failures.
+    return any(
+        phrase in lower
+        for phrase in (
+            "unable to access the web",
+            "cannot access the web",
+            "can't access the web",
+            "lack access to the web",
+            "do not have access to the web",
+            "don't have access to the web",
+            "unable to access the internet",
+            "no access to the internet",
+            "visit the site directly",
+            "check the website directly",
+            "not displaying any results",
+            "currently not displaying",
+        )
+    )
+
+
+def _news_spam(body: str) -> bool:
+    """True when a past reply dumped a numbered news headline list."""
+    lower = body.lower()
+    if "headline" not in lower and "nyhet" not in lower and "siste nytt" not in lower:
+        return False
+    numbered = sum(1 for marker in ("1.", "2.", "3.", "1)", "2)", "3)") if marker in body)
+    return numbered >= 2
 
 
 def _is_page_snapshot(text: str) -> bool:
@@ -667,7 +1040,27 @@ def _split_snapshot(result: str) -> tuple[str, str]:
 def _reply_text(message: str, vault, vocabulary, route: Route) -> Reply:
     text = message.strip() or "I could not finish that."
     shown, _ = redact(text, vault, vocabulary=vocabulary)
-    return Reply("reply", vault.restore(shown), route)
+    return Reply("reply", _for_person(vault.restore(shown)), route)
+
+
+_LEFTOVER_PLACEHOLDER = re.compile(r"\[([A-Z][A-Z0-9]*)_\d+\]")
+
+
+def _for_person(text: str) -> str:
+    """Person-facing text must not keep model/airlock placeholders."""
+
+    def repl(match: re.Match[str]) -> str:
+        label = match.group(1)
+        if label == "ORG":
+            return "that site"
+        if label in {"PERSON", "EMAIL", "PHONE", "ADDRESS"}:
+            return "that detail"
+        return "…"
+
+    cleaned = _LEFTOVER_PLACEHOLDER.sub(repl, text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r" ?\n ?", "\n", cleaned)
+    return cleaned.strip() or text.strip()
 
 
 def _confirm_text(assistant: Assistant, task: Task, call: ToolCall) -> str:

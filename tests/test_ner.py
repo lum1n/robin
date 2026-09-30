@@ -1,7 +1,31 @@
 import threading
 import time
 
-from robin.ner import GlinerNer
+from robin.ner import GlinerNer, spurious_person
+
+
+def test_spurious_person_drops_identity_asks_and_pronouns() -> None:
+    assert spurious_person("who are you?", 0, 12)
+    assert spurious_person("Who are you?", 0, 12)
+    assert spurious_person("hvem er du?", 0, 11)
+    assert spurious_person("No, I was asking", 4, 5)
+    assert spurious_person("ask you later", 4, 7)
+    assert spurious_person("Hello, Robin", 7, 12)
+    assert not spurious_person("Jane Doe called", 0, 8)
+    assert not spurious_person("Vegard was here", 0, 6)
+
+
+def test_detect_filters_identity_question_as_person(monkeypatch) -> None:
+    ner = GlinerNer()
+
+    class Fake:
+        def predict_entities(self, text, labels, threshold=0.5):
+            return [{"start": 0, "end": len(text.rstrip("?")), "label": "person"}]
+
+    ner._model = Fake()
+    ner._failed = False
+    assert ner.detect("who are you?") == ()
+    assert ner.detect("Jane Doe")[0].label == "PERSON"
 
 
 def test_load_failure_marks_ner_unavailable(monkeypatch) -> None:

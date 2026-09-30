@@ -35,6 +35,8 @@ class Tool:
     effect: Effect
     drop_arguments: tuple[str, ...] = ()
     egress: bool = False
+    confirm: bool = False
+    untrusted: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,13 +63,15 @@ class DueWork:
     finish: Callable[[str], None]
 
 
-@dataclass(frozen=True)
+@dataclass
 class ActiveTurn:
     account_id: str
     conversation_id: str
     allow_cloud: bool = False
     free_text: bool = False
     text: str = ""
+    tainted: bool = False
+    learning_source: str = "person"
 
 
 current_task: ContextVar[ActiveTurn | None] = ContextVar("robin_task", default=None)
@@ -96,6 +100,10 @@ class Capability:
     def status(self, account_id: str) -> str:
         """One-line connector status for the system prompt, or empty."""
         return ""
+
+    def guidance(self, account_id: str, text: str) -> list[str]:
+        """Short lines for the system prompt about this account's learned preferences."""
+        return []
 
     def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
         return None
@@ -157,6 +165,12 @@ class Registry:
             line = capability.status(account_id).strip()
             if line:
                 lines.append(line)
+        return lines
+
+    def guidance(self, account_id: str, text: str) -> list[str]:
+        lines: list[str] = []
+        for capability in self.for_account(account_id):
+            lines.extend(capability.guidance(account_id, text))
         return lines
 
 

@@ -19,9 +19,11 @@ from robin.capabilities.memory import Memory
 from robin.capabilities.notify import Notify
 from robin.capabilities.photos import Photos
 from robin.capabilities.shell import ShellBox, Terminal
+from robin.capabilities.skills import Skills
 from robin.capabilities.transit import Transit
 from robin.capabilities.weather import Weather
 from robin.capabilities.web import Web
+from robin.learning import Learning
 from robin.session import Assistant
 
 _HOUSE_FILES = Path("/var/lib/robin/files")
@@ -63,7 +65,11 @@ def install(assistant: Assistant) -> None:
     assistant.add(Contacts(CardDAV(assistant.broker)))
     assistant.add(Lists(store=assistant.store))
     assistant.add(Jobs(store=assistant.store))
-    assistant.add(Memory(store=assistant.store))
+    memory = Memory(store=assistant.store)
+    assistant.add(memory)
+    skills = Skills(store=assistant.store)
+    assistant.add(skills)
+    assistant.add(Learning(store=assistant.store, memory=memory, skills=skills))
     assistant.add(History(store=assistant.store))
     assistant.add(Notify(store=assistant.store))
     assistant.add(browser)
@@ -75,3 +81,4 @@ def install(assistant: Assistant) -> None:
     assistant.add(Weather())
     assistant.add(Transit())
     assistant.add(Home(broker=assistant.broker))
+    skills.known_tools = set(assistant.registry._names)

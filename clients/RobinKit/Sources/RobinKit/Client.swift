@@ -138,6 +138,35 @@ public actor RobinClient {
         return try JSONDecoder().decode(ThreadList.self, from: accepted(raw, status: 200)).threads
     }
 
+    public func turns(conversationID: String) async throws -> [Turn] {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/threads/\(conversationID)", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(ThreadTurns.self, from: accepted(raw, status: 200)).turns
+    }
+
+    /// After a send times out, poll the stored thread for Robin's reply (the server often finished anyway).
+    public func awaitStoredReply(
+        conversationID: String,
+        afterUserText: String,
+        attempts: Int = 36,
+        delayNanoseconds: UInt64 = 5_000_000_000
+    ) async throws -> Reply? {
+        for attempt in 0..<attempts {
+            if attempt > 0 {
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+            }
+            let turns = try await turns(conversationID: conversationID)
+            if let reply = latestRobinReply(in: turns, afterUserText: afterUserText) {
+                return reply
+            }
+        }
+        return nil
+    }
+
     private func postMessage(_ body: Data) async throws -> Reply {
         let raw = try await transport.call(
             url: try url(path: "/v1/messages"),
@@ -176,13 +205,15 @@ public struct Reply: Decodable, Sendable, Equatable {
     public let route: String
     public let tool: String?
     public let timing: String?
+    public let liveURL: String?
 
-    public init(status: String, text: String, route: String, tool: String?, timing: String? = nil) {
+    public init(status: String, text: String, route: String, tool: String?, timing: String? = nil, liveURL: String? = nil) {
         self.status = status
         self.text = text
         self.route = route
         self.tool = tool
         self.timing = timing
+        self.liveURL = liveURL
     }
 
     public init(from decoder: Decoder) throws {
@@ -192,10 +223,12 @@ public struct Reply: Decodable, Sendable, Equatable {
         route = try container.decode(String.self, forKey: .route)
         tool = try container.decodeIfPresent(String.self, forKey: .tool)
         timing = try container.decodeIfPresent(String.self, forKey: .timing)
+        liveURL = try container.decodeIfPresent(String.self, forKey: .liveURL)
     }
 
     private enum CodingKeys: String, CodingKey {
         case status, text, route, tool, timing
+        case liveURL = "live_url"
     }
 }
 
@@ -219,10 +252,17 @@ public protocol RobinTransport: Sendable {
 }
 
 public struct HTTPTransport: RobinTransport {
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 600
+        configuration.timeoutIntervalForResource = 600
+        return URLSession(configuration: configuration)
+    }()
+
     public init() {}
 
     public func call(url: URL, method: String, body: Data?, token: String?) async throws -> RobinRaw {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: 600)
         request.httpMethod = method
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -231,8 +271,7 @@ public struct HTTPTransport: RobinTransport {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = body
         }
-        request.timeoutInterval = 300
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         return RobinRaw(status: status, data: data)
     }
@@ -346,6 +385,26 @@ private struct ProfileBody: Decodable {
 
 private struct ThreadList: Decodable {
     var threads: [String]
+}
+
+public struct Turn: Decodable, Sendable, Equatable {
+    public var role: String
+    public var text: String
+}
+
+private struct ThreadTurns: Decodable {
+    var turns: [Turn]
+}
+
+func latestRobinReply(in turns: [Turn], afterUserText: String) -> Reply? {
+    guard let userIndex = turns.lastIndex(where: { $0.role == "user" && $0.text == afterUserText }) else {
+        return nil
+    }
+    let later = turns.suffix(from: turns.index(after: userIndex))
+    guard let robin = later.last(where: { $0.role != "user" && !$0.text.isEmpty }) else {
+        return nil
+    }
+    return Reply(status: robin.role, text: robin.text, route: "local", tool: nil)
 }
 
 private struct ErrorBody: Decodable {

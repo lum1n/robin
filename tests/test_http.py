@@ -184,3 +184,74 @@ def test_a_request_without_an_account_is_rejected(tmp_path) -> None:
     status, payload = dispatch(service, "POST", "/v1/messages", body={"text": "hello"})
     assert status == 400
     assert "account_id" in payload["error"]
+
+
+def test_send_swallows_client_disconnect() -> None:
+    from robin.http import _send
+
+    class Gone:
+        def send_response(self, status: int) -> None:
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+        def send_header(self, *args: object) -> None:
+            raise AssertionError("should not reach headers after reset")
+
+        def end_headers(self) -> None:
+            raise AssertionError("should not reach end_headers after reset")
+
+        @property
+        def wfile(self) -> object:
+            raise AssertionError("should not write body after reset")
+
+    _send(Gone(), 200, b"{}", "application/json")  # type: ignore[arg-type]
+
+
+def test_message_heartbeat_keeps_leading_whitespace_json_decodable(monkeypatch) -> None:
+    import io
+    import json
+    import time
+
+    from robin import http as http_mod
+
+    monkeypatch.setattr(http_mod, "_HEARTBEAT_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(http_mod, "_HEARTBEAT_SECONDS", 0.05)
+
+    class FakeHandler:
+        def __init__(self) -> None:
+            self.wfile = io.BytesIO()
+            self.status = None
+            self.headers: list[tuple[str, str]] = []
+
+        def send_response(self, status: int) -> None:
+            self.status = status
+
+        def send_header(self, key: str, value: str) -> None:
+            self.headers.append((key, value))
+
+        def end_headers(self) -> None:
+            return
+
+    handler = FakeHandler()
+
+    def compute() -> tuple[int, dict]:
+        time.sleep(0.18)
+        return 200, {"status": "reply", "text": "hi", "route": "cloud"}
+
+    http_mod._send_json_with_heartbeat(handler, compute)  # type: ignore[arg-type]
+    assert handler.status == 200
+    assert ("Transfer-Encoding", "chunked") in handler.headers
+    raw = handler.wfile.getvalue()
+    # Reassemble chunked body: size\r\ndata\r\n ...
+    body = b""
+    view = memoryview(raw)
+    offset = 0
+    while offset < len(view):
+        end = raw.find(b"\r\n", offset)
+        size = int(raw[offset:end], 16)
+        offset = end + 2
+        if size == 0:
+            break
+        body += raw[offset : offset + size]
+        offset += size + 2
+    assert body.lstrip().startswith(b"{")
+    assert json.loads(body)["text"] == "hi"

@@ -91,6 +91,8 @@ class HouseholdStore:
         self._db.execute("CREATE TABLE IF NOT EXISTS jobs (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS photo_index (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS memory (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS skills (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS learning (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS notifications (
@@ -385,6 +387,36 @@ class HouseholdStore:
 
     def load_memory(self) -> dict[str, list[dict]]:
         rows = self._db.execute("SELECT account_id, body FROM memory").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
+
+    def save_skills(self, account_id: str, skills: list[dict]) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO skills (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(skills, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_skills(self) -> dict[str, list[dict]]:
+        rows = self._db.execute("SELECT account_id, body FROM skills").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
+
+    def save_learning(self, account_id: str, state: dict) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO learning (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(state, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_learning(self) -> dict[str, dict]:
+        rows = self._db.execute("SELECT account_id, body FROM learning").fetchall()
         return {account_id: json.loads(self._open(body)) for account_id, body in rows}
 
     def save_notification(self, account_id: str, text: str) -> None:

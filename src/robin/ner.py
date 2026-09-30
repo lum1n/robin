@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import warnings
 from typing import Protocol
@@ -22,6 +23,63 @@ _LABELS = {
 }
 
 _CACHE_LIMIT = 64
+
+# GLiNER often tags pronouns and identity questions as PERSON, which erases the
+# person's actual ask (e.g. "who are you?" → [PERSON_1] → model resumes prior task).
+_PRONOUNS = frozenset(
+    {
+        "i",
+        "you",
+        "me",
+        "we",
+        "us",
+        "he",
+        "she",
+        "they",
+        "them",
+        "him",
+        "her",
+        "my",
+        "your",
+        "his",
+        "their",
+        "jeg",
+        "du",
+        "deg",
+        "vi",
+        "oss",
+        "han",
+        "hun",
+        "de",
+        "dem",
+        "henne",
+        "min",
+        "mitt",
+        "din",
+        "ditt",
+        "deres",
+    }
+)
+_ASSISTANT_NAMES = frozenset({"robin"})
+_IDENTITY_QUESTION = re.compile(
+    r"(?i)^(who\s+are\s+you|who\s+r\s+u|hvem\s+er\s+du|what(?:'s|\s+is)\s+your\s+name|"
+    r"hvem\s+er\s+robin|who\s+is\s+robin|what\s+are\s+you)(\s*\?*)?$"
+)
+
+
+def spurious_person(text: str, start: int, end: int) -> bool:
+    """True when a PERSON span is not a name (pronoun, assistant name, identity ask)."""
+    if end <= start or start < 0 or end > len(text):
+        return True
+    span = text[start:end].strip().strip("?.!,;:\"'“”")
+    if not span:
+        return True
+    lowered = span.lower()
+    if lowered in _PRONOUNS or lowered in _ASSISTANT_NAMES:
+        return True
+    if _IDENTITY_QUESTION.fullmatch(lowered):
+        return True
+    return False
 
 
 class Ner(Protocol):
@@ -91,7 +149,11 @@ class GlinerNer:
             label = _LABELS.get(str(item.get("label", "")).lower())
             if label is None:
                 continue
-            entities.append(Entity(int(item["start"]), int(item["end"]), label))
+            start = int(item["start"])
+            end = int(item["end"])
+            if label == "PERSON" and spurious_person(text, start, end):
+                continue
+            entities.append(Entity(start, end, label))
         result = tuple(entities)
         if len(self._cache) >= _CACHE_LIMIT:
             self._cache.clear()

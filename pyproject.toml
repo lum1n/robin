@@ -16,6 +16,8 @@ ner = [
     "protobuf>=7.36.2",
 ]
 photos = ["open-clip-torch>=2.24", "pillow>=10"]
+stealth = ["patchright>=1.49"]
+camoufox = ["camoufox[geoip]>=0.4"]
 
 [project.scripts]
 robin = "robin.__main__:main"

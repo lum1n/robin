@@ -235,6 +235,11 @@ class PlaywrightPage:
 
     def settle(self, *, timeout_ms: int = 4000) -> None:
         """Wait until a SPA route finishes painting, not just a fixed pause."""
+        # Cookie/consent overlays often load after first paint and block clicks/content.
+        try:
+            self.clear_gate()
+        except Exception:
+            pass
         page = self._page
         wait = getattr(page, "wait_for_load_state", None)
         if callable(wait):
@@ -285,6 +290,10 @@ class PlaywrightPage:
         if ref:
             if self._act_ref(ref, "click"):
                 return
+            raise RuntimeError(
+                f'control [{ref}] is gone or not clickable — browser_read for a fresh snapshot, '
+                f'then click a current Interactive ref (do not retry [{ref}])'
+            )
         if role in {"link", "button"}:
             try:
                 control = self._page.get_by_role(role, name=target)
@@ -312,6 +321,34 @@ class PlaywrightPage:
             raise
         except Exception:
             pass
+        # Prefer a shorter distinctive fragment for long autocomplete / search labels.
+        fragment = _click_fragment(target)
+        if fragment and fragment != target:
+            try:
+                control = self._page.get_by_text(fragment, exact=False)
+                count = int(control.count())
+                if count == 1:
+                    _raise_if_disabled(control.first, target)
+                    _call_timeout(control.first.click, 5000)
+                    return
+                if count > 1:
+                    # Prefer the shortest exact-looking match.
+                    for index in range(min(count, 8)):
+                        try:
+                            node = control.nth(index)
+                            text = str(node.inner_text() or "")
+                            if fragment.lower() in text.lower():
+                                _raise_if_disabled(node, target)
+                                _call_timeout(node.click, 5000)
+                                return
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            continue
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
         try:
             control = self._page.get_by_text(target)
             if int(control.count()) > 0:
@@ -435,11 +472,14 @@ class PlaywrightPage:
         selector = f'[data-robin-ref="{ref}"]'
         frames: list[Any] = [self._page]
         frames.extend(frame for frame in (getattr(self._page, "frames", None) or ()) if frame is not None)
+        saw = False
+        last_error: Exception | None = None
         for frame in frames:
             try:
                 locator = frame.locator(selector)
                 if int(locator.count()) == 0:
                     continue
+                saw = True
                 target = locator.first
                 if action == "click":
                     try:
@@ -451,8 +491,10 @@ class PlaywrightPage:
                         raise RuntimeError(
                             f'control [{ref}] is disabled — fill required fields first, then click again'
                         )
-                    _call_timeout(target.click, 5000)
-                elif action == "select":
+                    if _click_locator(target):
+                        return True
+                    continue
+                if action == "select":
                     _call_timeout(target.select_option, 5000, text)
                 elif action == "hover":
                     _call_timeout(target.hover, 5000)
@@ -461,8 +503,15 @@ class PlaywrightPage:
                 return True
             except RuntimeError:
                 raise
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 continue
+        if saw:
+            detail = str(last_error).splitlines()[0].strip() if last_error else ""
+            suffix = f" ({detail[:120]})" if detail else ""
+            raise RuntimeError(
+                f'control [{ref}] could not be clicked{suffix} — browser_read, then try another Interactive ref'
+            )
         return False
 
     def _fill_named(self, target: str, text: str) -> bool:
@@ -554,15 +603,31 @@ class PlaywrightPage:
         return bool(self._act_ref(best_ref, "click"))
 
     def needs_login(self) -> bool:
-        if int(self._fields("input[type='password']").count()) > 0:
-            return True
-        if int(self._fields(_USER_SELECTOR).count()) == 0:
-            return False
+        """True only when a visible password field is present (a real login form).
+
+        Email/search text boxes plus a header "Log in" link must not count — flight
+        OTAs and shops always have those and would trap every browse in a sign-in ask.
+        """
         try:
-            text = str(self._page.locator("body").inner_text())
+            passwords = self._fields("input[type='password']")
+            count = int(passwords.count())
         except Exception:
             return False
-        return bool(_LOGIN_WORD.search(text))
+        if count <= 0:
+            return False
+        visible = 0
+        checked = 0
+        for index in range(count):
+            try:
+                node = passwords.nth(index)
+                checked += 1
+                if bool(node.is_visible()):
+                    visible += 1
+            except Exception:
+                continue
+        if checked == 0:
+            return True
+        return visible > 0
 
     def type_username(self, text: str) -> None:
         self._await_selector(_USER_SELECTOR, timeout_ms=8000)
@@ -572,14 +637,53 @@ class PlaywrightPage:
         field.first.fill(text)
 
     def clear_gate(self) -> None:
-        for label in ("Accept all", "Accept", "I agree", "Allow all", "Agree", "Godta alle", "Godta"):
+        """Dismiss cookie/consent overlays, including Sourcepoint-style iframes."""
+        labels = (
+            "Godta alle",
+            "Tillat alle",
+            "Accept all",
+            "Allow all",
+            "Accept All",
+            "I agree",
+            "Agree",
+            "Accept",
+            "Godta",
+            "Tillat",
+        )
+        # CMP iframes often appear a beat after first paint.
+        for _attempt in range(6):
+            if self._click_gate_label(labels):
+                return
             try:
-                control = self._page.get_by_role("button", name=label)
-                if int(control.count()) > 0:
-                    control.first.click(timeout=1500)
-                    return
+                self._page.wait_for_timeout(300)
             except Exception:
-                continue
+                time.sleep(0.3)
+
+    def _click_gate_label(self, labels: tuple[str, ...]) -> bool:
+        frames: list[Any] = [self._page]
+        frames.extend(frame for frame in (getattr(self._page, "frames", None) or ()) if frame is not None)
+        for frame in frames:
+            for label in labels:
+                try:
+                    control = frame.get_by_role("button", name=label)
+                    count = int(control.count())
+                    if count <= 0:
+                        control = frame.get_by_role(
+                            "button",
+                            name=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE),
+                        )
+                        count = int(control.count())
+                    if count <= 0:
+                        continue
+                    _call_timeout(control.first.click, 2500)
+                    try:
+                        self._page.wait_for_timeout(400)
+                    except Exception:
+                        time.sleep(0.4)
+                    return True
+                except Exception:
+                    continue
+        return False
 
     def location(self) -> str:
         return str(getattr(self._page, "url", "") or "")
@@ -765,23 +869,116 @@ def _chromium_executable() -> Path | None:
     return None
 
 
-def open_chromium(url: str, profile: Path | None = None) -> PlaywrightPage:
+_HANDOFF_PREFIX = "HANDOFF:"
+_VIEWPORT = {"width": 1920, "height": 1080}
+_LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--window-size=1920,1080",
+]
+_IGNORE_ARGS = ["--enable-automation"]
+
+
+def launch_options(*, headless: bool | None = None, account_id: str = "") -> dict[str, Any]:
+    """Options passed to Chromium launch / persistent context. Tests assert these."""
+    from robin.capabilities.vdisplay import headless_requested
+
+    use_headless = headless_requested() if headless is None else headless
+    options: dict[str, Any] = {
+        "headless": use_headless,
+        "ignore_default_args": list(_IGNORE_ARGS),
+        "args": list(_LAUNCH_ARGS),
+        "accept_downloads": True,
+        "locale": "nb-NO",
+        "timezone_id": "Europe/Oslo",
+        "viewport": dict(_VIEWPORT),
+        "account_id": account_id,
+    }
+    if _chrome_available():
+        options["channel"] = "chrome"
+    return options
+
+
+def _chrome_available() -> bool:
+    for name in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium"):
+        path = Path("/usr/bin") / name
+        if path.is_file() and os.access(path, os.X_OK):
+            return True
+    return False
+
+
+def _sync_api():
+    from robin.capabilities.vdisplay import browser_engine
+
+    engine = browser_engine()
+    if engine == "patchright":
+        from patchright.sync_api import sync_playwright
+
+        return sync_playwright, "chromium"
+    if engine == "camoufox":
+        try:
+            from camoufox.sync_api import Camoufox
+
+            return Camoufox, "camoufox"
+        except Exception:
+            from playwright.sync_api import sync_playwright
+
+            return sync_playwright, "chromium"
     from playwright.sync_api import sync_playwright
 
-    executable = _chromium_executable()
-    if executable is None:
+    return sync_playwright, "chromium"
+
+
+def open_chromium(url: str, profile: Path | None = None, *, account_id: str = "") -> PlaywrightPage:
+    from robin.capabilities.vdisplay import browser_engine, display_for, headless_requested
+
+    options = launch_options(account_id=account_id)
+    use_headless = bool(options["headless"])
+    display = None
+    if not use_headless and not os.environ.get("DISPLAY"):
+        try:
+            display = display_for(account_id or "_default")
+            display.start()
+            os.environ["DISPLAY"] = display.display
+        except RuntimeError:
+            # No Xvfb on this machine — fall back to headless rather than hard-fail.
+            use_headless = True
+            display = None
+            options = {**options, "headless": True}
+
+    engine = browser_engine()
+    if engine == "camoufox":
+        return _open_camoufox(url, profile=profile, options=options, display=display)
+
+    sync_playwright, _kind = _sync_api()
+    executable = None if options.get("channel") else _chromium_executable()
+    if executable is None and not options.get("channel"):
         raise RuntimeError("Chromium is not installed. Run playwright install chromium on this machine.")
     playwright = sync_playwright().start()
     browser = None
     context = None
     try:
+        launch_kwargs: dict[str, Any] = {
+            "headless": use_headless,
+            "ignore_default_args": list(options["ignore_default_args"]),
+            "args": list(options["args"]),
+        }
+        if options.get("channel"):
+            launch_kwargs["channel"] = options["channel"]
+        elif executable is not None:
+            launch_kwargs["executable_path"] = str(executable)
+
+        context_kwargs: dict[str, Any] = {
+            "accept_downloads": True,
+            "locale": options["locale"],
+            "timezone_id": options["timezone_id"],
+            "viewport": dict(options["viewport"]),
+        }
         if profile is not None:
             profile.mkdir(parents=True, exist_ok=True)
             context = playwright.chromium.launch_persistent_context(
                 str(profile),
-                headless=True,
-                executable_path=str(executable),
-                accept_downloads=True,
+                **launch_kwargs,
+                **context_kwargs,
             )
             page = context.pages[0] if context.pages else context.new_page()
             opened = PlaywrightPage(page)
@@ -789,24 +986,76 @@ def open_chromium(url: str, profile: Path | None = None) -> PlaywrightPage:
             opened.bind_context(context)
             opened._playwright = playwright
             opened._context = context
+            opened._display = display
+            opened._account_id = account_id
             page.goto(url, wait_until="domcontentloaded", timeout=25000)
             opened.clear_gate()
             return opened
-        browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
-        context = browser.new_context(accept_downloads=True)
+        browser = playwright.chromium.launch(**launch_kwargs)
+        context = browser.new_context(**context_kwargs)
         page = context.new_page()
         opened = PlaywrightPage(page)
         opened.bind_context(context)
         opened._playwright = playwright
         opened._browser = browser
         opened._context = context
+        opened._display = display
+        opened._account_id = account_id
         page.goto(url, wait_until="domcontentloaded", timeout=25000)
         opened.clear_gate()
         return opened
     except Exception:
         # A failed goto must not leave sync Playwright's asyncio loop running on
         # this thread — the next open would raise "Sync API inside the asyncio loop".
+        if display is not None:
+            try:
+                display.stop()
+            except Exception:
+                pass
         _abandon_playwright(playwright, browser=browser, context=context)
+        raise
+
+
+def _open_camoufox(
+    url: str,
+    *,
+    profile: Path | None,
+    options: dict[str, Any],
+    display: Any,
+) -> PlaywrightPage:
+    from camoufox.sync_api import Camoufox
+
+    kwargs: dict[str, Any] = {
+        "headless": bool(options["headless"]),
+        "humanize": True,
+    }
+    if profile is not None:
+        profile.mkdir(parents=True, exist_ok=True)
+        kwargs["persistent_context"] = str(profile)
+    browser = None
+    try:
+        browser = Camoufox(**kwargs)
+        browser.start()
+        page = browser.new_page() if hasattr(browser, "new_page") else browser.pages[0]
+        # Camoufox context manager style — treat as context.
+        opened = PlaywrightPage(page)
+        opened._browser = browser
+        opened._display = display
+        opened._profile = str(profile) if profile else ""
+        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        opened.clear_gate()
+        return opened
+    except Exception:
+        if display is not None:
+            try:
+                display.stop()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
         raise
 
 
@@ -883,15 +1132,18 @@ class Desk:
         profile = None
         if self.profiles is not None and account_id:
             profile = (self.profiles / account_id / "browser").resolve()
-        if profile is None:
-            return self.opener(url)
         try:
-            return self.opener(url, profile)
+            return self.opener(url, profile, account_id=account_id)
         except TypeError:
-            try:
-                return self.opener(url, profile=profile)
-            except TypeError:
+            if profile is None:
                 return self.opener(url)
+            try:
+                return self.opener(url, profile)
+            except TypeError:
+                try:
+                    return self.opener(url, profile=profile)
+                except TypeError:
+                    return self.opener(url)
 
     def run(self, account_id: str, function: Any) -> Any:
         def work() -> Any:
@@ -902,6 +1154,20 @@ class Desk:
             return function(page)
 
         return self._calls.run(work)
+
+    def screenshot(self, account_id: str) -> bytes:
+        """PNG of the live page for the person's live view — never sent to a model."""
+
+        def work(page: Page) -> bytes:
+            raw = getattr(page, "_page", None)
+            if raw is None:
+                raise RuntimeError("no live page")
+            shot = getattr(raw, "screenshot", None)
+            if not callable(shot):
+                raise RuntimeError("screenshot unavailable")
+            return bytes(shot(type="png", full_page=False))
+
+        return self.run(account_id, work)
 
 
 _SITE = re.compile(r"(?<![\w@])(?:[a-z0-9-]+\.)+[a-z]{2,}\b")
@@ -946,7 +1212,8 @@ class Browser(Capability):
                 "Pass a full URL such as https://example.com (a bare host is accepted and treated as https). "
                 "If this site is already open, prefer browser_click/read on the current page instead of opening the homepage again. "
                 "Never pass a booking choice word (clinic, home visit, consultation) as the url — click that option on the page. "
-                "Pass a real host or https URL; do not invent hosts from placeholders like https://[ORG_1]. "
+                "When the person names a site as [ORG_n] (or similar), pass that placeholder as url — confirm restores the real host. "
+                "Do not invent a different hostname from memory (for example lot.com when they said Google). "
                 "To click or type, use Interactive refs (for example target 1) or the visible name. "
                 "Use browser_select for dropdowns, browser_scroll to reveal more, browser_press for Enter or Tab, "
                 "browser_back to leave a page. Use browser_hover for menus, browser_type_focused when the caret is already in a field. "
@@ -978,7 +1245,9 @@ class Browser(Capability):
                 "When the person describes a choice in plain language (clinic, home visit, consultation), "
                 "match it to a control and click — do not ask them to pick 1/2/3. "
                 "If the snapshot marks a control disabled, fill required fields first. "
-                "A button listed under Interactive is available — click its ref; do not claim it is missing."
+                "A button listed under Interactive is available — click its ref; do not claim it is missing. "
+                "If a click fails, browser_read and try a different ref — do not retry the same target. "
+                "After typing a search query, browser_press Enter or click a search suggestion option."
             ),
             parameters={"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]},
             effect=Effect.MUTATE,
@@ -1210,6 +1479,17 @@ class Browser(Capability):
             return "browser: page open — use click/type/submit to finish website tasks here"
         return "browser: available — use browser_open for websites"
 
+    def screenshot(self, account_id: str) -> bytes:
+        if self.desk is None:
+            raise RuntimeError("no live browser")
+        return self.desk.screenshot(account_id)
+
+    def live_path(self, account_id: str) -> str:
+        """Relative URL the person opens to see and clear a bot wall (pixels never go to a model)."""
+        if not self._page_open(account_id):
+            return ""
+        return f"/v1/browser/live?account_id={account_id}"
+
     def _page_open(self, account_id: str) -> bool:
         if self.desk is not None:
             return self.desk.has(account_id)
@@ -1409,10 +1689,13 @@ class Browser(Capability):
         text = _hide(text, self._known_secrets(account_id) + self._once.pop(account_id, []))
         note = self._login_notes.pop(account_id, "")
         profile_note = self._profile_note(account_id, text)
+        wall = _bot_wall_note(text)
         if note:
             text = f"{note}\n\n{text}"
         if profile_note:
             text = f"{profile_note}\n\n{text}"
+        if wall:
+            text = f"{_HANDOFF_PREFIX} {wall}\n\n{text}"
         if len(text) > 4000:
             text = text[:4000]
         return text
@@ -1853,6 +2136,55 @@ def _call_timeout(method: Any, timeout_ms: int, *args: Any) -> Any:
         return method(*args)
 
 
+def _click_locator(locator: Any) -> bool:
+    """Click a stamped control; scroll and force when the normal click is blocked."""
+    try:
+        scroll = getattr(locator, "scroll_into_view_if_needed", None)
+        if callable(scroll):
+            try:
+                scroll(timeout=2000)
+            except TypeError:
+                scroll()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        _call_timeout(locator.click, 5000)
+        return True
+    except Exception:
+        pass
+    try:
+        locator.click(timeout=5000, force=True)
+        return True
+    except TypeError:
+        try:
+            locator.click(force=True)
+            return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        locator.evaluate("(node) => node.click()")
+        return True
+    except Exception:
+        return False
+
+
+def _click_fragment(target: str) -> str:
+    """Shorten long autocomplete / search labels for get_by_text fallbacks."""
+    text = " ".join((target or "").split()).strip()
+    if len(text) < 40:
+        return text
+    # Prefer the first option-like chunk before a repeated category list.
+    for separator in (" i Bil ", " i Utstyr", " Finn flere", " ("):
+        if separator in text:
+            text = text.split(separator, 1)[0].strip()
+            break
+    return text[:80].strip()
+
+
 def _raise_if_disabled(locator: Any, target: str) -> None:
     try:
         disabled = locator.get_attribute("disabled")
@@ -1870,6 +2202,8 @@ def _action_failure(exc: Exception) -> str:
     line = text.splitlines()[0].strip() if text else ""
     if "disabled" in line.lower() and "fill required" in line.lower():
         return line[:180]
+    if "gone or not clickable" in line.lower() or "could not be clicked" in line.lower():
+        return line[:220]
     if "Timeout" in type(exc).__name__ or "Timeout" in text:
         if "get_by_label" in text:
             return "could not find that field on the page"
@@ -1893,9 +2227,49 @@ _LOGIN_FAIL = re.compile(
 _LOGIN_BLOCK = re.compile(
     r"unusual activity|are you a robot|captcha|access denied|verify you are human|"
     r"automated|suspicious|try again later|something went wrong|"
-    r"temporarily unavailable|not available in your|challenge",
+    r"temporarily unavailable|not available in your|challenge|"
+    r"are you a .{0,20} or a robot|px/captcha",
     re.IGNORECASE,
 )
+
+
+def is_handoff_result(text: str) -> bool:
+    return text.lstrip().startswith(_HANDOFF_PREFIX)
+
+
+def handoff_prompt(snapshot: str) -> str:
+    """Person-facing text when a captcha or WAF wall needs a human."""
+    return (
+        "A captcha or security check is blocking the page. "
+        "Open the live view, solve it, then tap Done so Robin can continue."
+    )
+
+
+def _bot_wall_note(snapshot: str) -> str:
+    """Tell the model when the page is a bot/captcha wall, not a usable booking UI."""
+    sample = snapshot
+    if "\nContent:\n" in snapshot:
+        sample = snapshot.split("\nContent:\n", 1)[1]
+    sample = sample[:2500]
+    lowered = snapshot.lower()
+    if not _LOGIN_BLOCK.search(sample) and "captcha" not in lowered and "/captcha" not in lowered:
+        # Empty shell often means a blocked iframe (cookie/bot gate) with no usable content.
+        if "content:\n(empty)" in lowered and ("iframe" in lowered or "interactive:\n\n(none)" in lowered):
+            return (
+                "This page has no usable content for Robin's automated browser "
+                "(likely a bot, captcha, or cookie wall). Do not keep opening more of the same "
+                "kind of site. Tell the person the site blocked automation, or try web_search "
+                "for a rough price estimate, or ask which airline site to open."
+            )
+        return ""
+    return (
+        "Bot/captcha wall — this site is blocking Robin's automated Chromium. "
+        "Do not retry the same host or keep hopping flight OTAs expecting a different result. "
+        "Tell the person those aggregators often block automation; offer web_search for a rough "
+        "estimate, or ask them to name an airline site, or to check prices in their own browser."
+    )
+
+
 _SIGNED_IN_PATH = re.compile(r"/(?:browse|profiles?|kids|gateway)(?:/|$|\?)", re.IGNORECASE)
 _LOGIN_PATH = re.compile(r"/(?:log[\s_-]*in|sign[\s_-]*in|auth|account|session)(?:/|$|\?)", re.IGNORECASE)
 _LOGIN_LABELS = ("Logg inn", "Log in", "Sign in", "Login", "Continue", "Fortsett")
@@ -2231,12 +2605,15 @@ def _wait_name(conversation_id: str) -> str:
 def _web_url(url: str) -> str:
     """Require http(s) with a real host. Bare hosts like vethjem.no become https://vethjem.no."""
     cleaned = url.strip()
+    alias = _site_alias(cleaned)
+    if alias is not None:
+        return alias
     if any(char.isspace() for char in cleaned):
         raise ValueError("url must be http or https")
     if _PLACEHOLDER.search(cleaned):
         raise ValueError(
-            "url still has an unresolved placeholder — pass a real http(s) URL or a site host, "
-            "not https://[ORG_n]; open the website first, then browser_click page options"
+            "url still has an unresolved placeholder — pass the [ORG_n] token alone when the person "
+            "named that site (confirm restores it), or a real http(s) host; do not invent another host"
         )
     if cleaned.startswith("https://") or cleaned.startswith("http://"):
         rest = cleaned.split("://", 1)[1]
@@ -2260,6 +2637,40 @@ def _web_url(url: str) -> str:
     raise ValueError("url must be http or https")
 
 
+_SITE_ALIASES = {
+    "google": "https://www.google.com/",
+    "google.com": "https://www.google.com/",
+    "www.google.com": "https://www.google.com/",
+    "google flights": "https://www.google.com/travel/flights",
+    "google flight": "https://www.google.com/travel/flights",
+    "google travel": "https://www.google.com/travel/flights",
+    "lot": "https://www.lot.com/",
+    "lot.com": "https://www.lot.com/",
+    "www.lot.com": "https://www.lot.com/",
+    "lot polish airlines": "https://www.lot.com/",
+    "polish airlines": "https://www.lot.com/",
+    "skyscanner": "https://www.skyscanner.com/",
+    "kayak": "https://www.kayak.com/",
+    "kiwi": "https://www.kiwi.com/",
+    "flybillet": "https://flybillet.no/",
+    "flybillet.no": "https://flybillet.no/",
+    "finn": "https://www.finn.no/",
+    "finn.no": "https://www.finn.no/",
+    "vg": "https://www.vg.no/",
+    "vg.no": "https://www.vg.no/",
+}
+
+
+def _site_alias(url: str) -> str | None:
+    """Map a restored org/site name (Google, LOT, …) to an https URL."""
+    cleaned = url.strip().strip(".")
+    if cleaned.startswith("https://") or cleaned.startswith("http://"):
+        return None
+    key = re.sub(r"\s+", " ", cleaned.lower())
+    key = key.strip("?.!,;:\"'")
+    return _SITE_ALIASES.get(key)
+
+
 def _host_ok(host: str) -> bool:
     name = host.strip().lower().rstrip(".")
     if not name:
@@ -2281,7 +2692,14 @@ _REF_LINE = re.compile(
 )
 
 _SNAPSHOT_JS = """() => {
-  const cleanLabel = (value) => String(value || "").replace(/\\s+/g, " ").trim().slice(0, 120);
+  const cleanLabel = (value) => String(value || "")
+    .replace(/\\s+/g, " ")
+    .replace(/\\bikon av\\b/gi, "")
+    .replace(/\\bicon(?:\\s+of)?\\b/gi, "")
+    .replace(/\\s*,\\s*,+/g, ",")
+    .replace(/^[,\\s]+|[,\\s]+$/g, "")
+    .trim()
+    .slice(0, 120);
   const INTERACTIVE = new Set([
     "link", "button", "textbox", "password", "searchbox", "combobox", "listbox", "option",
     "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
@@ -2492,10 +2910,19 @@ _SNAPSHOT_JS = """() => {
       for (const child of root.children) visit(child);
     }
   };
+  const isCookieDialog = (node) => {
+    if (!(node instanceof Element)) return false;
+    const id = String(node.id || "").toLowerCase();
+    const cls = String(node.className || "").toLowerCase();
+    const title = String(node.getAttribute("aria-label") || node.getAttribute("title") || "").toLowerCase();
+    const blob = id + " " + cls + " " + title;
+    return /sp_message|cookie|consent|cmp|tcf|onetrust|gdpr/.test(blob);
+  };
   const walkDocument = (doc) => {
     if (!doc) return;
     clearStamps(doc);
-    const dialog = doc.querySelector('[role="dialog"], dialog[open], [aria-modal="true"]');
+    const dialog = [...doc.querySelectorAll('[role="dialog"], dialog[open], [aria-modal="true"]')]
+      .find((node) => !isCookieDialog(node));
     if (dialog) walkTree(dialog);
     walkTree(doc);
     for (const frame of doc.querySelectorAll("iframe")) {
@@ -2506,8 +2933,9 @@ _SNAPSHOT_JS = """() => {
     }
   };
   walkDocument(document);
-  const dialog = document.querySelector('[role="dialog"], dialog[open], [aria-modal="true"]');
-  const contentRoot = dialog
+  const contentDialog = [...document.querySelectorAll('[role="dialog"], dialog[open], [aria-modal="true"]')]
+    .find((node) => !isCookieDialog(node));
+  const contentRoot = contentDialog
     || document.querySelector("main, article, [role='main']")
     || document.body
     || document.documentElement;

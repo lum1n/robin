@@ -143,6 +143,55 @@ def test_the_loop_stops_after_the_step_limit() -> None:
     assert model.seen[-1][1] == []
 
 
+def test_the_loop_nudges_when_the_same_click_keeps_failing() -> None:
+    from robin.capabilities.browser import Browser
+
+    class FailPage:
+        def click(self, target: str, role: str = "", ref: str = "") -> None:
+            raise RuntimeError('no clickable control matching "Bil"')
+
+        def read(self):
+            return (
+                'URL: https://finn.test/\n\nInteractive:\n'
+                '[22] link "Bil" (nav)\n\nContent:\nsearch',
+                "",
+            )
+
+        def location(self) -> str:
+            return "https://finn.test/"
+
+        def open(self, url: str) -> None:
+            return None
+
+        def needs_login(self) -> bool:
+            return False
+
+    assistant = Assistant(ner=StubNer())
+    browser = Browser(owner="ada", page=FailPage())
+    browser._refs["ada"] = {"22": ("link", "Bil")}
+    assistant.add(browser)
+    model = Scripted(
+        [ModelTurn("", (ToolCall("browser_click", {"target": "22"}),)) for _ in range(4)]
+        + [ModelTurn("I could not open Bil. Try another filter.")]
+    )
+    reply = converse(assistant, Task("ada", "t", "find cars", allow_cloud=True), model, max_steps=4)
+    assert "could not open Bil" in reply.text.lower() or "another filter" in reply.text.lower()
+    nudged = any(
+        "failed repeatedly" in str(message.get("content") or "")
+        for messages, _tools in model.seen
+        for message in messages
+        if message.get("role") == "user"
+    )
+    assert nudged
+    same_again = any(
+        "do not retry these arguments" in str(message.get("content") or "").lower()
+        for messages, _tools in model.seen
+        for message in messages
+        if message.get("role") == "tool"
+    )
+    assert same_again
+
+
 def test_a_page_snapshot_keeps_refs_after_the_airlock() -> None:
     from robin.airlock import VocabularyTerm
     from robin.loop import _release_snapshot
@@ -337,12 +386,65 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     store.append_turn("ada", "t", "user", "clinic")
     text = _history(assistant, Task("ada", "t", "clinic again", allow_cloud=True), assistant.vaults.get("ada", "t"), (), assistant.ner)
     assert "1. At the clinic" not in text
-    assert "continue with browser tools" in text
+    assert "ignore that list" in text
+    assert "continue with browser tools" not in text
+
+    store.append_turn(
+        "ada",
+        "t",
+        "assistant",
+        "I'm currently unable to access the web to check vg.no. Visit the site directly.",
+    )
+    text = _history(
+        assistant,
+        Task("ada", "t", "who are you?", allow_cloud=True),
+        assistant.vaults.get("ada", "t"),
+        (),
+        assistant.ner,
+    )
+    assert "unable to access" not in text.lower()
+    assert "ignore that" in text
+    assert "browser_open" not in text
+
+    store.append_turn(
+        "ada",
+        "t",
+        "assistant",
+        "Here are the latest news headlines from VG: 1. One 2. Two 3. Three If you'd like more details",
+    )
+    text = _history(
+        assistant,
+        Task("ada", "t", "who are you?", allow_cloud=True),
+        assistant.vaults.get("ada", "t"),
+        (),
+        assistant.ner,
+    )
+    assert "latest news headlines from VG: 1." not in text
+    assert "ignore unless the person asks for news" in text
+
+    store.append_turn(
+        "ada",
+        "t",
+        "assistant",
+        "Access to the LOT website has been blocked due to security policies, so I'm unable to retrieve flights.",
+    )
+    text = _history(
+        assistant,
+        Task("ada", "t", "USE LOT again", allow_cloud=True),
+        assistant.vaults.get("ada", "t"),
+        (),
+        assistant.ner,
+    )
+    assert "do not retry the same host" in text
+    assert "blocked Robin's automated browser" in text
+    assert "wrongly said a website was unreachable" in text  # prior false refusal still collapsed
 
     from robin.capabilities.browser import Browser
     from robin.capabilities.calendar import Calendar
     from robin.loop import SYSTEM, _system
 
+    assert "latest Person line is the current task" in SYSTEM
+    assert "identity questions" in SYSTEM.lower()
     assert "browser tools" in SYSTEM
     assert "own calendar" in SYSTEM or "third-party" in SYSTEM
     assert "never ask the person to reply with 1, 2, or 3" in SYSTEM.lower()
@@ -353,6 +455,8 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     assert "disabled" in SYSTEM.lower()
     assert "interactive are available" in SYSTEM.lower() or "listed under interactive" in SYSTEM.lower()
     assert "never say a button is missing" in SYSTEM.lower()
+    assert "lack access" in SYSTEM.lower()
+    assert "web_search fails" in SYSTEM.lower()
     assistant = Assistant(ner=StubNer())
     assistant.add(Browser(owner="ada", page=_LoopPage()))
     assistant.add(Calendar(_NoCal()))
@@ -369,6 +473,13 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     assert "browser_click" in tools["browser_submit"].lower()
     assert "calendar_add" in tools
     assert "website" in tools["calendar_add"].lower()
+
+    from robin.ner import UnavailableNer
+
+    cold = Assistant(ner=UnavailableNer())
+    cold_prompt = _system(cold, "ada")
+    assert "ner: unavailable" in cold_prompt
+    assert "[UNRESOLVED]" in cold_prompt
 
 
 class _LoopPage:
@@ -406,3 +517,120 @@ class _NoCal:
 
     def delete(self, account_id: str, event_id: str) -> None:
         return None
+
+
+def test_newer_message_drops_stale_in_flight_reply(tmp_path) -> None:
+    import threading
+    import time
+
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    assistant = Assistant(ner=StubNer(), store=store)
+    started = threading.Event()
+    results: dict[str, object] = {}
+
+    class SlowNews:
+        def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
+            started.set()
+            time.sleep(0.25)
+            return ModelTurn("Here are today's headlines from vg.no")
+
+    def run_news() -> None:
+        results["news"] = converse(
+            assistant,
+            Task("ada", "t", "what's the news?", allow_cloud=True),
+            SlowNews(),
+        )
+
+    def run_who() -> None:
+        assert started.wait(timeout=5)
+        time.sleep(0.05)
+        results["who"] = converse(
+            assistant,
+            Task("ada", "t", "who are you?", allow_cloud=True),
+            Scripted([ModelTurn("I am Robin, your household assistant.")]),
+        )
+
+    news_thread = threading.Thread(target=run_news)
+    who_thread = threading.Thread(target=run_who)
+    news_thread.start()
+    who_thread.start()
+    news_thread.join(timeout=5)
+    who_thread.join(timeout=5)
+    assert not news_thread.is_alive() and not who_thread.is_alive()
+
+    news_reply = results["news"]
+    who_reply = results["who"]
+    assert getattr(news_reply, "text") == "That turn was replaced by a newer message."
+    assert "Robin" in getattr(who_reply, "text")
+    assert "headlines" not in getattr(who_reply, "text").lower()
+    remembered = " ".join(turn["text"] for turn in store.turns("ada", "t"))
+    assert "headlines" not in remembered.lower()
+    assert "who are you?" in remembered
+    assert "Robin" in remembered
+
+
+def test_person_facing_replies_restore_placeholders() -> None:
+    from robin.loop import _for_person, _reply_text
+    from robin.policy import Route
+    from robin.vault import Vault
+
+    vault = Vault("ada", "home")
+    token = vault.token("ORG", "kayak.no")
+    reply = _reply_text(f"Sign in to {token} is needed.", vault, (), Route.CLOUD)
+    assert "kayak.no" in reply.text
+    assert "[ORG_" not in reply.text
+    assert _for_person(vault.restore(f"Visit {token} or [ORG_999]")) == "Visit kayak.no or that site"
+
+
+def test_credential_prompt_to_the_person_is_restored(tmp_path) -> None:
+    from robin.airlock import Entity
+    from robin.capabilities.browser import Browser, Desk
+    from robin.store import HouseholdStore
+    from robin.vault import new_key
+
+    class OrgNer(UnavailableNer):
+        def available(self) -> bool:
+            return True
+
+        def detect(self, text: str):
+            host = "accounts.store.example"
+            if host not in text:
+                return ()
+            start = text.index(host)
+            return (Entity(start, start + len(host), "ORG"),)
+
+    class LoginGate:
+        def __init__(self) -> None:
+            self.url = "https://accounts.store.example/login"
+            self.form = True
+
+        def open(self, url: str) -> None:
+            self.url = url
+
+        def needs_login(self) -> bool:
+            return True
+
+        def read(self) -> tuple[str, str]:
+            return "Sign in", ""
+
+        def location(self) -> str:
+            return self.url
+
+        def clear_gate(self) -> None:
+            return None
+
+        def needs_code(self) -> bool:
+            return False
+
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    page = LoginGate()
+    assistant = Assistant(store=store, ner=OrgNer())
+    assistant.add(Browser(desk=Desk(lambda url: page), broker=assistant.broker))
+    ask = converse(
+        assistant,
+        Task("ada", "home", "log in to store.example", allow_cloud=True),
+        Scripted([ModelTurn("", (ToolCall("browser_open", {"url": "https://store.example/"}),))]),
+    )
+    assert "accounts.store.example" in ask.text
+    assert ask.text.startswith("Sign in to")
+    assert "[ORG_" not in ask.text
