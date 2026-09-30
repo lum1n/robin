@@ -109,9 +109,10 @@ class InputRequest:
     reason: str
     fields: tuple[InputField, ...]
     owner: str
+    open_url: str = ""
 
     def public(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "request_id": self.request_id,
             "title": self.title,
             "reason": self.reason,
@@ -128,6 +129,9 @@ class InputRequest:
                 for field in self.fields
             ],
         }
+        if self.open_url:
+            payload["open_url"] = self.open_url
+        return payload
 
 
 class Capability:

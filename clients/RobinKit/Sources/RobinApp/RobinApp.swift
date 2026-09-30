@@ -555,6 +555,9 @@ private struct InputFormView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(request.title).font(.headline)
             Text(prompt.isEmpty ? request.reason : prompt)
+            if let raw = request.openURL, let url = URL(string: raw), !raw.isEmpty {
+                Link("Open authorization page", destination: url)
+            }
             ForEach(request.fields) { field in
                 inputField(field)
             }

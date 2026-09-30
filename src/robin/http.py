@@ -77,6 +77,8 @@ def dispatch(
         return _get_profile(service, headers, query)
     if method == "GET" and path == "/v1/mcp":
         return _get_mcp(service, headers, query)
+    if method == "GET" and path == "/v1/mcp/oauth/callback":
+        return _mcp_oauth_callback_json(service, query)
     if method == "GET" and path == "/v1/notifications":
         return _get_notifications(service, headers, query)
     if method == "POST" and path == "/v1/notifications":
@@ -231,6 +233,10 @@ def serve(service: Service, host: str = "127.0.0.1", port: int = 8787) -> None:
                 return
             if parsed.path == "/v1/browser/frame":
                 status, body, content_type = _browser_frame_bytes(service, headers, query)
+                _send(self, status, body, content_type)
+                return
+            if parsed.path == "/v1/mcp/oauth/callback":
+                status, body, content_type = _mcp_oauth_callback(service, query)
                 _send(self, status, body, content_type)
                 return
             self._respond("GET")
@@ -555,6 +561,27 @@ def _get_mcp(service: Service, headers: dict[str, str], query: dict[str, str]) -
             servers = summary(account_id)
             break
     return 200, {"servers": servers}
+
+
+def _mcp_capability(service: Service) -> Any:
+    for capability in service.assistant.registry._capabilities:
+        if getattr(capability, "id", "") == "mcp":
+            return capability
+    return None
+
+
+def _mcp_oauth_callback(service: Service, query: dict[str, str]) -> tuple[int, bytes, str]:
+    capability = _mcp_capability(service)
+    if capability is None or not callable(getattr(capability, "complete_oauth_callback", None)):
+        return 404, b"<!doctype html><p>MCP is not enabled.</p>", "text/html; charset=utf-8"
+    return capability.complete_oauth_callback(query)
+
+
+def _mcp_oauth_callback_json(service: Service, query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    status, body, _content_type = _mcp_oauth_callback(service, query)
+    if status == 200:
+        return 200, {"ok": True}
+    return status, {"error": body.decode("utf-8", errors="replace")[:200]}
 
 
 def _post_private(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:

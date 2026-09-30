@@ -195,7 +195,7 @@ def test_mcp_chat_setup_and_tools() -> None:
     assert "Ask the person" in ask
     pending = mcp.pending_input("ada", "t")
     assert pending is not None
-    mcp.accept_input("ada", "t", pending.request_id, {"token": "tok"})
+    mcp.accept_input("ada", "t", pending.request_id, {"secret": "tok"})
     tested = mcp.invoke("ada", "mcp_setup_test", {"name": "notes"})
     assert "2 tool(s)" in tested
     finished = assistant.invoke(
@@ -222,6 +222,153 @@ def test_mcp_stdio_refused_for_non_admin() -> None:
     mcp = Mcp(admins={"root"})
     result = mcp.invoke("ada", "mcp_setup_start", {"name": "local", "transport": "stdio", "command": "npx"})
     assert "admins" in result
+
+
+
+class _OAuthFakeSession:
+    """Blocks list_tools until OAuth code is delivered — mirrors OAuthClientProvider."""
+
+    def __init__(self, broker, tools: list[dict] | None = None) -> None:
+        self.broker = broker
+        self._tools = tools or [
+            {
+                "name": "search",
+                "description": "Search",
+                "readOnlyHint": True,
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+        ]
+        self.flow = None
+        self.register = None
+
+    def list_tools(self) -> list[dict]:
+        import time
+
+        flow = self.flow
+        if flow is not None:
+            if not flow.state:
+                flow.state = "st123"
+            flow.auth_url = f"https://auth.example/authorize?state={flow.state}"
+            if callable(self.register):
+                self.register(flow)
+            flow.auth_ready.set()
+            for _ in range(500):
+                if flow.code is not None or flow.cancelled or flow.result_error is not None:
+                    break
+                time.sleep(0.01)
+            if flow.cancelled or (flow.result_error and not flow.code):
+                raise RuntimeError(str(flow.result_error or "cancelled"))
+            if not flow.code:
+                raise RuntimeError("oauth timed out in fake session")
+            self.broker.put(
+                flow.account_id,
+                f"mcp:{flow.name}:oauth_tokens",
+                '{"access_token":"at","token_type":"bearer"}',
+            )
+            self.broker.put(
+                flow.account_id,
+                f"mcp:{flow.name}:oauth_client",
+                '{"client_id":"cid","redirect_uris":["http://127.0.0.1/cb"]}',
+            )
+        return list(self._tools)
+
+    def call_tool(self, name: str, arguments: dict) -> str:
+        return f"ok:{name}"
+
+
+def test_mcp_oauth_setup_input_and_callback() -> None:
+    assistant = Assistant()
+    fake = _OAuthFakeSession(assistant.broker)
+
+    def open_session(config: dict):
+        fake.flow = config.get("_oauth_flow")
+        fake.register = config.get("_oauth_register")
+        return fake
+
+    mcp = Mcp(
+        broker=assistant.broker,
+        registry=assistant.registry,
+        open_session=open_session,
+        public_base="http://127.0.0.1:8787",
+    )
+    assistant.add(mcp)
+    started = mcp.invoke(
+        "ada",
+        "mcp_setup_start",
+        {"name": "sentry", "transport": "http", "url": "https://mcp.sentry.dev/mcp", "auth": "oauth"},
+    )
+    assert "oauth" in started.casefold()
+    oauth = mcp.invoke("ada", "mcp_setup_oauth", {"name": "sentry"})
+    assert "Authorize" in oauth
+    pending = mcp.pending_input("ada", "t")
+    assert pending is not None
+    assert pending.open_url.startswith("https://auth.example/authorize")
+    assert pending.fields[0].id == "redirect"
+    assert pending.fields[0].required is False
+    status, body, content_type = mcp.complete_oauth_callback({"code": "authcode", "state": "st123"})
+    assert status == 200
+    assert "text/html" in content_type
+    assert b"connected" in body.lower()
+    accepted = mcp.accept_input("ada", "t", pending.request_id, {})
+    assert accepted is not None
+    assert accepted.resume and "finish" in accepted.resume.casefold()
+    assert mcp._drafts["ada"]["sentry"].get("tested")
+    assert "at" in assistant.broker.reveal("ada", "mcp:sentry:oauth_tokens")
+    finished = mcp.invoke("ada", "mcp_setup_finish", {"name": "sentry", "trust": "ask"})
+    assert "activated" in finished
+
+
+def test_mcp_oauth_paste_redirect() -> None:
+    assistant = Assistant()
+    fake = _OAuthFakeSession(assistant.broker)
+
+    def open_session(config: dict):
+        fake.flow = config.get("_oauth_flow")
+        fake.register = config.get("_oauth_register")
+        if fake.flow is not None:
+            fake.flow.state = "paste1"
+        return fake
+
+    mcp = Mcp(broker=assistant.broker, open_session=open_session, public_base="http://house.local")
+    mcp.invoke(
+        "ada",
+        "mcp_setup_start",
+        {"name": "notes", "transport": "http", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    )
+    mcp.invoke("ada", "mcp_setup_test", {"name": "notes"})
+    pending = mcp.pending_input("ada", "t")
+    assert pending is not None
+    accepted = mcp.accept_input(
+        "ada",
+        "t",
+        pending.request_id,
+        {"redirect": "http://house.local/v1/mcp/oauth/callback?code=c1&state=paste1"},
+    )
+    assert accepted is not None
+    assert accepted.resume
+
+
+def test_mcp_oauth_callback_http_dispatch() -> None:
+    from robin.capabilities.mcp import _OAuthFlow
+    from robin.http import Service, dispatch
+    from robin.model import ModelTurn
+
+    class M:
+        def complete(self, *, messages, tools):
+            return ModelTurn(text="ok")
+
+    assistant = Assistant()
+    mcp = Mcp(broker=assistant.broker)
+    assistant.add(mcp)
+    pending = _OAuthFlow(account_id="ada", name="x")
+    pending.state = "s1"
+    mcp._oauth_flows["ada"] = pending
+    mcp._oauth_by_state["s1"] = pending
+    service = Service(assistant, M())
+    status, body = dispatch(service, "GET", "/v1/mcp/oauth/callback", query={"code": "c", "state": "s1"})
+    assert status == 200
+    assert body.get("ok") is True
+    assert pending.code == "c"
 
 
 def test_bills_scan_parses_invoice() -> None:

@@ -218,6 +218,15 @@ def _boot(args: argparse.Namespace) -> int:
     ner.warm()
     assistant = Assistant(store=store, ner=ner)
     install(assistant, mcp_config=getattr(args, "mcp_config", "") or "")
+    public = advertised or os.environ.get("ROBIN_PUBLIC_URL", "").strip()
+    if not public:
+        host = args.host if args.host not in {"0.0.0.0", "::"} else "127.0.0.1"
+        public = f"http://{host}:{args.port}"
+    os.environ.setdefault("ROBIN_PUBLIC_URL", public)
+    for capability in assistant.registry._capabilities:
+        if getattr(capability, "id", "") == "mcp":
+            capability.public_base = public.rstrip("/")
+            break
     if not ner._installed:
         print(
             "robin: WARNING local NER is not installed (uv sync --extra ner). "

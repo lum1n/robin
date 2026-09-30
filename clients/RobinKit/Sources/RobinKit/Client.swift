@@ -292,10 +292,22 @@ public struct InputRequest: Decodable, Sendable, Equatable {
     public let reason: String
     public let owner: String
     public let fields: [InputField]
+    public let openURL: String?
 
     private enum CodingKeys: String, CodingKey {
         case requestID = "request_id"
         case title, reason, owner, fields
+        case openURL = "open_url"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        requestID = try container.decode(String.self, forKey: .requestID)
+        title = try container.decode(String.self, forKey: .title)
+        reason = try container.decode(String.self, forKey: .reason)
+        owner = try container.decode(String.self, forKey: .owner)
+        fields = try container.decodeIfPresent([InputField].self, forKey: .fields) ?? []
+        openURL = try container.decodeIfPresent(String.self, forKey: .openURL)
     }
 }
 

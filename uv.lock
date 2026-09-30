@@ -2593,7 +2593,7 @@ requires-dist = [
     { name = "camoufox", extras = ["geoip"], marker = "extra == 'camoufox'", specifier = ">=0.4" },
     { name = "cryptography", specifier = ">=44" },
     { name = "gliner", marker = "extra == 'ner'", specifier = ">=0.2.22" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.10" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.0" },
     { name = "open-clip-torch", marker = "extra == 'photos'", specifier = ">=2.24" },
     { name = "patchright", marker = "extra == 'stealth'", specifier = ">=1.49" },
     { name = "pillow", marker = "extra == 'photos'", specifier = ">=10" },

@@ -209,6 +209,7 @@ struct ShellTests {
         #expect(source.contains("import SwiftUI"))
         #expect(source.contains("SecureField"))
         #expect(source.contains("InputFormView"))
+        #expect(source.contains("Open authorization page"))
         #expect(source.contains("submitInput"))
         #expect(source.contains("Needs you"))
         #expect(source.contains("UserNotifications"))

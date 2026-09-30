@@ -12,7 +12,7 @@ A website sign-in belongs to that account and to the site's host. The first time
 
 ## Input requests
 
-When Robin needs details from the person — a Home Assistant token, an MCP bearer secret, a one-time code, a choice — the turn returns `status: input` with an `InputRequest` (`request_id`, title, reason, fields). Field kinds are `text`, `secret`, `url`, `email`, `username`, `otp`, `number`, and `choice`. The app posts `{"input": {"request_id", "values"}}` or `{"input": {"request_id", "cancel": true}}` on `POST /v1/messages`. Secret values go straight into the broker and never enter the model or thread history (history only records field labels). `ask_person` is for non-secret fields only; capabilities that own a secret destination raise their own forms.
+When Robin needs details from the person — a Home Assistant token, an MCP bearer secret, an MCP OAuth authorize step, a one-time code, a choice — the turn returns `status: input` with an `InputRequest` (`request_id`, title, reason, fields, optional `open_url`). Field kinds are `text`, `secret`, `url`, `email`, `username`, `otp`, `number`, and `choice`. The app posts `{"input": {"request_id", "values"}}` or `{"input": {"request_id", "cancel": true}}` on `POST /v1/messages`. Secret values go straight into the broker and never enter the model or thread history (history only records field labels). `ask_person` is for non-secret fields only; capabilities that own a secret destination raise their own forms.
 
 ## Home Assistant
 
@@ -20,7 +20,12 @@ Connect in chat: `home_connect` with the base URL, then a secure form for the lo
 
 ## MCP servers
 
-Attach servers in chat with `mcp_setup_start` → `mcp_setup_ask_secret` (secure form) → `mcp_setup_test` → `mcp_setup_finish` (confirm). Tools become `mcp_<server>_<tool>` (at most 40 per account). Results are untrusted data. Remote HTTP tools are egress. Destructive tools always confirm. A changed tool list hides the server until re-approval. Household admins may add stdio servers from `/etc/robin/mcp.json` (`--mcp-config`); stdio runs as that account's login. `GET /v1/mcp` is read-only (names, status, tool counts). Optional extra: `robin[mcp]`.
+Attach servers in chat with `mcp_setup_start` → secrets or OAuth → `mcp_setup_test` → `mcp_setup_finish` (confirm).
+
+- **Bearer / header / env:** `mcp_setup_ask_secret` shows a secure form; values stay in the broker.
+- **OAuth (authorization code + PKCE):** set `auth=oauth` on start (or call `mcp_setup_oauth`). Robin discovers the authorization server, opens an authorize link (`InputRequest.open_url`), and completes the callback at `GET /v1/mcp/oauth/callback` (or the person pastes the redirect URL). Access and refresh tokens plus the dynamic client registration live in the broker (`mcp:<name>:oauth_tokens` / `oauth_client`). Set `ROBIN_PUBLIC_URL` (or the advertise URL) so remote IdPs can redirect back to this house. Works with remote MCPs such as Sentry.
+
+Tools become `mcp_<server>_<tool>` (at most 40 per account). Results are untrusted data. Remote HTTP tools are egress. Destructive tools always confirm. A changed tool list hides the server until re-approval. Household admins may add stdio servers from `/etc/robin/mcp.json` (`--mcp-config`); stdio runs as that account's login. `GET /v1/mcp` is read-only (names, status, tool counts). Optional extra: `robin[mcp]` (mcp≥2).
 
 ## Documents and bills
 

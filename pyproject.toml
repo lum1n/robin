@@ -18,7 +18,7 @@ ner = [
 photos = ["open-clip-torch>=2.24", "pillow>=10"]
 stealth = ["patchright>=1.49"]
 camoufox = ["camoufox[geoip]>=0.4"]
-mcp = ["mcp>=1.10"]
+mcp = ["mcp>=2.0"]
 docs = ["pypdf>=5"]
 
 [project.scripts]

@@ -9,7 +9,7 @@ import re
 import secrets
 import threading
 from typing import Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from robin.capability import (
     Capability,
@@ -32,6 +32,7 @@ _META_TOOLS = frozenset(
     {
         "mcp_setup_start",
         "mcp_setup_ask_secret",
+        "mcp_setup_oauth",
         "mcp_setup_test",
         "mcp_setup_finish",
         "mcp_list",
@@ -60,7 +61,8 @@ class Mcp(Capability):
             name="mcp_setup_start",
             description=(
                 "Start attaching an MCP server. transport is http or stdio. "
-                "For http pass url; for stdio pass command and optional args (admins only)."
+                "For http pass url; for stdio pass command and optional args (admins only). "
+                "auth is none, bearer, or oauth (many remote MCPs such as Sentry use oauth)."
             ),
             parameters={
                 "type": "object",
@@ -70,6 +72,7 @@ class Mcp(Capability):
                     "url": {"type": "string"},
                     "command": {"type": "string"},
                     "args": {"type": "array", "items": {"type": "string"}},
+                    "auth": {"type": "string", "enum": ["none", "bearer", "oauth"]},
                 },
                 "required": ["name", "transport"],
             },
@@ -90,8 +93,21 @@ class Mcp(Capability):
             effect=Effect.MUTATE,
         ),
         Tool(
+            name="mcp_setup_oauth",
+            description=(
+                "Start OAuth (authorization code + PKCE) for a draft HTTP MCP server. "
+                "Opens a browser authorize link; after the person signs in, call mcp_setup_test if needed, then mcp_setup_finish."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+            effect=Effect.MUTATE,
+        ),
+        Tool(
             name="mcp_setup_test",
-            description="Test a draft MCP setup: initialize and list tools. Does not enable them yet.",
+            description="Test a draft MCP setup: initialize and list tools. Does not enable them yet. For oauth drafts, starts authorization if tokens are missing.",
             parameters={
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -161,6 +177,7 @@ class Mcp(Capability):
         open_session: Any = None,
         household: list[dict[str, Any]] | None = None,
         admins: set[str] | None = None,
+        public_base: str = "",
     ) -> None:
         self.broker = broker
         self.store = store
@@ -168,10 +185,13 @@ class Mcp(Capability):
         self.open_session = open_session or _open_sdk_session
         self.household = household or []
         self.admins = admins or set()
+        self.public_base = public_base.strip().rstrip("/")
         self._servers: dict[str, list[dict[str, Any]]] = {}
         self._drafts: dict[str, dict[str, dict[str, Any]]] = {}
         self._waits: dict[str, dict[str, Any]] = {}
         self._tool_index: dict[str, dict[str, tuple[str, str]]] = {}
+        self._oauth_flows: dict[str, _OAuthFlow] = {}
+        self._oauth_by_state: dict[str, _OAuthFlow] = {}
         if store is not None:
             self._servers = store.load_mcp()
 
@@ -268,6 +288,28 @@ class Mcp(Capability):
         if waiting is None:
             return None
         kind = str(waiting.get("kind") or "bearer")
+        if kind == "oauth":
+            auth_url = str(waiting.get("auth_url") or "")
+            return InputRequest(
+                request_id=str(waiting["request_id"]),
+                title=f"Authorize MCP {waiting.get('name')}",
+                reason=(
+                    f"Sign in to connect MCP server {waiting.get('name')}. "
+                    "Open the authorization link, approve access, then return here and submit. "
+                    "If the browser does not return to Robin automatically, paste the final redirect URL."
+                ),
+                fields=(
+                    InputField(
+                        id="redirect",
+                        label="Redirect URL (optional)",
+                        kind="url",
+                        required=False,
+                        placeholder="https://…?code=…",
+                    ),
+                ),
+                owner=self.id,
+                open_url=auth_url,
+            )
         label = "Access token" if kind == "bearer" else str(waiting.get("key") or "Secret")
         return InputRequest(
             request_id=str(waiting["request_id"]),
@@ -292,8 +334,11 @@ class Mcp(Capability):
         waiting = self._waits.get(account_id)
         if waiting is None or waiting.get("request_id") != request_id:
             return None
-        self._waits.pop(account_id, None)
         name = str(waiting.get("name") or "")
+        kind = str(waiting.get("kind") or "bearer")
+        if kind == "oauth":
+            return self._accept_oauth(account_id, waiting, values, cancel=cancel)
+        self._waits.pop(account_id, None)
         if cancel:
             return SecretAccepted(reply=f"MCP {name} secret cancelled.")
         secret = str(values.get("secret") or "").strip()
@@ -302,7 +347,6 @@ class Mcp(Capability):
         draft = self._drafts.get(account_id, {}).get(name)
         if draft is None:
             return SecretAccepted(reply="No draft for that MCP server.")
-        kind = str(waiting.get("kind") or "bearer")
         key = str(waiting.get("key") or "")
         if kind == "bearer":
             draft["token"] = secret
@@ -323,7 +367,18 @@ class Mcp(Capability):
             return None
         if text.strip().casefold() in {"cancel", "never mind", "nevermind"}:
             self._waits.pop(account_id, None)
+            flow = self._oauth_flows.pop(account_id, None)
+            if flow is not None:
+                self._cancel_oauth(flow)
             return SecretAccepted(reply="Cancelled.")
+        kind = str(waiting.get("kind") or "bearer")
+        if kind == "oauth":
+            return self.accept_input(
+                account_id,
+                conversation_id,
+                str(waiting["request_id"]),
+                {"redirect": text.strip()},
+            )
         return self.accept_input(
             account_id,
             conversation_id,
@@ -361,6 +416,19 @@ class Mcp(Capability):
     def _session_for(self, account_id: str, config: dict[str, Any]) -> McpSession:
         payload = dict(config)
         payload["_account_id"] = account_id
+        payload["_broker"] = self.broker
+        payload["_public_base"] = self.redirect_base()
+        name = str(config.get("name") or "")
+        if str(config.get("auth") or "") == "oauth" or self._has_oauth_tokens(account_id, name):
+            payload["auth"] = "oauth"
+            flow = self._oauth_flows.get(account_id)
+            if flow is not None and flow.name == name and not flow.finished.is_set():
+                payload["_oauth_flow"] = flow
+        if self.broker is not None and not payload.get("token") and name:
+            try:
+                payload["token"] = self.broker.reveal(account_id, f"mcp:{name}:token")
+            except Exception:
+                pass
         return self.open_session(payload)
 
     def _meta(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str | Result:
@@ -368,6 +436,8 @@ class Mcp(Capability):
             return self._setup_start(account_id, arguments)
         if tool_name == "mcp_setup_ask_secret":
             return self._ask_secret(account_id, arguments)
+        if tool_name == "mcp_setup_oauth":
+            return self._setup_oauth(account_id, arguments)
         if tool_name == "mcp_setup_test":
             return self._setup_test(account_id, arguments)
         if tool_name == "mcp_setup_finish":
@@ -383,6 +453,9 @@ class Mcp(Capability):
     def _setup_start(self, account_id: str, arguments: dict[str, Any]) -> str:
         name = _sanitize(str(arguments.get("name") or ""))
         transport = str(arguments.get("transport") or "").strip()
+        auth = str(arguments.get("auth") or "none").strip().casefold() or "none"
+        if auth not in {"none", "bearer", "oauth"}:
+            return "auth must be none, bearer, or oauth"
         if not name:
             return "name is required"
         if transport == "http":
@@ -390,10 +463,16 @@ class Mcp(Capability):
             err = _validate_url(url)
             if err:
                 return err
-            draft = {"name": name, "transport": "http", "url": url, "status": "draft"}
+            if auth == "oauth":
+                host = (urlparse(url).hostname or "").casefold()
+                if not url.startswith("https://") and host not in {"localhost", "127.0.0.1", "::1"}:
+                    return "oauth MCP url should be https (or localhost for development)"
+            draft = {"name": name, "transport": "http", "url": url, "auth": auth, "status": "draft"}
         elif transport == "stdio":
             if account_id not in self.admins:
                 return "stdio MCP servers can only be attached by household admins"
+            if auth == "oauth":
+                return "oauth is only for http MCP servers"
             command = str(arguments.get("command") or "").strip()
             if not _stdio_allowed(command):
                 return "command must be npx, uvx, docker, or an absolute path under /opt/robin-mcp"
@@ -403,11 +482,16 @@ class Mcp(Capability):
                 "transport": "stdio",
                 "command": command,
                 "args": args,
+                "auth": auth if auth != "oauth" else "none",
                 "status": "draft",
             }
         else:
             return "transport must be http or stdio"
         self._drafts.setdefault(account_id, {})[name] = draft
+        if auth == "oauth":
+            return f"Draft MCP {name} saved (http, oauth). Call mcp_setup_oauth or mcp_setup_test to authorize."
+        if auth == "bearer":
+            return f"Draft MCP {name} saved ({transport}). Ask for the bearer secret, then mcp_setup_test."
         return f"Draft MCP {name} saved ({transport}). Ask for any secrets, then mcp_setup_test."
 
     def _ask_secret(self, account_id: str, arguments: dict[str, Any]) -> str:
@@ -425,16 +509,247 @@ class Mcp(Capability):
         }
         return f"Ask the person for the {kind} secret for {name}."
 
+    def _setup_oauth(self, account_id: str, arguments: dict[str, Any]) -> str:
+        name = _sanitize(str(arguments.get("name") or ""))
+        draft = self._drafts.get(account_id, {}).get(name)
+        if draft is None:
+            return "no draft with that name — mcp_setup_start first"
+        if draft.get("transport") != "http":
+            return "oauth is only for http MCP servers"
+        draft["auth"] = "oauth"
+        return self._start_oauth(account_id, name)
+
     def _setup_test(self, account_id: str, arguments: dict[str, Any]) -> str:
         name = _sanitize(str(arguments.get("name") or ""))
         draft = self._drafts.get(account_id, {}).get(name)
         if draft is None:
             return "no draft with that name"
+        if str(draft.get("auth") or "") == "oauth" and not self._has_oauth_tokens(account_id, name):
+            return self._start_oauth(account_id, name)
         try:
             session = self._session_for(account_id, draft)
             tools = session.list_tools()
         except Exception as exc:
+            message = str(exc)
+            if "401" in message or "Unauthorized" in message or "oauth" in message.casefold():
+                draft["auth"] = "oauth"
+                return self._start_oauth(account_id, name)
             return f"MCP test failed: {exc}"
+        return self._record_test(account_id, name, draft, tools)
+
+    def _start_oauth(self, account_id: str, name: str) -> str:
+        draft = self._drafts.get(account_id, {}).get(name)
+        if draft is None:
+            return "no draft with that name"
+        existing = self._oauth_flows.get(account_id)
+        if existing is not None and not existing.finished.is_set():
+            if existing.name == name and existing.auth_url:
+                self._waits[account_id] = {
+                    "request_id": secrets.token_hex(8),
+                    "name": name,
+                    "kind": "oauth",
+                    "auth_url": existing.auth_url,
+                }
+                return f"Authorize MCP {name} in the browser, then submit."
+            return f"OAuth already in progress for {existing.name}"
+        flow = _OAuthFlow(account_id=account_id, name=name)
+        self._oauth_flows[account_id] = flow
+
+        def worker() -> None:
+            try:
+                payload = dict(draft)
+                payload["_account_id"] = account_id
+                payload["_broker"] = self.broker
+                payload["_public_base"] = self.redirect_base()
+                payload["_oauth_flow"] = flow
+                payload["auth"] = "oauth"
+                payload["_oauth_register"] = lambda f: self._register_oauth_state(f)
+                session = self.open_session(payload)
+                tools = session.list_tools()
+                draft["tools"] = tools
+                draft["tool_hash"] = _tool_hash(tools)
+                draft["tested"] = True
+                draft["auth"] = "oauth"
+                self._drafts.setdefault(account_id, {})[name] = draft
+                flow.tools = tools
+            except Exception as exc:  # noqa: BLE001 — surface to the waiting UI
+                flow.result_error = exc
+            finally:
+                flow.finished.set()
+
+        threading.Thread(target=worker, daemon=True, name=f"robin-mcp-oauth-{name}").start()
+        waited = 0.0
+        while waited < 90.0:
+            if flow.auth_ready.wait(timeout=0.25):
+                break
+            if flow.finished.is_set():
+                break
+            waited += 0.25
+        if flow.finished.is_set() and not flow.auth_url:
+            self._oauth_flows.pop(account_id, None)
+            if flow.result_error is not None:
+                return f"OAuth failed: {flow.result_error}"
+            tools = list(draft.get("tools") or flow.tools or [])
+            if tools:
+                return self._record_test(account_id, name, draft, tools)
+            return f"MCP {name} authorized with no tools listed."
+        if not flow.auth_url:
+            self._cancel_oauth(flow)
+            self._oauth_flows.pop(account_id, None)
+            return "OAuth discovery timed out — check the MCP URL is reachable"
+        if flow.state:
+            self._oauth_by_state[flow.state] = flow
+        request_id = secrets.token_hex(8)
+        self._waits[account_id] = {
+            "request_id": request_id,
+            "name": name,
+            "kind": "oauth",
+            "auth_url": flow.auth_url,
+        }
+        return f"Authorize MCP {name} in the browser, then submit."
+
+    def _accept_oauth(
+        self,
+        account_id: str,
+        waiting: dict[str, Any],
+        values: dict[str, str],
+        *,
+        cancel: bool,
+    ) -> SecretAccepted:
+        name = str(waiting.get("name") or "")
+        flow = self._oauth_flows.get(account_id)
+        if cancel:
+            self._waits.pop(account_id, None)
+            if flow is not None:
+                self._cancel_oauth(flow)
+                self._oauth_flows.pop(account_id, None)
+            return SecretAccepted(reply=f"MCP {name} OAuth cancelled.")
+        redirect = str(values.get("redirect") or "").strip()
+        if redirect and flow is not None:
+            try:
+                code, state, iss = _parse_oauth_redirect(redirect)
+            except ValueError as exc:
+                return SecretAccepted(reply=str(exc))
+            self.deliver_oauth_code(code, state, iss)
+        elif flow is not None and flow.code is None and not flow.finished.is_set():
+            flow.finished.wait(timeout=2.0)
+            if flow.code is None and not flow.finished.is_set():
+                return SecretAccepted(
+                    reply=(
+                        "Still waiting for authorization. Open the link, approve access, "
+                        "then submit again (paste the redirect URL if needed)."
+                    )
+                )
+        if flow is not None and not flow.finished.wait(timeout=60.0):
+            return SecretAccepted(reply="OAuth is still finishing — try again in a moment.")
+        self._waits.pop(account_id, None)
+        self._oauth_flows.pop(account_id, None)
+        if flow is not None and flow.state:
+            self._oauth_by_state.pop(flow.state, None)
+        if flow is not None and flow.result_error is not None:
+            return SecretAccepted(reply=f"OAuth failed: {flow.result_error}")
+        draft = self._drafts.get(account_id, {}).get(name)
+        if draft is not None and draft.get("tested"):
+            count = len(draft.get("tools") or [])
+            return SecretAccepted(
+                resume=f"OAuth for {name} succeeded ({count} tool(s)). Finish with mcp_setup_finish."
+            )
+        return SecretAccepted(resume=f"OAuth for {name} saved. Run mcp_setup_test, then mcp_setup_finish.")
+
+    def _cancel_oauth(self, flow: _OAuthFlow) -> None:
+        flow.cancelled = True
+        if flow.state:
+            self._oauth_by_state.pop(flow.state, None)
+        self.deliver_oauth_code("", flow.state or "cancelled", None, error="cancelled")
+
+    def _register_oauth_state(self, flow: _OAuthFlow) -> None:
+        if flow.state:
+            self._oauth_by_state[flow.state] = flow
+
+    def deliver_oauth_code(
+        self,
+        code: str,
+        state: str,
+        iss: str | None,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        flow = self._oauth_by_state.get(state) if state else None
+        if flow is None:
+            for candidate in self._oauth_flows.values():
+                if not candidate.finished.is_set():
+                    flow = candidate
+                    break
+        if flow is None:
+            return False
+        if error:
+            flow.result_error = RuntimeError(error)
+            flow.code = ""
+            flow.callback_state = state
+            flow.iss = iss
+            flow.signal_code()
+            return True
+        if not code:
+            return False
+        flow.code = code
+        flow.callback_state = state
+        flow.iss = iss
+        flow.signal_code()
+        return True
+
+    def complete_oauth_callback(self, query: dict[str, str]) -> tuple[int, bytes, str]:
+        """Browser redirect target for MCP OAuth. No Robin session cookie required."""
+        err = query.get("error") or ""
+        if err:
+            detail = query.get("error_description") or err
+            body = (
+                "<!doctype html><title>Robin MCP</title>"
+                f"<p>Authorization failed: {_html(detail)}</p>"
+                "<p>You can close this window.</p>"
+            ).encode()
+            return 400, body, "text/html; charset=utf-8"
+        code = query.get("code") or ""
+        state = query.get("state") or ""
+        iss = query.get("iss") or None
+        if not code or not state:
+            body = b"<!doctype html><title>Robin MCP</title><p>Missing code or state.</p>"
+            return 400, body, "text/html; charset=utf-8"
+        if not self.deliver_oauth_code(code, state, iss):
+            body = (
+                b"<!doctype html><title>Robin MCP</title>"
+                b"<p>No pending MCP authorization matched this callback.</p>"
+            )
+            return 404, body, "text/html; charset=utf-8"
+        body = (
+            b"<!doctype html><title>Robin MCP</title>"
+            b"<p>Robin is connected. You can close this window and return to the app, then submit.</p>"
+        )
+        return 200, body, "text/html; charset=utf-8"
+
+    def redirect_base(self) -> str:
+        import os
+
+        base = self.public_base or os.environ.get("ROBIN_PUBLIC_URL", "").strip().rstrip("/")
+        if not base:
+            base = "http://127.0.0.1:8787"
+        return base
+
+    def _has_oauth_tokens(self, account_id: str, name: str) -> bool:
+        if self.broker is None:
+            return False
+        try:
+            raw = self.broker.reveal(account_id, f"mcp:{name}:oauth_tokens")
+        except Exception:
+            return False
+        return bool(raw and raw.strip() not in {"{}", "null"})
+
+    def _record_test(
+        self,
+        account_id: str,
+        name: str,
+        draft: dict[str, Any],
+        tools: list[dict[str, Any]],
+    ) -> str:
         draft["tools"] = tools
         draft["tool_hash"] = _tool_hash(tools)
         draft["tested"] = True
@@ -486,6 +801,7 @@ class Mcp(Capability):
             "headers": draft.get("headers") or {},
             "env": draft.get("env") or {},
             "token": draft.get("token") or "",
+            "auth": str(draft.get("auth") or "none"),
             "tools": tools,
             "enabled": tools_names[:_MAX_MCP_TOOLS],
             "tool_hash": draft.get("tool_hash") or _tool_hash(tools),
@@ -571,6 +887,11 @@ class Mcp(Capability):
                 self.broker.delete(account_id, f"mcp:{name}:token")
             except Exception:
                 pass
+            for key in (f"mcp:{name}:oauth_tokens", f"mcp:{name}:oauth_client"):
+                try:
+                    self.broker.delete(account_id, key)
+                except Exception:
+                    pass
         self._save(account_id)
         return "removed" if row is not None else "not found"
 
@@ -717,18 +1038,38 @@ class _SdkSession:
         @asynccontextmanager
         async def opened():
             from mcp import ClientSession
-            from mcp.client.streamable_http import streamablehttp_client
+
+            try:
+                from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+            except ImportError:  # pragma: no cover — mcp 1.x
+                from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
+
+                create_mcp_http_client = None  # type: ignore[assignment]
 
             url = str(self._config.get("url") or "")
             headers = dict(self._config.get("headers") or {})
             token = str(self._config.get("token") or "")
-            if token and "authorization" not in {key.casefold() for key in headers}:
+            auth_mode = str(self._config.get("auth") or "")
+            http_auth = None
+            if auth_mode == "oauth":
+                http_auth = _build_oauth_auth(self._config)
+            elif token and "authorization" not in {key.casefold() for key in headers}:
                 headers["Authorization"] = f"Bearer {token}"
-            async with streamablehttp_client(url, headers=headers or None) as streams:
-                read, write = streams[0], streams[1]
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    yield session
+            if create_mcp_http_client is not None:
+                client = create_mcp_http_client(headers=headers or None, auth=http_auth)
+                async with streamable_http_client(url, http_client=client) as streams:
+                    read, write = streams[0], streams[1]
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        yield session
+            else:  # pragma: no cover
+                if http_auth is not None:
+                    raise RuntimeError("MCP OAuth requires mcp>=2.0")
+                async with streamable_http_client(url, headers=headers or None) as streams:
+                    read, write = streams[0], streams[1]
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        yield session
 
         return opened()
 
@@ -785,3 +1126,147 @@ def load_household_mcp(path: str) -> tuple[list[dict[str, Any]], set[str]]:
     if not isinstance(servers, list):
         return [], admins
     return [dict(item) for item in servers if isinstance(item, dict)], admins
+
+
+class _OAuthFlow:
+    def __init__(self, *, account_id: str, name: str) -> None:
+        self.account_id = account_id
+        self.name = name
+        self.auth_url = ""
+        self.state = ""
+        self.code: str | None = None
+        self.callback_state = ""
+        self.iss: str | None = None
+        self.auth_ready = threading.Event()
+        self.finished = threading.Event()
+        self.cancelled = False
+        self.result_error: BaseException | None = None
+        self.tools: list[dict[str, Any]] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._code_event: asyncio.Event | None = None
+
+    def bind_loop(self) -> asyncio.Event:
+        self._loop = asyncio.get_running_loop()
+        self._code_event = asyncio.Event()
+        return self._code_event
+
+    def signal_code(self) -> None:
+        if self._loop is not None and self._code_event is not None:
+            self._loop.call_soon_threadsafe(self._code_event.set)
+
+
+class _BrokerTokenStorage:
+    """Persist MCP OAuth tokens and dynamic client registration in the broker."""
+
+    def __init__(self, broker: SecretStore, account_id: str, name: str) -> None:
+        self.broker = broker
+        self.account_id = account_id
+        self.name = name
+
+    async def get_tokens(self) -> Any:
+        from mcp.shared.auth import OAuthToken
+
+        raw = self._reveal(f"mcp:{self.name}:oauth_tokens")
+        if not raw:
+            return None
+        return OAuthToken.model_validate_json(raw)
+
+    async def set_tokens(self, tokens: Any) -> None:
+        self.broker.put(self.account_id, f"mcp:{self.name}:oauth_tokens", tokens.model_dump_json())
+
+    async def get_client_info(self) -> Any:
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        raw = self._reveal(f"mcp:{self.name}:oauth_client")
+        if not raw:
+            return None
+        return OAuthClientInformationFull.model_validate_json(raw)
+
+    async def set_client_info(self, client_info: Any) -> None:
+        self.broker.put(self.account_id, f"mcp:{self.name}:oauth_client", client_info.model_dump_json())
+
+    def _reveal(self, key: str) -> str:
+        try:
+            return self.broker.reveal(self.account_id, key)
+        except Exception:
+            return ""
+
+
+def _build_oauth_auth(config: dict[str, Any]) -> Any:
+    from pydantic import AnyUrl
+
+    from mcp.client.auth import AuthorizationCodeResult, OAuthClientProvider
+    from mcp.shared.auth import OAuthClientMetadata
+
+    broker = config.get("_broker")
+    account_id = str(config.get("_account_id") or "")
+    name = str(config.get("name") or "")
+    if broker is None or not account_id or not name:
+        raise RuntimeError("OAuth MCP requires a broker-backed account")
+    flow: _OAuthFlow | None = config.get("_oauth_flow")
+    base = str(config.get("_public_base") or "http://127.0.0.1:8787").rstrip("/")
+    redirect = f"{base}/v1/mcp/oauth/callback"
+    storage = _BrokerTokenStorage(broker, account_id, name)
+
+    async def redirect_handler(authorization_url: str) -> None:
+        if flow is None:
+            raise RuntimeError("OAuth authorization required but no interactive flow is active")
+        flow.auth_url = authorization_url
+        params = parse_qs(urlparse(authorization_url).query)
+        flow.state = (params.get("state") or [""])[0]
+        register = config.get("_oauth_register")
+        if callable(register):
+            register(flow)
+        flow.auth_ready.set()
+
+    async def callback_handler() -> AuthorizationCodeResult:
+        if flow is None:
+            raise RuntimeError("OAuth authorization required but no interactive flow is active")
+        event = flow.bind_loop()
+        await event.wait()
+        if flow.cancelled or flow.result_error is not None and not flow.code:
+            raise RuntimeError(str(flow.result_error or "OAuth cancelled"))
+        return AuthorizationCodeResult(
+            code=str(flow.code or ""),
+            state=flow.callback_state or flow.state or None,
+            iss=flow.iss,
+        )
+
+    metadata = OAuthClientMetadata(
+        client_name="Robin",
+        redirect_uris=[AnyUrl(redirect)],
+        grant_types=["authorization_code", "refresh_token"],
+        response_types=["code"],
+        token_endpoint_auth_method="none",
+    )
+    return OAuthClientProvider(
+        server_url=str(config.get("url") or ""),
+        client_metadata=metadata,
+        storage=storage,
+        redirect_handler=redirect_handler,
+        callback_handler=callback_handler,
+    )
+
+
+def _parse_oauth_redirect(redirect: str) -> tuple[str, str, str | None]:
+    parsed = urlparse(redirect.strip())
+    params = parse_qs(parsed.query)
+    if not params and parsed.fragment:
+        params = parse_qs(parsed.fragment)
+    if params.get("error"):
+        raise ValueError(f"authorization error: {params['error'][0]}")
+    code = (params.get("code") or [""])[0]
+    state = (params.get("state") or [""])[0]
+    iss = (params.get("iss") or [None])[0]
+    if not code or not state:
+        raise ValueError("redirect URL must include code and state")
+    return code, state, iss
+
+
+def _html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
