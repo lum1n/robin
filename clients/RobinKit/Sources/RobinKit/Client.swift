@@ -86,6 +86,27 @@ public actor RobinClient {
         return try JSONDecoder().decode(ScheduleState.self, from: accepted(raw, status: 200)).enabled
     }
 
+    public func notifications() async throws -> [AttentionItem] {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/notifications", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(NotificationList.self, from: accepted(raw, status: 200)).notifications
+    }
+
+    public func ackNotifications(_ ids: [String]) async throws -> Int {
+        let body = try encode(NotificationAckBody(accountID: accountID, ack: ids))
+        let raw = try await transport.call(
+            url: try url(path: "/v1/notifications"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(NotificationAckResult.self, from: accepted(raw, status: 200)).acked
+    }
+
     public func connect(name: String, secret: String) async throws {
         let body = try encode(SecretBody(accountID: accountID, name: name, value: secret))
         let raw = try await transport.call(
@@ -301,6 +322,56 @@ public struct InputField: Decodable, Sendable, Equatable, Identifiable {
         placeholder = try container.decodeIfPresent(String.self, forKey: .placeholder) ?? ""
         options = try container.decodeIfPresent([String].self, forKey: .options) ?? []
     }
+}
+
+public struct AttentionItem: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String { itemID }
+    public let itemID: String
+    public let kind: String
+    public let conversationID: String
+    public let text: String
+    public let created: String
+
+    private enum CodingKeys: String, CodingKey {
+        case itemID = "id"
+        case kind, text, created
+        case conversationID = "conversation_id"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        itemID = try container.decode(String.self, forKey: .itemID)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "notify"
+        conversationID = try container.decodeIfPresent(String.self, forKey: .conversationID) ?? ""
+        text = try container.decode(String.self, forKey: .text)
+        created = try container.decodeIfPresent(String.self, forKey: .created) ?? ""
+    }
+
+    public init(itemID: String, kind: String, conversationID: String, text: String, created: String = "") {
+        self.itemID = itemID
+        self.kind = kind
+        self.conversationID = conversationID
+        self.text = text
+        self.created = created
+    }
+}
+
+private struct NotificationList: Decodable {
+    var notifications: [AttentionItem]
+}
+
+private struct NotificationAckBody: Encodable {
+    var accountID: String
+    var ack: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case ack
+    }
+}
+
+private struct NotificationAckResult: Decodable {
+    var acked: Int
 }
 
 private struct InputMessageBody: Encodable {

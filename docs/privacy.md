@@ -113,4 +113,6 @@ The model opens an http or https page with browser_open when the request needs o
 
 A scheduled check stays off until that account turns it on with `POST /v1/schedule`, from the app. `robin tick` then runs a local check of mail and calendar for the accounts that asked. `deploy/robin-tick.timer` is the house timer. The running server also checks automations about once a minute.
 
+When that background turn needs a confirm or an input form, Robin also writes an encrypted notification for that account. The signed-in app polls `GET /v1/notifications` and can show a local alert. Another account cannot read those items. Remote Apple Push is not used.
+
 An automation comes from a sentence, for example a day summary every day at 08:00, a check every hour, or a reminder in 15 minutes. A repeating interval keeps running. A delay such as “in 15 minutes” runs once. It belongs to that account, stays on the instance, and runs on the local model. The result is saved for that account. Another account cannot list, change, or cancel it. An external action during a run is stored for confirmation and does not run on its own. The timer's output is a count. Memory stays on the instance, per account, and goes through the airlock before any cloud model.

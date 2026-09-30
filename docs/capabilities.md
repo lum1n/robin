@@ -26,6 +26,10 @@ Attach servers in chat with `mcp_setup_start` → `mcp_setup_ask_secret` (secure
 
 `files_read` extracts text from PDF (`robin[docs]`) and `.docx`. `docs_find` keyword-searches readable folders with an encrypted `doc_index`. `bills_scan` / `bills_remind` parse invoices from mail (KID/account drop for the model). `packages_scan` finds carrier tracking numbers and URLs.
 
+## Attention notifications
+
+`notify_person` and background work (`robin tick`, `run_due`) that stop on `confirm` or `input` enqueue a per-account inbox item (`kind`, conversation, text). Items are encrypted in the household store. The Mac and iPhone apps poll `GET /v1/notifications` while signed in, show a “Needs you” list, post a local OS alert for new items, and clear them with `POST /v1/notifications` `{ack: [ids]}`. There is no Apple Push channel yet — delivery depends on a signed-in app (plus best-effort iOS background refresh).
+
 ## Browser stealth and bot walls
 
 Robin opens pages with a **headed** Chromium (or Google Chrome when installed) on a per-account Xvfb display by default (`ROBIN_BROWSER_HEADLESS=0`). Automation flags are stripped. Optional engines: `ROBIN_BROWSER_ENGINE=playwright|patchright|camoufox` (patchright is preferred when installed via the `stealth` extra). Per-account persistent profiles keep cookies between visits.

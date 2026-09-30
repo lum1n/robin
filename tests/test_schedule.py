@@ -1,3 +1,4 @@
+from robin.capabilities.notify import Notify
 from robin.capabilities.screen import Screen
 from robin.http import Service, dispatch
 from robin.model import ModelTurn, ToolCall
@@ -23,6 +24,8 @@ def test_a_check_stays_off_until_that_account_turns_it_on(tmp_path) -> None:
     screen = Screen(owner="ada", text="desk", password="")
     assistant = Assistant(store=HouseholdStore(path, key))
     assistant.add(screen)
+    notify = Notify(store=assistant.store)
+    assistant.add(notify)
     model = Scripted([ModelTurn("", (ToolCall("screen_submit", {}),))])
     assert tick(assistant, model) == []
     assert model.calls == 0
@@ -51,6 +54,8 @@ def test_a_check_stays_off_until_that_account_turns_it_on(tmp_path) -> None:
 
     revived = Assistant(store=HouseholdStore(path, key))
     revived.add(screen)
+    revived_notify = Notify(store=revived.store)
+    revived.add(revived_notify)
     assert revived.schedule_enabled("ada") is True
     assert revived.schedule_enabled("bea") is False
     replies = tick(revived, model)
@@ -61,3 +66,6 @@ def test_a_check_stays_off_until_that_account_turns_it_on(tmp_path) -> None:
     pending = revived.take_pending("ada", "schedule")
     assert pending is not None
     assert pending["tool"] == "screen_submit"
+    attention = revived_notify.pending("ada")
+    assert len(attention) == 1
+    assert attention[0]["kind"] == "confirm"

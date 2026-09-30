@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -483,17 +485,90 @@ class HouseholdStore:
         rows = self._db.execute("SELECT account_id, body FROM doc_index").fetchall()
         return {account_id: json.loads(self._open(body)) for account_id, body in rows}
 
-    def save_notification(self, account_id: str, text: str) -> None:
+    def save_notification(
+        self,
+        account_id: str,
+        text: str,
+        *,
+        kind: str = "notify",
+        conversation_id: str = "",
+        notification_id: str | None = None,
+    ) -> dict:
+        """Persist one unread notification. Returns the public record."""
         self.ensure_account(account_id)
         position = self._db.execute(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM notifications WHERE account_id = ?",
             (account_id,),
         ).fetchone()[0]
+        record = {
+            "id": notification_id or f"{account_id}-{position}-{secrets.token_hex(4)}",
+            "kind": kind if kind in {"notify", "confirm", "input"} else "notify",
+            "conversation_id": conversation_id,
+            "text": text[:500],
+            "created": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        }
         self._db.execute(
             "INSERT INTO notifications (account_id, position, body) VALUES (?, ?, ?)",
-            (account_id, position, self._seal(text)),
+            (account_id, position, self._seal(json.dumps(record, sort_keys=True))),
         )
         self._db.commit()
+        return dict(record)
+
+    def list_notifications(self, account_id: str) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT position, body FROM notifications WHERE account_id = ? ORDER BY position",
+            (account_id,),
+        ).fetchall()
+        items: list[dict] = []
+        for position, body in rows:
+            raw = self._open(body)
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = {
+                    "id": f"{account_id}-{position}",
+                    "kind": "notify",
+                    "conversation_id": "",
+                    "text": raw,
+                    "created": "",
+                }
+            if isinstance(payload, dict):
+                items.append(
+                    {
+                        "id": str(payload.get("id") or f"{account_id}-{position}"),
+                        "kind": str(payload.get("kind") or "notify"),
+                        "conversation_id": str(payload.get("conversation_id") or ""),
+                        "text": str(payload.get("text") or raw)[:500],
+                        "created": str(payload.get("created") or ""),
+                    }
+                )
+        return items
+
+    def ack_notifications(self, account_id: str, ids: list[str]) -> int:
+        wanted = {str(item) for item in ids if str(item)}
+        if not wanted:
+            return 0
+        rows = self._db.execute(
+            "SELECT position, body FROM notifications WHERE account_id = ?",
+            (account_id,),
+        ).fetchall()
+        removed = 0
+        for position, body in rows:
+            raw = self._open(body)
+            try:
+                payload = json.loads(raw)
+                item_id = str(payload.get("id") or f"{account_id}-{position}")
+            except json.JSONDecodeError:
+                item_id = f"{account_id}-{position}"
+            if item_id in wanted:
+                self._db.execute(
+                    "DELETE FROM notifications WHERE account_id = ? AND position = ?",
+                    (account_id, position),
+                )
+                removed += 1
+        if removed:
+            self._db.commit()
+        return removed
 
     def delete_instance(self, account_id: str) -> None:
         self._db.execute("DELETE FROM instances WHERE account_id = ?", (account_id,))

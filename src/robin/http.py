@@ -77,6 +77,10 @@ def dispatch(
         return _get_profile(service, headers, query)
     if method == "GET" and path == "/v1/mcp":
         return _get_mcp(service, headers, query)
+    if method == "GET" and path == "/v1/notifications":
+        return _get_notifications(service, headers, query)
+    if method == "POST" and path == "/v1/notifications":
+        return _post_notifications(service, headers, body)
     if method == "POST" and path == "/v1/private":
         return _post_private(service, headers, body)
     if method == "GET" and path == "/v1/private":
@@ -413,6 +417,39 @@ def _get_schedule(service: Service, headers: dict[str, str], query: dict[str, st
     if denied is not None:
         return denied
     return 200, {"enabled": service.assistant.schedule_enabled(query["account_id"])}
+
+
+def _notify(service: Service):
+    for capability in service.assistant.registry._capabilities:
+        if getattr(capability, "id", "") == "notify" and hasattr(capability, "pending"):
+            return capability
+    return None
+
+
+def _get_notifications(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    account_id = query.get("account_id")
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    notify = _notify(service)
+    items = notify.pending(account_id) if notify is not None else []
+    return 200, {"notifications": items}
+
+
+def _post_notifications(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    raw = body.get("ack")
+    if not isinstance(raw, list):
+        return 400, {"error": "ack is required"}
+    ids = [str(item) for item in raw if str(item)]
+    notify = _notify(service)
+    cleared = notify.ack(account_id, ids) if notify is not None and hasattr(notify, "ack") else 0
+    return 200, {"acked": cleared}
 
 
 def _post_export(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:

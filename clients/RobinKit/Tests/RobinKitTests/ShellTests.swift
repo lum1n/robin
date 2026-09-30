@@ -93,6 +93,31 @@ struct ShellTests {
         #expect(await shell.phase == .ready(threads: ["desk"], reply: "hello"))
     }
 
+    @Test func notificationsPollAndAck() async throws {
+        let transport = ScriptedTransport(responses: [
+            raw(200, #"{"token":"sess-1"}"#),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, #"{"enabled":false}"#),
+            raw(200, #"{"notifications":[{"id":"n1","kind":"confirm","conversation_id":"schedule","text":"Confirm send.","created":"2026-09-30T00:00:00Z"}]}"#),
+            raw(200, #"{"acked":1}"#),
+        ])
+        let shell = Shell(transport: transport)
+        try await shell.signIn(instance: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", password: "pw")
+        #expect(await shell.notifications.isEmpty)
+        _ = try await shell.refreshNotifications(markFresh: true)
+        let items = await shell.notifications
+        #expect(items.count == 1)
+        #expect(items[0].itemID == "n1")
+        #expect(await shell.freshNotificationIDs == ["n1"])
+        try await shell.ackNotifications(["n1"])
+        #expect(await shell.notifications.isEmpty)
+        let calls = await transport.calls
+        #expect(calls.contains(where: { $0.url.path.hasSuffix("/v1/notifications") && $0.method == "GET" }))
+        let ack = calls.last(where: { $0.method == "POST" && $0.url.path.hasSuffix("/v1/notifications") })
+        let ackBody = String(decoding: ack?.body ?? Data(), as: UTF8.self)
+        #expect(ackBody.contains("\"n1\""))
+    }
+
     @Test func inputFormSubmitsAndCancels() async throws {
         let inputJSON = #"{"status":"input","text":"Enter the token.","route":"local","tool":null,"input":{"request_id":"req-1","title":"Home Assistant","reason":"Enter the token.","owner":"home","fields":[{"id":"token","label":"Access token","kind":"secret","required":true,"placeholder":"","options":[]}]}}"#
         let transport = ScriptedTransport(responses: [
@@ -185,6 +210,8 @@ struct ShellTests {
         #expect(source.contains("SecureField"))
         #expect(source.contains("InputFormView"))
         #expect(source.contains("submitInput"))
+        #expect(source.contains("Needs you"))
+        #expect(source.contains("UserNotifications"))
         #expect(source.contains("Connect mail"))
         #expect(source.contains("Connect calendar"))
         #expect(source.contains("Check mail and calendar"))

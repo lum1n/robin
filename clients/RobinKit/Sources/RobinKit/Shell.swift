@@ -13,8 +13,12 @@ public actor Shell {
     public private(set) var phase: ShellPhase = .signedOut
     public private(set) var scheduleEnabled = false
     public private(set) var serverTiming = ""
+    public private(set) var notifications: [AttentionItem] = []
+    /// IDs newly seen on the last poll (for local OS alerts).
+    public private(set) var freshNotificationIDs: [String] = []
     private var client: RobinClient?
     private let transport: any RobinTransport
+    private var knownNotificationIDs: Set<String> = []
 
     public init(transport: any RobinTransport = HTTPTransport()) {
         self.transport = transport
@@ -27,12 +31,18 @@ public actor Shell {
         scheduleEnabled = try await next.schedule()
         client = next
         phase = .ready(threads: threads, reply: nil)
+        knownNotificationIDs = []
+        notifications = []
+        freshNotificationIDs = []
     }
 
     public func leave() {
         client = nil
         scheduleEnabled = false
         serverTiming = ""
+        notifications = []
+        freshNotificationIDs = []
+        knownNotificationIDs = []
         phase = .signedOut
     }
 
@@ -116,6 +126,41 @@ public actor Shell {
         let current = try signedIn()
         let reply = try await current.cancelInput(conversationID: conversationID, requestID: requestID)
         try await show(reply, on: current)
+    }
+
+    @discardableResult
+    public func refreshNotifications(markFresh: Bool = true) async throws -> [AttentionItem] {
+        let current = try signedIn()
+        let items = try await current.notifications()
+        let ids = Set(items.map(\.itemID))
+        if markFresh {
+            freshNotificationIDs = items.map(\.itemID).filter { !knownNotificationIDs.contains($0) }
+        } else {
+            freshNotificationIDs = []
+        }
+        knownNotificationIDs = ids
+        notifications = items
+        return items
+    }
+
+    public func ackNotifications(_ ids: [String]) async throws {
+        guard !ids.isEmpty else { return }
+        let current = try signedIn()
+        _ = try await current.ackNotifications(ids)
+        knownNotificationIDs.subtract(ids)
+        notifications.removeAll { ids.contains($0.itemID) }
+        freshNotificationIDs.removeAll { ids.contains($0) }
+    }
+
+    public func openNotification(_ item: AttentionItem) async throws {
+        try await ackNotifications([item.itemID])
+        let current = try signedIn()
+        let threads = try await current.threads()
+        if item.kind == "confirm" {
+            phase = .confirm(threads: threads, prompt: item.text, tool: "")
+        } else {
+            phase = .ready(threads: threads, reply: item.text)
+        }
     }
 
     private func isTimeout(_ error: Error) -> Bool {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from robin.loop import Reply, converse
 from robin.model import Model
@@ -36,6 +37,7 @@ def run_due(assistant: Assistant, model: Model, *, now: datetime | None = None) 
                 allow_cloud=reply.allow_cloud,
                 free_text=reply.free_text,
             )
+        _notify_attention(assistant, work.account_id, work.conversation_id, reply)
         work.finish(reply.text)
         replies.append(reply)
     return replies
@@ -60,5 +62,35 @@ def tick(assistant: Assistant, model: Model, *, now: datetime | None = None) -> 
                 allow_cloud=reply.allow_cloud,
                 free_text=reply.free_text,
             )
+        _notify_attention(assistant, account_id, CONVERSATION, reply)
         replies.append(reply)
     return replies
+
+
+def _notify_attention(assistant: Assistant, account_id: str, conversation_id: str, reply: Reply) -> None:
+    """Enqueue attention when background work needs the person (confirm or input)."""
+    if reply.status not in {"confirm", "input"}:
+        return
+    notify = _find_notify(assistant)
+    if notify is None:
+        return
+    enqueue = getattr(notify, "enqueue", None)
+    if not callable(enqueue):
+        return
+    if reply.status == "confirm":
+        tool = reply.tool or "an action"
+        text = f"Robin needs confirmation for {tool}."
+        kind = "confirm"
+    else:
+        request = reply.input
+        title = getattr(request, "title", None) if request is not None else None
+        text = str(reply.text or title or "Robin needs a detail")[:500]
+        kind = "input"
+    enqueue(account_id, text, kind=kind, conversation_id=conversation_id)
+
+
+def _find_notify(assistant: Assistant) -> Any | None:
+    for capability in getattr(assistant.registry, "_capabilities", []):
+        if getattr(capability, "id", "") == "notify":
+            return capability
+    return None

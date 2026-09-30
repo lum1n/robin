@@ -1,8 +1,13 @@
 import RobinKit
 import SwiftUI
+import UserNotifications
 
 #if os(macOS)
 import AppKit
+#endif
+#if os(iOS)
+import BackgroundTasks
+import UIKit
 #endif
 
 @MainActor
@@ -35,8 +40,10 @@ final class ShellModel: ObservableObject {
     @Published private(set) var waiting = false
     @Published private(set) var serverTiming = ""
     @Published var inputValues: [String: String] = [:]
+    @Published private(set) var attention: [AttentionItem] = []
 
     private let shell: Shell
+    private var pollMirror: Task<Void, Never>?
 
     init(shell: Shell = Shell()) {
         self.shell = shell
@@ -58,6 +65,12 @@ final class ShellModel: ObservableObject {
             scheduleOn = await shell.scheduleEnabled
             await loadProfile()
             phase = await shell.phase
+            await AttentionAlerts.requestPermission()
+            await syncAttention(alertFresh: false)
+            startMirroringPoll()
+            #if os(iOS)
+            AttentionAlerts.scheduleBackgroundRefresh()
+            #endif
         } catch let error as RobinFailure {
             failure = error.message
         } catch {
@@ -102,6 +115,27 @@ final class ShellModel: ObservableObject {
                 requestID: request.requestID
             )
         }
+    }
+
+    func openAttention(_ item: AttentionItem) async {
+        if !item.conversationID.isEmpty {
+            conversationID = item.conversationID
+        }
+        await perform {
+            try await self.shell.openNotification(item)
+        }
+        attention = await shell.notifications
+    }
+
+    func dismissAttention(_ item: AttentionItem) async {
+        await perform {
+            try await self.shell.ackNotifications([item.itemID])
+        }
+        attention = await shell.notifications
+    }
+
+    func pollAttention() async {
+        await syncAttention(alertFresh: true)
     }
 
     func liveViewURL(path: String) -> URL? {
@@ -185,6 +219,8 @@ final class ShellModel: ObservableObject {
     }
 
     func leave() async {
+        pollMirror?.cancel()
+        pollMirror = nil
         await shell.leave()
         draft = ""
         mailPassword = ""
@@ -195,6 +231,7 @@ final class ShellModel: ObservableObject {
         clearProfile()
         serverTiming = ""
         failure = nil
+        attention = []
         phase = .signedOut
     }
 
@@ -237,12 +274,77 @@ final class ShellModel: ObservableObject {
             try await work()
             phase = await shell.phase
             serverTiming = await shell.serverTiming
+            attention = await shell.notifications
         } catch let error as RobinFailure {
             failure = error.message
         } catch {
             failure = _reach(error)
         }
     }
+
+    private func syncAttention(alertFresh: Bool) async {
+        do {
+            _ = try await shell.refreshNotifications(markFresh: alertFresh)
+            attention = await shell.notifications
+            if alertFresh {
+                let fresh = await shell.freshNotificationIDs
+                let items = attention.filter { fresh.contains($0.itemID) }
+                for item in items {
+                    AttentionAlerts.post(item)
+                }
+            }
+        } catch {
+            // Poll failures stay quiet; the next tick retries.
+        }
+    }
+
+    private func startMirroringPoll() {
+        pollMirror?.cancel()
+        pollMirror = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                guard !Task.isCancelled else { return }
+                await syncAttention(alertFresh: true)
+            }
+        }
+    }
+}
+
+private enum AttentionAlerts {
+    static let refreshTaskID = "robin.attention.refresh"
+
+    static func requestPermission() async {
+        _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
+    }
+
+    static func post(_ item: AttentionItem) {
+        let content = UNMutableNotificationContent()
+        content.title = "Robin"
+        content.body = item.text
+        content.sound = .default
+        content.userInfo = [
+            "notification_id": item.itemID,
+            "conversation_id": item.conversationID,
+            "kind": item.kind,
+        ]
+        let request = UNNotificationRequest(identifier: item.itemID, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    #if os(iOS)
+    static func registerBackgroundRefresh() {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: refreshTaskID, using: nil) { task in
+            task.setTaskCompleted(success: true)
+            scheduleBackgroundRefresh()
+        }
+    }
+
+    static func scheduleBackgroundRefresh() {
+        let request = BGAppRefreshTaskRequest(identifier: refreshTaskID)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+    #endif
 }
 
 private func _reach(_ error: Error) -> String {
@@ -258,6 +360,9 @@ private func _reach(_ error: Error) -> String {
 
 struct RobinRootView: View {
     @StateObject private var model = ShellModel()
+    #if os(iOS)
+    @Environment(\.scenePhase) private var scenePhase
+    #endif
 
     var body: some View {
         NavigationStack {
@@ -268,6 +373,13 @@ struct RobinRootView: View {
                 ConversationForm(model: model)
             }
         }
+        #if os(iOS)
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await model.pollAttention() }
+            }
+        }
+        #endif
     }
 }
 
@@ -303,6 +415,21 @@ private struct ConversationForm: View {
         RobinFields {
             if model.waiting {
                 Text("Waiting for Robin…")
+            }
+            if !model.attention.isEmpty {
+                Text("Needs you").font(.headline)
+                ForEach(model.attention) { item in
+                    HStack {
+                        Button(item.text) {
+                            Task { await model.openAttention(item) }
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
+                        Button("Dismiss") {
+                            Task { await model.dismissAttention(item) }
+                        }
+                    }
+                }
             }
             switch model.phase {
             case .ready(let threads, let reply):
@@ -539,6 +666,12 @@ struct RobinApp: App {
     #if os(macOS)
     @NSApplicationDelegateAdaptor(RobinActivation.self) private var activation
     #endif
+
+    init() {
+        #if os(iOS)
+        AttentionAlerts.registerBackgroundRefresh()
+        #endif
+    }
 
     var body: some Scene {
         WindowGroup {
