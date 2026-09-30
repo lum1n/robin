@@ -83,6 +83,8 @@ class SecretAccepted:
     resume: str = ""
     allow_cloud: bool = False
     free_text: bool = False
+    # When true, the wait is still open — return status input again (do not dismiss the form).
+    input_again: bool = False
 
 
 _INPUT_KINDS = frozenset({"text", "secret", "url", "email", "username", "otp", "number", "choice"})

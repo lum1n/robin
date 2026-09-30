@@ -206,6 +206,38 @@ def test_send_swallows_client_disconnect() -> None:
     _send(Gone(), 200, b"{}", "application/json")  # type: ignore[arg-type]
 
 
+def test_status_overview_lists_connectors_without_secrets(tmp_path) -> None:
+    model = Scripted([ModelTurn("ok")])
+    service, _screen, ada, bea = _service(tmp_path, model)
+    secret = "mailbox-password-ada"
+    connected, _ = dispatch(
+        service,
+        "POST",
+        "/v1/secrets",
+        body={"account_id": "ada", "name": "mailbox", "value": secret},
+        headers=ada,
+    )
+    assert connected == 200
+    service.assistant.set_schedule("ada", True)
+    service.assistant.remember("ada", "kitchen", "user", "hi")
+
+    status, body = dispatch(service, "GET", "/v1/status", query={"account_id": "ada"}, headers=ada)
+    assert status == 200
+    assert body["account_id"] == "ada"
+    assert body["schedule_enabled"] is True
+    assert body["connected"] == ["mailbox"]
+    assert body["threads"] == ["kitchen"]
+    assert body["private"] is None
+    assert body["mcp"] == []
+    assert any(cap["id"] == "display_fixture" for cap in body["capabilities"])
+    fixture = next(cap for cap in body["capabilities"] if cap["id"] == "display_fixture")
+    assert "screen_submit" in fixture["tools"]
+    assert secret not in json.dumps(body)
+
+    denied, _ = dispatch(service, "GET", "/v1/status", query={"account_id": "ada"}, headers=bea)
+    assert denied == 401
+
+
 def test_message_heartbeat_keeps_leading_whitespace_json_decodable(monkeypatch) -> None:
     import io
     import json

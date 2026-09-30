@@ -2558,7 +2558,11 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
+    { name = "gliner" },
+    { name = "mcp" },
+    { name = "patchright" },
     { name = "playwright" },
+    { name = "protobuf" },
 ]
 
 [package.optional-dependencies]
@@ -2568,19 +2572,9 @@ camoufox = [
 docs = [
     { name = "pypdf" },
 ]
-mcp = [
-    { name = "mcp" },
-]
-ner = [
-    { name = "gliner" },
-    { name = "protobuf" },
-]
 photos = [
     { name = "open-clip-torch" },
     { name = "pillow" },
-]
-stealth = [
-    { name = "patchright" },
 ]
 
 [package.dev-dependencies]
@@ -2592,16 +2586,16 @@ dev = [
 requires-dist = [
     { name = "camoufox", extras = ["geoip"], marker = "extra == 'camoufox'", specifier = ">=0.4" },
     { name = "cryptography", specifier = ">=44" },
-    { name = "gliner", marker = "extra == 'ner'", specifier = ">=0.2.22" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.0" },
+    { name = "gliner", specifier = ">=0.2.22" },
+    { name = "mcp", specifier = ">=2.0" },
     { name = "open-clip-torch", marker = "extra == 'photos'", specifier = ">=2.24" },
-    { name = "patchright", marker = "extra == 'stealth'", specifier = ">=1.49" },
+    { name = "patchright", specifier = ">=1.49" },
     { name = "pillow", marker = "extra == 'photos'", specifier = ">=10" },
     { name = "playwright", specifier = ">=1.49" },
-    { name = "protobuf", marker = "extra == 'ner'", specifier = ">=7.36.2" },
+    { name = "protobuf", specifier = ">=7.36.2" },
     { name = "pypdf", marker = "extra == 'docs'", specifier = ">=5" },
 ]
-provides-extras = ["ner", "photos", "stealth", "camoufox", "mcp", "docs"]
+provides-extras = ["photos", "camoufox", "docs"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]

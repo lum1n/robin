@@ -13,7 +13,41 @@ struct ShellTests {
         await #expect(throws: RobinFailure(status: 401, message: "login required")) {
             try await shell.loadTurns(conversationID: "home")
         }
+        await #expect(throws: RobinFailure(status: 401, message: "login required")) {
+            try await shell.overview()
+        }
         #expect(await transport.calls.isEmpty)
+    }
+
+    @Test func overviewReturnsAssistantSnapshotWithoutMutatingPhase() async throws {
+        let payload = """
+        {"account_id":"ada","schedule_enabled":true,"connected":["mailbox"],"profile_present":["email"],\
+        "mcp":[{"name":"notes","status":"active","transport":"http","tools":2}],\
+        "capabilities":[{"id":"post","status":"mail: connected","tools":["mail_list"]}],\
+        "connectors":["mail: connected"],"threads":["home"],"private":null}
+        """
+        let transport = ScriptedTransport(responses: [
+            raw(200, #"{"token":"sess-1"}"#),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, #"{"enabled":false}"#),
+            raw(200, payload),
+        ])
+        let shell = Shell(transport: transport)
+        try await shell.signIn(instance: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", password: "pw")
+        let overview = try await shell.overview()
+        #expect(overview.accountID == "ada")
+        #expect(overview.scheduleEnabled == true)
+        #expect(overview.connected == ["mailbox"])
+        #expect(overview.profilePresent == ["email"])
+        #expect(overview.mcp == [McpServerSummary(name: "notes", status: "active", transport: "http", tools: 2)])
+        #expect(overview.capabilities == [CapabilitySummary(id: "post", status: "mail: connected", tools: ["mail_list"])])
+        #expect(overview.connectors == ["mail: connected"])
+        #expect(overview.threads == ["home"])
+        #expect(overview.privateInstance == nil)
+        #expect(await shell.phase == .ready(threads: ["home"], reply: nil))
+        let calls = await transport.calls
+        #expect(calls[3].url.absoluteString == "http://127.0.0.1:8787/v1/status?account_id=ada")
+        #expect(calls[3].method == "GET")
     }
 
     @Test func listThreadsReturnsIdsWithoutMutatingPhase() async throws {
@@ -178,6 +212,7 @@ struct ShellTests {
 
     @Test func inputFormSubmitsAndCancels() async throws {
         let inputJSON = #"{"status":"input","text":"Enter the token.","route":"local","tool":null,"input":{"request_id":"req-1","title":"Home Assistant","reason":"Enter the token.","owner":"home","fields":[{"id":"token","label":"Access token","kind":"secret","required":true,"placeholder":"","options":[]}]}}"#
+        let oauthJSON = #"{"status":"input","text":"Open this authorization link:\nhttps://auth.example/authorize?state=s1\n","route":"local","tool":null,"input":{"request_id":"req-oauth","title":"Authorize MCP sentry","reason":"Open this authorization link:\nhttps://auth.example/authorize?state=s1\n","owner":"mcp","open_url":"https://auth.example/authorize?state=s1","fields":[{"id":"redirect","label":"Redirect URL (optional)","kind":"url","required":false,"placeholder":"https://…?code=…","options":[]}]}}"#
         let transport = ScriptedTransport(responses: [
             raw(200, #"{"token":"sess-1"}"#),
             raw(200, #"{"threads":["home"]}"#),
@@ -189,6 +224,8 @@ struct ShellTests {
             raw(200, inputJSON),
             raw(200, #"{"threads":["home"]}"#),
             raw(200, #"{"status":"reply","text":"cancelled","route":"local","tool":null}"#),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, oauthJSON),
             raw(200, #"{"threads":["home"]}"#),
         ])
         let shell = Shell(transport: transport)
@@ -214,6 +251,14 @@ struct ShellTests {
         let cancelCall = await transport.calls.reversed().first(where: { $0.body != nil })
         let cancelBody = String(decoding: cancelCall?.body ?? Data(), as: UTF8.self)
         #expect(cancelBody.contains("\"cancel\":true"))
+        try await shell.send(conversationID: "home", text: "sentry oauth")
+        guard case .input(_, let oauthPrompt, let oauthRequest) = await shell.phase else {
+            Issue.record("expected oauth input")
+            return
+        }
+        #expect(oauthPrompt.contains("https://auth.example/authorize"))
+        #expect(oauthRequest.openURL == "https://auth.example/authorize?state=s1")
+        #expect(oauthRequest.fields.first?.fieldID == "redirect")
     }
 
     @Test func connectingAMailboxDoesNotKeepThePassword() async throws {

@@ -229,9 +229,10 @@ def _boot(args: argparse.Namespace) -> int:
             break
     if not ner._installed:
         print(
-            "robin: WARNING local NER is not installed (uv sync --extra ner). "
-            "Without it, conversation history and free-text tool results stay [UNRESOLVED] "
-            "and browser controls become unusable labels.",
+            "robin: WARNING local NER packages are missing — reinstall robin "
+            "(gliner is a core dependency). Without NER, conversation history and "
+            "free-text tool results stay [UNRESOLVED] and browser controls become "
+            "unusable labels.",
             flush=True,
         )
     elif ner._failed:

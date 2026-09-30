@@ -150,6 +150,17 @@ public actor RobinClient {
         return try JSONDecoder().decode(SecretList.self, from: accepted(raw, status: 200)).connected
     }
 
+    /// Read-only assistant snapshot: connectors, MCP, capabilities, schedule, threads.
+    public func overview() async throws -> AssistantOverview {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/status", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(AssistantOverview.self, from: accepted(raw, status: 200))
+    }
+
     public func profile() async throws -> [String: String] {
         let raw = try await transport.call(
             url: try url(path: "/v1/profile", query: ["account_id": accountID]),
@@ -577,6 +588,68 @@ private struct ThreadList: Decodable {
 public struct Turn: Decodable, Sendable, Equatable {
     public var role: String
     public var text: String
+}
+
+public struct AssistantOverview: Decodable, Sendable, Equatable {
+    public var accountID: String
+    public var scheduleEnabled: Bool
+    public var connected: [String]
+    public var profilePresent: [String]
+    public var mcp: [McpServerSummary]
+    public var capabilities: [CapabilitySummary]
+    public var connectors: [String]
+    public var threads: [String]
+    public var privateInstance: PrivateInstanceSummary?
+
+    private enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case scheduleEnabled = "schedule_enabled"
+        case connected
+        case profilePresent = "profile_present"
+        case mcp, capabilities, connectors, threads
+        case privateInstance = "private"
+    }
+}
+
+public struct McpServerSummary: Decodable, Sendable, Equatable {
+    public var name: String
+    public var status: String
+    public var transport: String
+    public var tools: Int
+
+    public init(name: String, status: String, transport: String, tools: Int) {
+        self.name = name
+        self.status = status
+        self.transport = transport
+        self.tools = tools
+    }
+}
+
+public struct CapabilitySummary: Decodable, Sendable, Equatable {
+    public var id: String
+    public var status: String
+    public var tools: [String]
+
+    public init(id: String, status: String, tools: [String]) {
+        self.id = id
+        self.status = status
+        self.tools = tools
+    }
+}
+
+public struct PrivateInstanceSummary: Decodable, Sendable, Equatable {
+    public var httpsURL: String
+    public var ready: Bool
+
+    public init(httpsURL: String, ready: Bool) {
+        self.httpsURL = httpsURL
+        self.ready = ready
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case httpsURL = "https_url"
+        case ready
+    }
 }
 
 private struct ThreadTurns: Decodable {

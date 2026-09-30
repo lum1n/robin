@@ -290,14 +290,27 @@ class Mcp(Capability):
         kind = str(waiting.get("kind") or "bearer")
         if kind == "oauth":
             auth_url = str(waiting.get("auth_url") or "")
-            return InputRequest(
-                request_id=str(waiting["request_id"]),
-                title=f"Authorize MCP {waiting.get('name')}",
-                reason=(
-                    f"Sign in to connect MCP server {waiting.get('name')}. "
+            name = waiting.get("name")
+            error = str(waiting.get("error") or "").strip()
+            if auth_url:
+                reason = (
+                    f"Sign in to connect MCP server {name}. "
+                    f"Open this authorization link:\n{auth_url}\n"
+                    "Approve access, then return here and submit. "
+                    "If the browser does not return to Robin automatically, paste the final redirect URL."
+                )
+            else:
+                reason = (
+                    f"Sign in to connect MCP server {name}. "
                     "Open the authorization link, approve access, then return here and submit. "
                     "If the browser does not return to Robin automatically, paste the final redirect URL."
-                ),
+                )
+            if error:
+                reason = f"{error}\n\n{reason}"
+            return InputRequest(
+                request_id=str(waiting["request_id"]),
+                title=f"Authorize MCP {name}",
+                reason=reason,
                 fields=(
                     InputField(
                         id="redirect",
@@ -629,19 +642,23 @@ class Mcp(Capability):
             try:
                 code, state, iss = _parse_oauth_redirect(redirect)
             except ValueError as exc:
-                return SecretAccepted(reply=str(exc))
+                waiting["error"] = str(exc)
+                return SecretAccepted(reply=str(exc), input_again=True)
+            waiting.pop("error", None)
             self.deliver_oauth_code(code, state, iss)
         elif flow is not None and flow.code is None and not flow.finished.is_set():
             flow.finished.wait(timeout=2.0)
             if flow.code is None and not flow.finished.is_set():
-                return SecretAccepted(
-                    reply=(
-                        "Still waiting for authorization. Open the link, approve access, "
-                        "then submit again (paste the redirect URL if needed)."
-                    )
+                message = (
+                    "Still waiting for authorization. Open the link, approve access, "
+                    "then submit again (paste the redirect URL if needed)."
                 )
+                waiting["error"] = message
+                return SecretAccepted(reply=message, input_again=True)
         if flow is not None and not flow.finished.wait(timeout=60.0):
-            return SecretAccepted(reply="OAuth is still finishing — try again in a moment.")
+            message = "OAuth is still finishing — try again in a moment."
+            waiting["error"] = message
+            return SecretAccepted(reply=message, input_again=True)
         self._waits.pop(account_id, None)
         self._oauth_flows.pop(account_id, None)
         if flow is not None and flow.state:
@@ -944,7 +961,7 @@ def _stdio_allowed(command: str) -> bool:
 
 
 def _unavailable_session(config: dict[str, Any]) -> McpSession:
-    raise RuntimeError("MCP client is not installed — pip install robin[mcp]")
+    raise RuntimeError("Robin MCP SDK missing — reinstall robin (mcp is a core dependency)")
 
 
 class _AsyncLoop:
@@ -969,7 +986,7 @@ def _mcp_loop() -> _AsyncLoop:
 
 
 class _SdkSession:
-    """Sync wrapper around the optional mcp Python SDK."""
+    """Sync wrapper around the mcp Python SDK."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
@@ -1108,7 +1125,9 @@ def _open_sdk_session(config: dict[str, Any]) -> McpSession:
     try:
         import mcp  # noqa: F401
     except ImportError as exc:
-        raise RuntimeError("MCP client is not installed — pip install robin[mcp]") from exc
+        raise RuntimeError(
+            "Robin MCP SDK missing — reinstall robin (mcp is a core dependency)"
+        ) from exc
     return _SdkSession(config)
 
 

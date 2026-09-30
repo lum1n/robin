@@ -162,6 +162,15 @@ def _with_site_login(
 ) -> Reply:
     accepted = assistant.accept_secret(task.account_id, task.conversation_id, task.text)
     if accepted is not None and accepted.reply:
+        if accepted.input_again:
+            pending = assistant.pending_input(task.account_id, task.conversation_id)
+            if pending is not None:
+                return Reply(
+                    "input",
+                    pending.reason or accepted.reply,
+                    Route.LOCAL,
+                    input=pending,
+                )
         return Reply("reply", accepted.reply, Route.LOCAL)
     if accepted is not None and accepted.resume:
         task = Task(

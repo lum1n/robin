@@ -231,6 +231,35 @@ class Assistant:
     def statuses(self, account_id: str) -> list[str]:
         return self.registry.statuses(account_id)
 
+    def overview(self, account_id: str) -> dict[str, Any]:
+        """Read-only assistant snapshot for apps — no secrets or profile values."""
+        capabilities: list[dict[str, Any]] = []
+        mcp: list[dict[str, Any]] = []
+        for capability in self.registry.for_account(account_id):
+            tools = [tool.name for tool in capability.available_tools(account_id)]
+            capabilities.append(
+                {
+                    "id": capability.id,
+                    "status": capability.status(account_id).strip(),
+                    "tools": tools,
+                }
+            )
+            summary = getattr(capability, "summary", None)
+            if capability.id == "mcp" and callable(summary):
+                mcp = summary(account_id)
+        connectable = ("calendar", "mailbox")
+        connected = [name for name in self.broker.names(account_id) if name in connectable]
+        return {
+            "account_id": account_id,
+            "schedule_enabled": self.schedule_enabled(account_id),
+            "connected": connected,
+            "profile_present": self.profile_presence(account_id),
+            "mcp": mcp,
+            "capabilities": capabilities,
+            "connectors": self.statuses(account_id),
+            "threads": self.threads(account_id),
+        }
+
     def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
         for capability in self.registry.for_account(account_id):
             accepted = capability.accept_secret(account_id, conversation_id, text)

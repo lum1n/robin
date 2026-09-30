@@ -78,6 +78,11 @@ public actor Shell {
         try await signedIn().saveProfile(fields)
     }
 
+    /// Read-only assistant snapshot for the signed-in account.
+    public func overview() async throws -> AssistantOverview {
+        try await signedIn().overview()
+    }
+
     /// Thread ids for the signed-in account (empty when signed out throws via signedIn()).
     public func listThreads() async throws -> [String] {
         try await signedIn().threads()

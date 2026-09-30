@@ -25,7 +25,7 @@ Attach servers in chat with `mcp_setup_start` → secrets or OAuth → `mcp_setu
 - **Bearer / header / env:** `mcp_setup_ask_secret` shows a secure form; values stay in the broker.
 - **OAuth (authorization code + PKCE):** set `auth=oauth` on start (or call `mcp_setup_oauth`). Robin discovers the authorization server, opens an authorize link (`InputRequest.open_url`), and completes the callback at `GET /v1/mcp/oauth/callback` (or the person pastes the redirect URL). Access and refresh tokens plus the dynamic client registration live in the broker (`mcp:<name>:oauth_tokens` / `oauth_client`). Set `ROBIN_PUBLIC_URL` (or the advertise URL) so remote IdPs can redirect back to this house. Works with remote MCPs such as Sentry.
 
-Tools become `mcp_<server>_<tool>` (at most 40 per account). Results are untrusted data. Remote HTTP tools are egress. Destructive tools always confirm. A changed tool list hides the server until re-approval. Household admins may add stdio servers from `/etc/robin/mcp.json` (`--mcp-config`); stdio runs as that account's login. `GET /v1/mcp` is read-only (names, status, tool counts). Optional extra: `robin[mcp]` (mcp≥2).
+Tools become `mcp_<server>_<tool>` (at most 40 per account). Results are untrusted data. Remote HTTP tools are egress. Destructive tools always confirm. A changed tool list hides the server until re-approval. Household admins may add stdio servers from `/etc/robin/mcp.json` (`--mcp-config`); stdio runs as that account's login. `GET /v1/mcp` is read-only (names, status, tool counts). `GET /v1/status` is the RobinKit overview: schedule, connected mailbox/calendar names, profile field presence, MCP summaries, each capability's status line and tool names, threads, and optional private instance — never secrets. The MCP Python SDK ships with Robin (`mcp>=2`).
 
 ## Documents and bills
 
@@ -37,7 +37,7 @@ Tools become `mcp_<server>_<tool>` (at most 40 per account). Results are untrust
 
 ## Browser stealth and bot walls
 
-Robin opens pages with a **headed** Chromium (or Google Chrome when installed) on a per-account Xvfb display by default (`ROBIN_BROWSER_HEADLESS=0`). Automation flags are stripped. Optional engines: `ROBIN_BROWSER_ENGINE=playwright|patchright|camoufox` (patchright is preferred when installed via the `stealth` extra). Per-account persistent profiles keep cookies between visits.
+Robin opens pages with a **headed** Chromium (or Google Chrome when installed) on a per-account Xvfb display by default (`ROBIN_BROWSER_HEADLESS=0`). Automation flags are stripped. Engines: `ROBIN_BROWSER_ENGINE=playwright|patchright|camoufox` (patchright ships with Robin and is preferred by default; camoufox remains an optional extra). Per-account persistent profiles keep cookies between visits.
 
 When a snapshot is a captcha or WAF wall, the turn returns status `handoff` with a `live_url`. The person opens that live view (Playwright screenshots over HTTP — pixels never go to a model), solves the check, then confirms. `resume` re-reads the page and continues.
 

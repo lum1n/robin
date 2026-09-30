@@ -38,10 +38,10 @@ COPY deploy/robin-tick.timer /etc/systemd/system/robin-tick.timer
 # Shelley and SSH stay off. No mailbox secret and no exe.dev token are baked in.
 # Chromium/Chrome is for computer-use on this VM. The house server does not use this image.
 # ROBIN_BROWSER_HEADLESS defaults to 0 (headed on Xvfb). Set to 1 to force headless.
-# ROBIN_BROWSER_ENGINE=playwright|patchright|camoufox (patchright when installed).
+# ROBIN_BROWSER_ENGINE=playwright|patchright|camoufox (patchright is preferred by default).
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/robin/ms-playwright
 ENV ROBIN_BROWSER_HEADLESS=0
-RUN uv sync --frozen --no-dev --extra ner --extra stealth \
+RUN uv sync --frozen --no-dev \
     && /opt/robin/.venv/bin/playwright install --with-deps chromium \
     && /opt/robin/.venv/bin/patchright install chromium || true \
     && ln -sf /opt/robin/.venv/bin/robin /usr/local/bin/robin \

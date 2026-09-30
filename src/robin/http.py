@@ -77,6 +77,8 @@ def dispatch(
         return _get_profile(service, headers, query)
     if method == "GET" and path == "/v1/mcp":
         return _get_mcp(service, headers, query)
+    if method == "GET" and path == "/v1/status":
+        return _get_status(service, headers, query)
     if method == "GET" and path == "/v1/mcp/oauth/callback":
         return _mcp_oauth_callback_json(service, query)
     if method == "GET" and path == "/v1/notifications":
@@ -380,6 +382,17 @@ def _post_input(
             "provided: " + ", ".join(labels),
         )
     if accepted.reply and not accepted.resume:
+        if accepted.input_again:
+            again = service.assistant.pending_input(account_id, conversation_id)
+            if again is not None:
+                return 200, {
+                    "status": "input",
+                    "text": again.reason or accepted.reply,
+                    "route": "local",
+                    "tool": None,
+                    "timing": "",
+                    "input": again.public(),
+                }
         return 200, {
             "status": "reply",
             "text": accepted.reply,
@@ -572,6 +585,23 @@ def _get_mcp(service: Service, headers: dict[str, str], query: dict[str, str]) -
             servers = summary(account_id)
             break
     return 200, {"servers": servers}
+
+
+def _get_status(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """One-shot overview for RobinKit: connectors, MCP, capabilities, schedule, threads."""
+    account_id = query.get("account_id")
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    assert isinstance(account_id, str)
+    body = service.assistant.overview(account_id)
+    private: dict[str, Any] | None = None
+    if service.enrollment is not None:
+        record = service.enrollment.get(account_id)
+        if record is not None:
+            private = {"https_url": record["https_url"], "ready": record["ready"]}
+    body["private"] = private
+    return 200, body
 
 
 def _mcp_capability(service: Service) -> Any:

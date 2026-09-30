@@ -176,6 +176,28 @@ struct ClientTests {
         #expect(calls[2].token == "sess-1")
     }
 
+    @Test func overviewDecodesStatusWithoutSecrets() async throws {
+        let body = #"{"account_id":"ada","schedule_enabled":false,"connected":["calendar"],"profile_present":[],"mcp":[],"capabilities":[{"id":"agenda","status":"calendar: connected","tools":["calendar_list"]}],"connectors":["calendar: connected"],"threads":[],"private":{"https_url":"https://robin-ada.example","ready":true}}"#
+        let transport = ScriptedTransport(responses: [
+            RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(body.utf8)),
+        ])
+        let client = RobinClient(
+            baseURL: URL(string: "http://127.0.0.1:8787")!,
+            accountID: "ada",
+            transport: transport
+        )
+        try await client.login(password: "correct-horse")
+        let overview = try await client.overview()
+        #expect(overview.connected == ["calendar"])
+        #expect(overview.privateInstance?.httpsURL == "https://robin-ada.example")
+        #expect(overview.privateInstance?.ready == true)
+        let calls = await transport.calls
+        #expect(calls[1].url.absoluteString == "http://127.0.0.1:8787/v1/status?account_id=ada")
+        #expect(calls[1].method == "GET")
+        #expect(calls[1].token == "sess-1")
+    }
+
     @Test func aMessageBeforeLoginFailsLocally() async throws {
         let transport = ScriptedTransport(responses: [])
         let client = RobinClient(

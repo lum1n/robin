@@ -303,6 +303,7 @@ def test_mcp_oauth_setup_input_and_callback() -> None:
     pending = mcp.pending_input("ada", "t")
     assert pending is not None
     assert pending.open_url.startswith("https://auth.example/authorize")
+    assert pending.open_url in pending.reason
     assert pending.fields[0].id == "redirect"
     assert pending.fields[0].required is False
     status, body, content_type = mcp.complete_oauth_callback({"code": "authcode", "state": "st123"})
@@ -316,6 +317,74 @@ def test_mcp_oauth_setup_input_and_callback() -> None:
     assert "at" in assistant.broker.reveal("ada", "mcp:sentry:oauth_tokens")
     finished = mcp.invoke("ada", "mcp_setup_finish", {"name": "sentry", "trust": "ask"})
     assert "activated" in finished
+
+
+def test_mcp_oauth_bad_redirect_keeps_input() -> None:
+    assistant = Assistant()
+    fake = _OAuthFakeSession(assistant.broker)
+
+    def open_session(config: dict):
+        fake.flow = config.get("_oauth_flow")
+        fake.register = config.get("_oauth_register")
+        if fake.flow is not None:
+            fake.flow.state = "bad1"
+        return fake
+
+    mcp = Mcp(broker=assistant.broker, open_session=open_session, public_base="http://house.local")
+    assistant.add(mcp)
+    mcp.invoke(
+        "ada",
+        "mcp_setup_start",
+        {"name": "notes", "transport": "http", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    )
+    mcp.invoke("ada", "mcp_setup_oauth", {"name": "notes"})
+    pending = mcp.pending_input("ada", "t")
+    assert pending is not None
+    assert pending.open_url in pending.reason
+    accepted = mcp.accept_input(
+        "ada",
+        "t",
+        pending.request_id,
+        {"redirect": "https://example.com/not-a-callback"},
+    )
+    assert accepted is not None
+    assert accepted.input_again
+    assert "code and state" in accepted.reply.casefold()
+    again = mcp.pending_input("ada", "t")
+    assert again is not None
+    assert again.open_url == pending.open_url
+    assert again.open_url in again.reason
+    assert "code and state" in again.reason.casefold()
+
+    from robin.http import Service, dispatch
+    from robin.model import ModelTurn
+
+    class M:
+        def complete(self, *, messages, tools):
+            return ModelTurn(text="ok")
+
+    service = Service(assistant, M())
+    service.auth.register("ada", "pw")
+    headers = {"authorization": f"Bearer {service.auth.login('ada', 'pw')}"}
+    status, body = dispatch(
+        service,
+        "POST",
+        "/v1/messages",
+        body={
+            "account_id": "ada",
+            "conversation_id": "t",
+            "input": {
+                "request_id": again.request_id,
+                "values": {"redirect": "https://example.com/still-wrong"},
+            },
+        },
+        headers=headers,
+    )
+    assert status == 200
+    assert body["status"] == "input"
+    assert body["input"]["open_url"] == pending.open_url
+    assert pending.open_url in body["text"]
+    assert "code and state" in body["text"].casefold()
 
 
 def test_mcp_oauth_paste_redirect() -> None:
