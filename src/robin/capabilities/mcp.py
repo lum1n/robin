@@ -27,6 +27,8 @@ from robin.store import HouseholdStore
 
 _SAFE_NAME = re.compile(r"[^a-z0-9_]+")
 _MAX_MCP_TOOLS = 40
+# Robin apps catch this in the system sign-in sheet, so the house never has to be reachable from the browser.
+OAUTH_REDIRECT_URI = "robin://oauth/callback"
 _STDIO_LAUNCHERS = frozenset({"npx", "uvx", "docker"})
 _META_TOOLS = frozenset(
     {
@@ -177,7 +179,6 @@ class Mcp(Capability):
         open_session: Any = None,
         household: list[dict[str, Any]] | None = None,
         admins: set[str] | None = None,
-        public_base: str = "",
     ) -> None:
         self.broker = broker
         self.store = store
@@ -185,7 +186,6 @@ class Mcp(Capability):
         self.open_session = open_session or _open_sdk_session
         self.household = household or []
         self.admins = admins or set()
-        self.public_base = public_base.strip().rstrip("/")
         self._servers: dict[str, list[dict[str, Any]]] = {}
         self._drafts: dict[str, dict[str, dict[str, Any]]] = {}
         self._waits: dict[str, dict[str, Any]] = {}
@@ -289,39 +289,18 @@ class Mcp(Capability):
             return None
         kind = str(waiting.get("kind") or "bearer")
         if kind == "oauth":
-            auth_url = str(waiting.get("auth_url") or "")
             name = waiting.get("name")
             error = str(waiting.get("error") or "").strip()
-            if auth_url:
-                reason = (
-                    f"Sign in to connect MCP server {name}. "
-                    f"Open this authorization link:\n{auth_url}\n"
-                    "Approve access, then return here and submit. "
-                    "If the browser does not return to Robin automatically, paste the final redirect URL."
-                )
-            else:
-                reason = (
-                    f"Sign in to connect MCP server {name}. "
-                    "Open the authorization link, approve access, then return here and submit. "
-                    "If the browser does not return to Robin automatically, paste the final redirect URL."
-                )
+            reason = f"Sign in to connect {name}. Robin opens the sign-in page and finishes on its own."
             if error:
                 reason = f"{error}\n\n{reason}"
             return InputRequest(
                 request_id=str(waiting["request_id"]),
-                title=f"Authorize MCP {name}",
+                title=f"Sign in to {name}",
                 reason=reason,
-                fields=(
-                    InputField(
-                        id="redirect",
-                        label="Redirect URL (optional)",
-                        kind="url",
-                        required=False,
-                        placeholder="https://…?code=…",
-                    ),
-                ),
+                fields=(),
                 owner=self.id,
-                open_url=auth_url,
+                open_url=str(waiting.get("auth_url") or ""),
             )
         label = "Access token" if kind == "bearer" else str(waiting.get("key") or "Secret")
         return InputRequest(
@@ -430,7 +409,6 @@ class Mcp(Capability):
         payload = dict(config)
         payload["_account_id"] = account_id
         payload["_broker"] = self.broker
-        payload["_public_base"] = self.redirect_base()
         name = str(config.get("name") or "")
         if str(config.get("auth") or "") == "oauth" or self._has_oauth_tokens(account_id, name):
             payload["auth"] = "oauth"
@@ -573,7 +551,6 @@ class Mcp(Capability):
                 payload = dict(draft)
                 payload["_account_id"] = account_id
                 payload["_broker"] = self.broker
-                payload["_public_base"] = self.redirect_base()
                 payload["_oauth_flow"] = flow
                 payload["auth"] = "oauth"
                 payload["_oauth_register"] = lambda f: self._register_oauth_state(f)
@@ -649,10 +626,7 @@ class Mcp(Capability):
         elif flow is not None and flow.code is None and not flow.finished.is_set():
             flow.finished.wait(timeout=2.0)
             if flow.code is None and not flow.finished.is_set():
-                message = (
-                    "Still waiting for authorization. Open the link, approve access, "
-                    "then submit again (paste the redirect URL if needed)."
-                )
+                message = "Still waiting for sign-in. Finish signing in, then try again."
                 waiting["error"] = message
                 return SecretAccepted(reply=message, input_again=True)
         if flow is not None and not flow.finished.wait(timeout=60.0):
@@ -742,14 +716,6 @@ class Mcp(Capability):
             b"<p>Robin is connected. You can close this window and return to the app, then submit.</p>"
         )
         return 200, body, "text/html; charset=utf-8"
-
-    def redirect_base(self) -> str:
-        import os
-
-        base = self.public_base or os.environ.get("ROBIN_PUBLIC_URL", "").strip().rstrip("/")
-        if not base:
-            base = "http://127.0.0.1:8787"
-        return base
 
     def _has_oauth_tokens(self, account_id: str, name: str) -> bool:
         if self.broker is None:
@@ -1177,10 +1143,11 @@ class _OAuthFlow:
 class _BrokerTokenStorage:
     """Persist MCP OAuth tokens and dynamic client registration in the broker."""
 
-    def __init__(self, broker: SecretStore, account_id: str, name: str) -> None:
+    def __init__(self, broker: SecretStore, account_id: str, name: str, redirect_uri: str = "") -> None:
         self.broker = broker
         self.account_id = account_id
         self.name = name
+        self.redirect_uri = redirect_uri
 
     async def get_tokens(self) -> Any:
         from mcp.shared.auth import OAuthToken
@@ -1199,7 +1166,12 @@ class _BrokerTokenStorage:
         raw = self._reveal(f"mcp:{self.name}:oauth_client")
         if not raw:
             return None
-        return OAuthClientInformationFull.model_validate_json(raw)
+        info = OAuthClientInformationFull.model_validate_json(raw)
+        registered = {str(uri) for uri in (info.redirect_uris or [])}
+        if self.redirect_uri and self.redirect_uri not in registered:
+            # Registered with an older redirect; register again so the IdP accepts the current one.
+            return None
+        return info
 
     async def set_client_info(self, client_info: Any) -> None:
         self.broker.put(self.account_id, f"mcp:{self.name}:oauth_client", client_info.model_dump_json())
@@ -1223,9 +1195,8 @@ def _build_oauth_auth(config: dict[str, Any]) -> Any:
     if broker is None or not account_id or not name:
         raise RuntimeError("OAuth MCP requires a broker-backed account")
     flow: _OAuthFlow | None = config.get("_oauth_flow")
-    base = str(config.get("_public_base") or "http://127.0.0.1:8787").rstrip("/")
-    redirect = f"{base}/v1/mcp/oauth/callback"
-    storage = _BrokerTokenStorage(broker, account_id, name)
+    redirect = OAUTH_REDIRECT_URI
+    storage = _BrokerTokenStorage(broker, account_id, name, redirect)
 
     async def redirect_handler(authorization_url: str) -> None:
         if flow is None:

@@ -1,3 +1,4 @@
+import AuthenticationServices
 import RobinKit
 import SwiftUI
 import UserNotifications
@@ -103,6 +104,19 @@ final class ShellModel: ObservableObject {
                 requestID: request.requestID,
                 values: values
             )
+        }
+    }
+
+    func signIn(at url: URL, using session: WebAuthenticationSession) async {
+        failure = nil
+        do {
+            let callback = try await session.authenticate(using: url, callbackURLScheme: robinOAuthScheme)
+            inputValues["redirect"] = callback.absoluteString
+            await submitInput()
+        } catch let error as ASWebAuthenticationSessionError where error.code == .canceledLogin {
+            return
+        } catch {
+            failure = error.localizedDescription
         }
     }
 
@@ -550,8 +564,12 @@ private struct ConversationForm: View {
     }
 }
 
+/// Matches OAUTH_REDIRECT_URI on the Robin server.
+private let robinOAuthScheme = "robin"
+
 private struct InputFormView: View {
     @ObservedObject var model: ShellModel
+    @Environment(\.webAuthenticationSession) private var webAuthenticationSession
     let prompt: String
     let request: InputRequest
 
@@ -565,15 +583,6 @@ private struct InputFormView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(request.title).font(.headline)
             Text(prompt.isEmpty ? request.reason : prompt)
-            if let raw = request.openURL, !raw.isEmpty {
-                if let url = URL(string: raw) {
-                    Link("Open authorization page", destination: url)
-                }
-                Text(raw)
-                    .font(.caption)
-                    .textSelection(.enabled)
-                    .foregroundStyle(.secondary)
-            }
             ForEach(request.fields) { field in
                 inputField(field)
             }
@@ -581,11 +590,19 @@ private struct InputFormView: View {
                 Button("Cancel") {
                     Task { await model.cancelInput() }
                 }
-                Button("Submit") {
-                    Task { await model.submitInput() }
+                if let raw = request.openURL, let url = URL(string: raw), !raw.isEmpty {
+                    Button("Sign in") {
+                        Task { await model.signIn(at: url, using: webAuthenticationSession) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.waiting)
+                } else {
+                    Button("Submit") {
+                        Task { await model.submitInput() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canSubmit || model.waiting)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(!canSubmit || model.waiting)
             }
             if let failure = model.failure {
                 Text(failure)

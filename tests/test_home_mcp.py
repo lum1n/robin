@@ -289,7 +289,6 @@ def test_mcp_oauth_setup_input_and_callback() -> None:
         broker=assistant.broker,
         registry=assistant.registry,
         open_session=open_session,
-        public_base="http://127.0.0.1:8787",
     )
     assistant.add(mcp)
     started = mcp.invoke(
@@ -303,9 +302,8 @@ def test_mcp_oauth_setup_input_and_callback() -> None:
     pending = mcp.pending_input("ada", "t")
     assert pending is not None
     assert pending.open_url.startswith("https://auth.example/authorize")
-    assert pending.open_url in pending.reason
-    assert pending.fields[0].id == "redirect"
-    assert pending.fields[0].required is False
+    assert pending.open_url not in pending.reason
+    assert pending.fields == ()
     status, body, content_type = mcp.complete_oauth_callback({"code": "authcode", "state": "st123"})
     assert status == 200
     assert "text/html" in content_type
@@ -330,7 +328,7 @@ def test_mcp_oauth_bad_redirect_keeps_input() -> None:
             fake.flow.state = "bad1"
         return fake
 
-    mcp = Mcp(broker=assistant.broker, open_session=open_session, public_base="http://house.local")
+    mcp = Mcp(broker=assistant.broker, open_session=open_session)
     assistant.add(mcp)
     mcp.invoke(
         "ada",
@@ -340,7 +338,6 @@ def test_mcp_oauth_bad_redirect_keeps_input() -> None:
     mcp.invoke("ada", "mcp_setup_oauth", {"name": "notes"})
     pending = mcp.pending_input("ada", "t")
     assert pending is not None
-    assert pending.open_url in pending.reason
     accepted = mcp.accept_input(
         "ada",
         "t",
@@ -353,7 +350,6 @@ def test_mcp_oauth_bad_redirect_keeps_input() -> None:
     again = mcp.pending_input("ada", "t")
     assert again is not None
     assert again.open_url == pending.open_url
-    assert again.open_url in again.reason
     assert "code and state" in again.reason.casefold()
 
     from robin.http import Service, dispatch
@@ -383,11 +379,10 @@ def test_mcp_oauth_bad_redirect_keeps_input() -> None:
     assert status == 200
     assert body["status"] == "input"
     assert body["input"]["open_url"] == pending.open_url
-    assert pending.open_url in body["text"]
     assert "code and state" in body["text"].casefold()
 
 
-def test_mcp_oauth_paste_redirect() -> None:
+def test_mcp_oauth_app_callback_redirect() -> None:
     assistant = Assistant()
     fake = _OAuthFakeSession(assistant.broker)
 
@@ -398,7 +393,7 @@ def test_mcp_oauth_paste_redirect() -> None:
             fake.flow.state = "paste1"
         return fake
 
-    mcp = Mcp(broker=assistant.broker, open_session=open_session, public_base="http://house.local")
+    mcp = Mcp(broker=assistant.broker, open_session=open_session)
     mcp.invoke(
         "ada",
         "mcp_setup_start",
@@ -411,10 +406,42 @@ def test_mcp_oauth_paste_redirect() -> None:
         "ada",
         "t",
         pending.request_id,
-        {"redirect": "http://house.local/v1/mcp/oauth/callback?code=c1&state=paste1"},
+        {"redirect": "robin://oauth/callback?code=c1&state=paste1"},
     )
     assert accepted is not None
     assert accepted.resume
+
+
+def test_mcp_oauth_redirect_is_app_scheme() -> None:
+    from robin.capabilities.mcp import OAUTH_REDIRECT_URI, _build_oauth_auth
+
+    assistant = Assistant()
+    provider = _build_oauth_auth(
+        {"name": "sentry", "url": "https://mcp.sentry.dev/mcp", "_broker": assistant.broker, "_account_id": "ada"}
+    )
+    assert [str(uri) for uri in provider.context.client_metadata.redirect_uris] == [OAUTH_REDIRECT_URI]
+
+
+def test_mcp_oauth_stale_client_registration_is_dropped() -> None:
+    import asyncio
+
+    from robin.capabilities.mcp import OAUTH_REDIRECT_URI, _BrokerTokenStorage
+
+    assistant = Assistant()
+    storage = _BrokerTokenStorage(assistant.broker, "ada", "sentry", OAUTH_REDIRECT_URI)
+    assistant.broker.put(
+        "ada",
+        "mcp:sentry:oauth_client",
+        '{"client_id":"old","redirect_uris":["http://127.0.0.1:8787/v1/mcp/oauth/callback"]}',
+    )
+    assert asyncio.run(storage.get_client_info()) is None
+    assistant.broker.put(
+        "ada",
+        "mcp:sentry:oauth_client",
+        '{"client_id":"new","redirect_uris":["robin://oauth/callback"]}',
+    )
+    info = asyncio.run(storage.get_client_info())
+    assert info is not None and info.client_id == "new"
 
 
 def test_mcp_oauth_callback_http_dispatch() -> None:
