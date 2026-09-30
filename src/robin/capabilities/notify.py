@@ -15,7 +15,10 @@ class Notify(Capability):
     tools = [
         Tool(
             name="notify_person",
-            description="Send a short push notification to this person through the Robin app.",
+            description=(
+                "Send a short push notification to this person through the Robin app right now. "
+                "Not for later: to remind them at a future time, use jobs_add."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"text": {"type": "string"}},

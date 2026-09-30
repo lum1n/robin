@@ -287,3 +287,31 @@ def test_message_heartbeat_keeps_leading_whitespace_json_decodable(monkeypatch) 
         offset += size + 2
     assert body.lstrip().startswith(b"{")
     assert json.loads(body)["text"] == "hi"
+
+
+def test_server_routes_delete_to_dispatch(tmp_path) -> None:
+    import http.client
+    import socket
+    import threading
+    import time
+
+    from robin.http import serve
+
+    service, _screen, ada, _bea = _service(tmp_path, Scripted([]))
+    service.assistant.remember("ada", "kitchen", "user", "hi")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    threading.Thread(target=serve, args=(service, "127.0.0.1", port), daemon=True).start()
+
+    for _ in range(50):
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("DELETE", "/v1/threads/kitchen?account_id=ada", headers=ada)
+            break
+        except ConnectionRefusedError:
+            time.sleep(0.05)
+    response = conn.getresponse()
+    assert response.status == 200
+    assert json.loads(response.read()) == {"ok": True}
+    conn.close()

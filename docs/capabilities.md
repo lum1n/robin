@@ -4,7 +4,7 @@ The core is the airlock, accounts, the model route, and a registry. A new way fo
 
 The mail account secret is stored with `broker.put(account_id, "mailbox", mailbox_secret(...))`. The JSON holds `imap_host`, `smtp_host`, `user`, and `password`. The model calls mail_list or mail_search when it needs the inbox. An iCloud, Gmail, or Outlook address supplies its mail servers when the host was left blank. The model does not receive the message text. A mailbox that is not connected, or that refuses the sign-in, is said in the conversation. `list_messages` returns those messages. `send_message` is external, so it waits for a confirm. Tests pass `open_imap` and `open_smtp`.
 
-The calendar secret is `broker.put(account_id, "calendar", calendar_secret(...))` with an `https` URL, user, and password. The model calls calendar_list when it needs this account's CalDAV calendar. Website bookings use the browser tools. A calendar that is not connected is said in the conversation. `list_events` returns those events. `add_event` waits for a confirm. Tests pass `fetch` and `put`.
+The calendar secret is `broker.put(account_id, "calendar", calendar_secret(...))` with an `https` URL, user, and password. The model calls calendar_list when it needs this account's CalDAV calendar. Website bookings use the browser tools. Until a calendar is connected its tools are hidden from the model, and the status line says it is not connected. `list_events` returns those events. `add_event` waits for a confirm. Tests pass `fetch` and `put`.
 
 The grocery list lives on this server. `add_private` changes only that account's list. `add_shared` and `add_member` wait for a confirm, because another account will see the result. A private item is not in another account's records. Pass a `HouseholdStore` and the list is encrypted across a restart.
 
@@ -45,7 +45,7 @@ When a snapshot is a captcha or WAF wall, the turn returns status `handoff` with
 
 Measure with `robin browser-probe` (add `--headless` to compare modes).
 
-An automation is a sentence such as “create a summary of my day and deliver it to me every day at 08:00”, “check the news every hour”, or “remind me in 15 minutes”. Robin saves it for that account and runs it on this instance when the time arrives. A daily time that has already passed starts the next matching day. “Every hour” and “every 15 minutes” repeat. “In 15 minutes” runs once. “List my jobs”, “cancel the summary”, and “change the summary to 07:30” do those things. Another account does not see the list. Sending, paying, or deleting during a run still waits for a confirm.
+An automation is a sentence such as “create a summary of my day and deliver it to me every day at 08:00”, “check the news every hour”, or “remind me in 15 minutes”. Robin saves it for that account and runs it on this instance when the time arrives. A daily time that has already passed starts the next matching day. “Every hour” and “every 15 minutes” repeat. “In 15 minutes” and “tomorrow at 19:45” run once; a time that has passed or is more than a year away is refused. Reminders always go through automations; `notify_person` only sends now. “List my jobs”, “cancel the summary”, and “change the summary to 07:30” do those things. Another account does not see the list. Sending, paying, or deleting during a run still waits for a confirm.
 
 ## Declare one
 

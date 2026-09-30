@@ -146,17 +146,18 @@ def test_hello_does_not_fetch_the_calendar() -> None:
     assert fetches == []
 
 
-def test_calendar_tools_stay_available_alongside_the_browser() -> None:
+def test_calendar_tools_hidden_until_connected() -> None:
     assistant = Assistant()
     calendar = Calendar(CalDAV(assistant.broker))
     assistant.add(calendar)
     names = {tool["name"] for tool in assistant.tools("ada")}
-    assert "calendar_list" in names
+    assert not {name for name in names if name.startswith("calendar_")}
     assert calendar.status("ada") == "calendar: not connected, connect it in the app"
 
 
 def test_calendar_tools_do_not_depend_on_request_text() -> None:
     calendar = Calendar(CalDAV(Assistant().broker))
+    calendar.calendar.connected = lambda account_id: True
     names = {tool.name for tool in calendar.available_tools("ada")}
     assert names == {tool.name for tool in calendar.tools}
 

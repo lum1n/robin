@@ -51,6 +51,8 @@ SYSTEM = (
     "When the person names a website or URL (vg.no, finn.no, https://…), browser_open that host "
     "and finish the task on the page — do not use web_search as a substitute for opening the site. "
     "calendar_* tools are only this account's own calendar, not a third-party booking site. "
+    "For reminders ('remind me …', 'an hour before …'), use jobs_add with at or in_minutes; "
+    "notify_person only sends now. Never say a reminder is set unless jobs_add saved it. "
     "mail_* tools are only this account's mailbox. "
     "Do not say you lack access to a website or the web when browser tools are available — use browser_open. "
     "If web_search fails, browser_open the named site instead of giving up. "

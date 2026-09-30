@@ -471,8 +471,9 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     assert "disabled" in tools["browser_click"].lower()
     assert "interactive" in tools["browser_click"].lower()
     assert "browser_click" in tools["browser_submit"].lower()
-    assert "calendar_add" in tools
-    assert "website" in tools["calendar_add"].lower()
+    assert "calendar_add" not in tools
+    assert "calendar_* tools are only" in prompt
+    assert "jobs_add" in prompt
 
     from robin.ner import UnavailableNer
 
@@ -761,3 +762,20 @@ def test_model_http_errors_are_named() -> None:
         return {"choices": [{"message": {"content": "hi"}}]}
 
     assert ChatModel(transport=flaky).complete(messages=[], tools=[]).message == "hi"
+
+
+def test_calendar_tools_hidden_until_connected() -> None:
+    from robin.capabilities.calendar import Calendar
+
+    class _Cal(_NoCal):
+        linked = False
+
+        def connected(self, account_id: str) -> bool:
+            return self.linked
+
+    cal = _Cal()
+    assistant = Assistant(ner=StubNer())
+    assistant.add(Calendar(cal))
+    assert not [tool for tool in assistant.tools("ada") if tool["name"].startswith("calendar_")]
+    cal.linked = True
+    assert "calendar_add" in {tool["name"] for tool in assistant.tools("ada")}

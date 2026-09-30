@@ -48,13 +48,18 @@ class Jobs(Capability):
         Tool(
             name="jobs_add",
             description=(
-                "Save an automation for this account. "
-                "Provide instruction plus one of: hour/minute (daily), every_minutes, or in_minutes (once)."
+                "Set a reminder or scheduled task for this account; at the chosen time Robin runs the instruction "
+                "and pushes the answer to the person. Use this for any 'remind me …'. "
+                "Provide instruction plus one of: at (one time, local date and time such as 2026-10-01T19:45), "
+                "in_minutes (one time), hour/minute (daily), or every_minutes. "
+                "For a reminder, phrase instruction as the message to deliver, e.g. "
+                "'Remind the person: the match starts at 20:45.'"
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "instruction": {"type": "string"},
+                    "at": {"type": "string", "description": "One-time local date and time, YYYY-MM-DDTHH:MM."},
                     "hour": {"type": "integer"},
                     "minute": {"type": "integer"},
                     "days": {"type": "string"},
@@ -73,6 +78,7 @@ class Jobs(Capability):
                 "properties": {
                     "id": {"type": "string"},
                     "instruction": {"type": "string"},
+                    "at": {"type": "string", "description": "One-time local date and time, YYYY-MM-DDTHH:MM."},
                     "hour": {"type": "integer"},
                     "minute": {"type": "integer"},
                     "days": {"type": "string"},
@@ -171,12 +177,16 @@ class Jobs(Capability):
         if tool_name == "jobs_add":
             instruction = str(arguments.get("instruction", "")).strip()
             schedule = _schedule_from_arguments(arguments, self.clock())
+            if isinstance(schedule, str):
+                return schedule
             if schedule is None or not instruction:
-                return "Say what to do, and a time such as 08:00, every hour, or in 15 minutes."
+                return "Say what to do, and a time such as 08:00, every hour, in 15 minutes, or at 2026-10-01T19:45."
             return self._add(account_id, instruction, schedule)
         if tool_name == "jobs_update":
             instruction = str(arguments.get("instruction", "")).strip()
             schedule = _schedule_from_arguments(arguments, self.clock(), partial=True)
+            if isinstance(schedule, str):
+                return schedule
             return self._update(
                 account_id,
                 str(arguments.get("id", "")),
@@ -528,7 +538,18 @@ def _clock_schedule(hour: int, minute: int, days: str, now: datetime, *, already
     }
 
 
-def _schedule_from_arguments(arguments: dict, now: datetime, *, partial: bool = False) -> dict | None:
+def _schedule_from_arguments(arguments: dict, now: datetime, *, partial: bool = False) -> dict | str | None:
+    """A schedule, None when no time was given, or a message saying why the time was rejected."""
+    at = str(arguments.get("at") or "").strip()
+    if at:
+        moment = _parse_at(at, now)
+        if moment is None:
+            return f"Could not read the time {at!r}. Use local YYYY-MM-DDTHH:MM."
+        if moment <= now:
+            return f"{_stamp(moment)} has already passed (it is now {_stamp(now)})."
+        if moment - now > timedelta(days=366):
+            return "That is more than a year away."
+        return _once_schedule(moment)
     every = _optional_number(arguments.get("every_minutes"), 7 * 24 * 60)
     delay = _optional_number(arguments.get("in_minutes"), 7 * 24 * 60)
     if every:
@@ -545,6 +566,21 @@ def _schedule_from_arguments(arguments: dict, now: datetime, *, partial: bool = 
     if days is None:
         return None
     return _clock_schedule(hour, minute, days, now, already_ran=False)
+
+
+def _parse_at(text: str, now: datetime) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(text.replace(" ", "T", 1) if "T" not in text else text)
+    except ValueError:
+        return None
+    if moment.tzinfo is not None:
+        local = now.tzinfo or datetime.now().astimezone().tzinfo
+        moment = moment.astimezone(local)
+        if now.tzinfo is None:
+            moment = moment.replace(tzinfo=None)
+    elif now.tzinfo is not None:
+        moment = moment.replace(tzinfo=now.tzinfo)
+    return moment.replace(second=0, microsecond=0)
 
 
 def _every_minutes(text: str) -> int | None:
@@ -603,6 +639,8 @@ def _stamp_label(stamp: str) -> str:
     parsed = _parse_stamp(stamp)
     if parsed is None:
         return stamp
+    if parsed.date() != datetime.now(parsed.tzinfo).date():
+        return parsed.strftime("%Y-%m-%d %H:%M")
     return parsed.strftime("%H:%M")
 
 

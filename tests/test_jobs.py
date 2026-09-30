@@ -236,3 +236,33 @@ def test_a_job_created_after_its_time_waits_until_the_next_day() -> None:
     )
     row = jobs.records("ada")[0]
     assert "08:00" in row["when"]
+
+
+def test_jobs_add_at_a_date_and_time_runs_once() -> None:
+    now = datetime(2026, 9, 30, 21, 30)
+    jobs = Jobs({}, clock=lambda: now)
+    saved = jobs.invoke("ada", "jobs_add", {"instruction": "Remind the person: match at 20:45", "at": "2026-10-01T19:45"})
+    assert "once at 2026-10-01 19:45" in saved
+    assert jobs.due(datetime(2026, 10, 1, 19, 44)) == []
+    work = jobs.due(datetime(2026, 10, 1, 19, 45))
+    assert len(work) == 1 and "match at 20:45" in work[0].text
+    work[0].finish("sent")
+    assert jobs.due(datetime(2026, 10, 1, 19, 50)) == []
+
+
+def test_jobs_add_at_rejects_past_and_garbage() -> None:
+    now = datetime(2026, 9, 30, 21, 30)
+    jobs = Jobs({}, clock=lambda: now)
+    assert "already passed" in jobs.invoke("ada", "jobs_add", {"instruction": "x", "at": "2026-09-30T20:00"})
+    assert "Could not read" in jobs.invoke("ada", "jobs_add", {"instruction": "x", "at": "tomorrow"})
+    assert jobs.invoke("ada", "jobs_list", {}) == "No automations."
+
+
+def test_reminder_tools_point_at_jobs_add() -> None:
+    from robin.capabilities.bills import Bills
+    from robin.capabilities.notify import Notify
+
+    described = {tool.name: tool.description for cap in (Jobs, Notify, Bills) for tool in cap.tools}
+    assert "remind" in described["jobs_add"].lower()
+    assert "jobs_add" in described["notify_person"]
+    assert "jobs_add" in described["bills_remind"]

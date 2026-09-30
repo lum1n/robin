@@ -49,7 +49,7 @@ class Bills(Capability):
         ),
         Tool(
             name="bills_remind",
-            description="Create a reminder job before a scanned bill's due date.",
+            description="Only for bills: schedule a reminder before the due date of a bill id from bills_scan. For any other reminder use jobs_add.",
             parameters={
                 "type": "object",
                 "properties": {"bill_id": {"type": "string"}},

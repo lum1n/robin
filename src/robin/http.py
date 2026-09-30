@@ -257,6 +257,9 @@ def serve(service: Service, host: str = "127.0.0.1", port: int = 8787) -> None:
         def do_POST(self) -> None:  # noqa: N802
             self._respond("POST")
 
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._respond("DELETE")
+
         def _respond(self, method: str) -> None:
             parsed = urlparse(self.path)
             query = {key: values[0] for key, values in parse_qs(parsed.query).items()}

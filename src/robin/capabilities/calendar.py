@@ -212,6 +212,10 @@ class Calendar(Capability):
     def __init__(self, calendar: CalDAV) -> None:
         self.calendar = calendar
 
+    def available_tools(self, account_id: str) -> list[Tool]:
+        """No calendar tools until one is connected, so the model does not reach for them."""
+        return list(self.tools) if self.calendar.connected(account_id) else []
+
     def status(self, account_id: str) -> str:
         if self.calendar.connected(account_id):
             return "calendar: connected"
