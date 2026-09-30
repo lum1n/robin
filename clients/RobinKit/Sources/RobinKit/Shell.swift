@@ -78,13 +78,28 @@ public actor Shell {
         try await signedIn().saveProfile(fields)
     }
 
+    /// Thread ids for the signed-in account (empty when signed out throws via signedIn()).
+    public func listThreads() async throws -> [String] {
+        try await signedIn().threads()
+    }
+
+    /// Full turn history for one conversation id.
+    public func loadTurns(conversationID: String) async throws -> [Turn] {
+        try await signedIn().turns(conversationID: conversationID)
+    }
+
+    /// Delete a conversation on the house (turns, vault, pending, thread row).
+    public func deleteThread(conversationID: String) async throws {
+        try await signedIn().deleteThread(conversationID: conversationID)
+    }
+
     public func send(conversationID: String, text: String) async throws {
         let current = try signedIn()
         do {
             let reply = try await current.send(conversationID: conversationID, text: text)
             try await show(reply, on: current)
         } catch {
-            guard isTimeout(error) else { throw error }
+            guard isDroppedWhileWaiting(error) else { throw error }
             // Long browser turns often finish on the server after the phone drops the socket.
             if let recovered = try await current.awaitStoredReply(
                 conversationID: conversationID,
@@ -103,7 +118,7 @@ public actor Shell {
             let reply = try await current.confirm(conversationID: conversationID)
             try await show(reply, on: current)
         } catch {
-            guard isTimeout(error) else { throw error }
+            guard isDroppedWhileWaiting(error) else { throw error }
             let turns = try await current.turns(conversationID: conversationID)
             if let robin = turns.last(where: { $0.role == "reply" && !$0.text.isEmpty }) {
                 try await show(
@@ -163,12 +178,23 @@ public actor Shell {
         }
     }
 
-    private func isTimeout(_ error: Error) -> Bool {
-        if let urlError = error as? URLError, urlError.code == .timedOut {
-            return true
+    /// Phone/NAT paths often sever a long /v1/messages wait as timedOut (-1001) or
+    /// networkConnectionLost (-1005) while the house server keeps working.
+    private func isDroppedWhileWaiting(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut, .networkConnectionLost:
+                return true
+            default:
+                break
+            }
         }
         let text = String(describing: error).lowercased()
-        return text.contains("timed out") || text.contains("timeout") || text.contains("-1001")
+        return text.contains("timed out")
+            || text.contains("timeout")
+            || text.contains("network connection was lost")
+            || text.contains("-1001")
+            || text.contains("-1005")
     }
 
     private func signedIn() throws -> RobinClient {

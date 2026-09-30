@@ -111,6 +111,11 @@ class Assistant:
             return []
         return self.store.threads(account_id)
 
+    def delete_thread(self, account_id: str, conversation_id: str) -> bool:
+        if self.store is None:
+            return False
+        return self.store.delete_thread(account_id, conversation_id)
+
     def turns(self, account_id: str, conversation_id: str) -> list[dict[str, str]]:
         if self.store is None:
             return []

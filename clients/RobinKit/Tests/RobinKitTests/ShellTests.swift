@@ -4,32 +4,90 @@ import Testing
 @testable import RobinKit
 
 struct ShellTests {
-    @Test func sendRecoversStoredReplyAfterTimeout() async throws {
+    @Test func listThreadsAndLoadTurnsRequireSignIn() async throws {
+        let transport = ScriptedTransport(responses: [])
+        let shell = Shell(transport: transport)
+        await #expect(throws: RobinFailure(status: 401, message: "login required")) {
+            try await shell.listThreads()
+        }
+        await #expect(throws: RobinFailure(status: 401, message: "login required")) {
+            try await shell.loadTurns(conversationID: "home")
+        }
+        #expect(await transport.calls.isEmpty)
+    }
+
+    @Test func listThreadsReturnsIdsWithoutMutatingPhase() async throws {
+        let transport = ScriptedTransport(responses: [
+            raw(200, #"{"token":"sess-1"}"#),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, #"{"enabled":false}"#),
+            raw(200, #"{"threads":["home","desk"]}"#),
+        ])
+        let shell = Shell(transport: transport)
+        try await shell.signIn(instance: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", password: "pw")
+        #expect(await shell.phase == .ready(threads: ["home"], reply: nil))
+        let threads = try await shell.listThreads()
+        #expect(threads == ["home", "desk"])
+        #expect(await shell.phase == .ready(threads: ["home"], reply: nil))
+        let calls = await transport.calls
+        #expect(calls[3].url.absoluteString == "http://127.0.0.1:8787/v1/threads?account_id=ada")
+        #expect(calls[3].method == "GET")
+        #expect(calls[3].token == "sess-1")
+    }
+
+    @Test func loadTurnsReturnsDecodedHistory() async throws {
+        let transport = ScriptedTransport(responses: [
+            raw(200, #"{"token":"sess-1"}"#),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, #"{"enabled":false}"#),
+            raw(200, #"{"turns":[{"role":"user","text":"hi"},{"role":"reply","text":"hello"}]}"#),
+        ])
+        let shell = Shell(transport: transport)
+        try await shell.signIn(instance: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", password: "pw")
+        let turns = try await shell.loadTurns(conversationID: "home")
+        #expect(turns == [
+            Turn(role: "user", text: "hi"),
+            Turn(role: "reply", text: "hello"),
+        ])
+        #expect(await shell.phase == .ready(threads: ["home"], reply: nil))
+        let calls = await transport.calls
+        #expect(calls[3].url.absoluteString == "http://127.0.0.1:8787/v1/threads/home?account_id=ada")
+        #expect(calls[3].method == "GET")
+        #expect(calls[3].token == "sess-1")
+    }
+
+    @Test(arguments: [URLError.Code.timedOut, .networkConnectionLost])
+    func sendRecoversStoredReplyAfterDrop(_ drop: URLError.Code) async throws {
         actor RecoverTransport: RobinTransport {
             var messageAttempts = 0
             var calls = 0
             var responses: [RobinRaw]
-            init(responses: [RobinRaw]) {
+            let drop: URLError.Code
+            init(responses: [RobinRaw], drop: URLError.Code) {
                 self.responses = responses
+                self.drop = drop
             }
             func call(url: URL, method: String, body: Data?, token: String?) async throws -> RobinRaw {
                 calls += 1
                 if url.path.hasSuffix("/v1/messages") {
                     messageAttempts += 1
                     if messageAttempts == 1 {
-                        throw URLError(.timedOut)
+                        throw URLError(drop)
                     }
                 }
                 return responses.removeFirst()
             }
         }
-        let transport = RecoverTransport(responses: [
-            raw(200, #"{"token":"sess-1"}"#),
-            raw(200, #"{"threads":["home"]}"#),
-            raw(200, #"{"enabled":false}"#),
-            raw(200, #"{"turns":[{"role":"user","text":"find cars"},{"role":"reply","text":"Found GLC listings."}]}"#),
-            raw(200, #"{"threads":["home"]}"#),
-        ])
+        let transport = RecoverTransport(
+            responses: [
+                raw(200, #"{"token":"sess-1"}"#),
+                raw(200, #"{"threads":["home"]}"#),
+                raw(200, #"{"enabled":false}"#),
+                raw(200, #"{"turns":[{"role":"user","text":"find cars"},{"role":"reply","text":"Found GLC listings."}]}"#),
+                raw(200, #"{"threads":["home"]}"#),
+            ],
+            drop: drop
+        )
         let shell = Shell(transport: transport)
         try await shell.signIn(instance: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", password: "pw")
         try await shell.send(conversationID: "home", text: "find cars")

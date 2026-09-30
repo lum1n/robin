@@ -191,6 +191,16 @@ public actor RobinClient {
         return try JSONDecoder().decode(ThreadTurns.self, from: accepted(raw, status: 200)).turns
     }
 
+    public func deleteThread(conversationID: String) async throws {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/threads/\(conversationID)", query: ["account_id": accountID]),
+            method: "DELETE",
+            body: nil,
+            token: try sessionToken()
+        )
+        _ = try accepted(raw, status: 200)
+    }
+
     /// After a send times out, poll the stored thread for Robin's reply (the server often finished anyway).
     public func awaitStoredReply(
         conversationID: String,

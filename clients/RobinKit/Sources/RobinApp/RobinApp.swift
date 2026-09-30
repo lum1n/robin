@@ -348,11 +348,21 @@ private enum AttentionAlerts {
 }
 
 private func _reach(_ error: Error) -> String {
-    if let urlError = error as? URLError, urlError.code == .timedOut {
-        return "Robin took too long to answer."
+    if let urlError = error as? URLError {
+        switch urlError.code {
+        case .timedOut, .networkConnectionLost:
+            return "Robin took too long to answer."
+        default:
+            break
+        }
     }
     let text = String(describing: error).lowercased()
-    if text.contains("timed out") || text.contains("timeout") || text.contains("-1001") {
+    if text.contains("timed out")
+        || text.contains("timeout")
+        || text.contains("network connection was lost")
+        || text.contains("-1001")
+        || text.contains("-1005")
+    {
         return "Robin took too long to answer."
     }
     return "Could not reach Robin."

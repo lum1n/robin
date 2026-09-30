@@ -148,6 +148,30 @@ class HouseholdStore:
         ).fetchall()
         return [row[0] for row in rows]
 
+    def delete_thread(self, account_id: str, conversation_id: str) -> bool:
+        """Remove a conversation and its turns/vault/pending state. Returns True if it existed."""
+        row = self._db.execute(
+            "SELECT 1 FROM threads WHERE account_id = ? AND conversation_id = ?",
+            (account_id, conversation_id),
+        ).fetchone()
+        if row is None:
+            return False
+        self._db.execute(
+            "DELETE FROM turns WHERE account_id = ? AND conversation_id = ?",
+            (account_id, conversation_id),
+        )
+        self._db.execute(
+            "DELETE FROM vaults WHERE account_id = ? AND conversation_id = ?",
+            (account_id, conversation_id),
+        )
+        self.clear_pending(account_id, conversation_id)
+        self._db.execute(
+            "DELETE FROM threads WHERE account_id = ? AND conversation_id = ?",
+            (account_id, conversation_id),
+        )
+        self._db.commit()
+        return True
+
     def append_turn(self, account_id: str, conversation_id: str, role: str, text: str) -> None:
         self.ensure_thread(account_id, conversation_id)
         position = self._db.execute(

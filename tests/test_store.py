@@ -63,6 +63,17 @@ def test_a_restart_keeps_one_accounts_thread_and_hides_it_from_the_other(tmp_pat
     assert revived.vocabulary["ada"][0].text == "Jane Doe"
 
 
+def test_delete_thread_removes_turns_and_leaves_other_threads(tmp_path) -> None:
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    store.append_turn("ada", "kitchen", "user", "hello")
+    store.append_turn("ada", "garden", "user", "plants")
+    assert store.delete_thread("ada", "kitchen") is True
+    assert store.threads("ada") == ["garden"]
+    assert store.turns("ada", "kitchen") == []
+    assert store.turns("ada", "garden")[0]["text"] == "plants"
+    assert store.delete_thread("ada", "kitchen") is False
+
+
 def test_the_wrong_key_cannot_open_the_store(tmp_path) -> None:
     path = tmp_path / "house.sqlite"
     store = HouseholdStore(path, new_key())

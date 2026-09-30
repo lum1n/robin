@@ -100,6 +100,17 @@ def dispatch(
         if denied is not None:
             return denied
         return 200, {"turns": service.assistant.turns(query["account_id"], conversation_id)}
+    if method == "DELETE" and path.startswith("/v1/threads/"):
+        conversation_id = path.removeprefix("/v1/threads/")
+        if not conversation_id or "/" in conversation_id:
+            return 404, {"error": "not found"}
+        denied = _require(service, headers, query.get("account_id"))
+        if denied is not None:
+            return denied
+        deleted = service.assistant.delete_thread(query["account_id"], conversation_id)
+        if not deleted:
+            return 404, {"error": "not found"}
+        return 200, {"ok": True}
     if method == "GET" and path == "/v1/activity":
         denied = _require(service, headers, query.get("account_id"))
         if denied is not None:
