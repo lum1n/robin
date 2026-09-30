@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import threading
+import time
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
 
@@ -27,6 +28,8 @@ from robin.store import HouseholdStore
 
 _SAFE_NAME = re.compile(r"[^a-z0-9_]+")
 _MAX_MCP_TOOLS = 40
+_VERIFY_SECONDS = 300.0
+_REFRESH_MARGIN = 60
 # Robin apps catch this in the system sign-in sheet, so the house never has to be reachable from the browser.
 OAUTH_REDIRECT_URI = "robin://oauth/callback"
 _STDIO_LAUNCHERS = frozenset({"npx", "uvx", "docker"})
@@ -192,6 +195,7 @@ class Mcp(Capability):
         self._tool_index: dict[str, dict[str, tuple[str, str]]] = {}
         self._oauth_flows: dict[str, _OAuthFlow] = {}
         self._oauth_by_state: dict[str, _OAuthFlow] = {}
+        self._verified: dict[tuple[str, str], float] = {}
         if store is not None:
             self._servers = store.load_mcp()
 
@@ -395,14 +399,24 @@ class Mcp(Capability):
         if row.get("status") == "tools_changed":
             return f"MCP {server_name} tools changed — re-approve with mcp_setup_test then mcp_setup_finish"
         session = self._session_for(account_id, row)
-        try:
-            live = session.list_tools()
-        except Exception:
-            live = None
-        if live is not None and _tool_hash(live) != str(row.get("tool_hash") or ""):
-            row["status"] = "tools_changed"
-            self._save(account_id)
-            return f"MCP {server_name} tools changed — re-approve with mcp_setup_test then mcp_setup_finish"
+        key = (account_id, server_name)
+        if time.monotonic() - self._verified.get(key, float("-inf")) > _VERIFY_SECONDS:
+            try:
+                live = session.list_tools()
+            except Exception:
+                live = None
+            if live is not None:
+                stored = str(row.get("tool_hash") or "")
+                fresh = _tool_hash(live)
+                if fresh != stored and _legacy_tool_hash(live) == stored:
+                    row["tool_hash"] = fresh
+                    self._save(account_id)
+                elif fresh != stored:
+                    row["status"] = "tools_changed"
+                    self._verified.pop(key, None)
+                    self._save(account_id)
+                    return f"MCP {server_name} tools changed — re-approve with mcp_setup_test then mcp_setup_finish"
+                self._verified[key] = time.monotonic()
         return session.call_tool(remote_name, arguments)
 
     def _session_for(self, account_id: str, config: dict[str, Any]) -> McpSession:
@@ -870,7 +884,12 @@ class Mcp(Capability):
                 self.broker.delete(account_id, f"mcp:{name}:token")
             except Exception:
                 pass
-            for key in (f"mcp:{name}:oauth_tokens", f"mcp:{name}:oauth_client"):
+            for key in (
+                f"mcp:{name}:oauth_tokens",
+                f"mcp:{name}:oauth_client",
+                f"mcp:{name}:oauth_expires_at",
+                f"mcp:{name}:oauth_metadata",
+            ):
                 try:
                     self.broker.delete(account_id, key)
                 except Exception:
@@ -900,6 +919,16 @@ def _tool_name(server: str, remote: str) -> str:
 
 
 def _tool_hash(tools: list[dict[str, Any]]) -> str:
+    """Fingerprint of approved tools. Servers may list tools in any order."""
+    rows = sorted(
+        ({"name": str(t.get("name") or ""), "description": str(t.get("description") or "")} for t in tools),
+        key=lambda row: row["name"],
+    )
+    return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+
+
+def _legacy_tool_hash(tools: list[dict[str, Any]]) -> str:
+    """Order-sensitive fingerprint stored before; matched once so existing servers upgrade quietly."""
     blob = json.dumps(
         [{"name": t.get("name"), "description": t.get("description")} for t in tools],
         sort_keys=True,
@@ -936,9 +965,13 @@ class _AsyncLoop:
         self.thread = threading.Thread(target=self.loop.run_forever, name="robin-mcp", daemon=True)
         self.thread.start()
 
-    def run(self, coro: Any, timeout: float = 60.0) -> Any:
+    def run(self, coro: Any, timeout: float = 120.0) -> Any:
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"MCP server did not answer within {int(timeout)} seconds") from None
 
 
 _LOOP: _AsyncLoop | None = None
@@ -1148,6 +1181,7 @@ class _BrokerTokenStorage:
         self.account_id = account_id
         self.name = name
         self.redirect_uri = redirect_uri
+        self.context: Any = None
 
     async def get_tokens(self) -> Any:
         from mcp.shared.auth import OAuthToken
@@ -1159,6 +1193,30 @@ class _BrokerTokenStorage:
 
     async def set_tokens(self, tokens: Any) -> None:
         self.broker.put(self.account_id, f"mcp:{self.name}:oauth_tokens", tokens.model_dump_json())
+        lifetime = getattr(tokens, "expires_in", None)
+        expires_at = str(time.time() + max(int(lifetime) - _REFRESH_MARGIN, 0)) if lifetime else ""
+        self.broker.put(self.account_id, f"mcp:{self.name}:oauth_expires_at", expires_at)
+        metadata = getattr(self.context, "oauth_metadata", None)
+        if metadata is not None:
+            self.broker.put(self.account_id, f"mcp:{self.name}:oauth_metadata", metadata.model_dump_json())
+
+    def metadata(self) -> Any:
+        from mcp.shared.auth import OAuthMetadata
+
+        raw = self._reveal(f"mcp:{self.name}:oauth_metadata")
+        if not raw:
+            return None
+        try:
+            return OAuthMetadata.model_validate_json(raw)
+        except ValueError:
+            return None
+
+    def expires_at(self) -> float | None:
+        raw = self._reveal(f"mcp:{self.name}:oauth_expires_at")
+        try:
+            return float(raw) if raw else None
+        except ValueError:
+            return None
 
     async def get_client_info(self) -> Any:
         from mcp.shared.auth import OAuthClientInformationFull
@@ -1200,7 +1258,7 @@ def _build_oauth_auth(config: dict[str, Any]) -> Any:
 
     async def redirect_handler(authorization_url: str) -> None:
         if flow is None:
-            raise RuntimeError("OAuth authorization required but no interactive flow is active")
+            raise RuntimeError(f"Sign-in to MCP {name} expired — reconnect it with mcp_setup_oauth")
         flow.auth_url = authorization_url
         params = parse_qs(urlparse(authorization_url).query)
         flow.state = (params.get("state") or [""])[0]
@@ -1229,13 +1287,29 @@ def _build_oauth_auth(config: dict[str, Any]) -> Any:
         response_types=["code"],
         token_endpoint_auth_method="none",
     )
-    return OAuthClientProvider(
+    class _Provider(OAuthClientProvider):
+        async def _initialize(self) -> None:
+            await super()._initialize()
+            tokens = self.context.current_tokens
+            metadata = storage.metadata()
+            if tokens is None or metadata is None:
+                return
+            # The SDK only knows expiry and the token endpoint for tokens it fetched in this
+            # provider; Robin opens a provider per call, so restore both to allow refresh.
+            self.context.oauth_metadata = metadata
+            expires_at = storage.expires_at()
+            if expires_at is not None:
+                self.context.token_expiry_time = expires_at
+
+    provider = _Provider(
         server_url=str(config.get("url") or ""),
         client_metadata=metadata,
         storage=storage,
         redirect_handler=redirect_handler,
         callback_handler=callback_handler,
     )
+    storage.context = provider.context
+    return provider
 
 
 def _parse_oauth_redirect(redirect: str) -> tuple[str, str, str | None]:

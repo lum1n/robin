@@ -634,3 +634,35 @@ def test_credential_prompt_to_the_person_is_restored(tmp_path) -> None:
     assert "accounts.store.example" in ask.text
     assert ask.text.startswith("Sign in to")
     assert "[ORG_" not in ask.text
+
+
+def test_tool_arguments_are_decoded_leniently() -> None:
+    from robin.model import decode_arguments
+
+    assert decode_arguments('{"query": "oslo"}') == ({"query": "oslo"}, "")
+    assert decode_arguments('"{\\"query\\": \\"oslo\\"}"') == ({"query": "oslo"}, "")
+    assert decode_arguments('```json\n{"query": "oslo"}\n```') == ({"query": "oslo"}, "")
+    assert decode_arguments({"query": "oslo"}) == ({"query": "oslo"}, "")
+    assert decode_arguments("") == ({}, "")
+    arguments, error = decode_arguments("query=oslo")
+    assert arguments == {} and "not a JSON object" in error
+
+
+def test_a_call_missing_required_arguments_is_sent_back_to_the_model() -> None:
+    lists = Lists(members={"ada"}, shared=[{"item": "milk", "list": "groceries", "loyalty": ""}], private={})
+    assistant = Assistant(ner=StubNer())
+    assistant.add(lists)
+    model = Scripted(
+        [
+            ModelTurn("", (ToolCall("lists_show", {}),)),
+            ModelTurn("", (ToolCall("lists_show", {}, error="arguments were not a JSON object: x"),)),
+            ModelTurn("", (ToolCall("lists_show", {"list": "groceries"}),)),
+            ModelTurn("done"),
+        ]
+    )
+    reply = converse(assistant, Task("ada", "t", "what should I buy"), model)
+    assert reply.text == "done"
+    tool_messages = [message for message in model.seen[3][0] if message.get("role") == "tool"]
+    assert "missing required argument(s) list" in tool_messages[0]["content"]
+    assert "not a JSON object" in tool_messages[1]["content"]
+    assert "Not run" not in tool_messages[2]["content"]

@@ -14,6 +14,7 @@ class ToolCall:
     name: str
     arguments: dict[str, Any]
     id: str = "call_0"
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -209,26 +210,48 @@ def _function(tool: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def decode_arguments(raw: Any) -> tuple[dict[str, Any], str]:
+    """Tool-call arguments as a dict, plus an error when the model sent something unusable."""
+    if raw is None or raw == "":
+        return {}, ""
+    value = raw
+    # Local models sometimes double-encode arguments or wrap them in prose or code fences.
+    for _ in range(3):
+        if not isinstance(value, str):
+            break
+        text = value.strip()
+        if not text:
+            return {}, ""
+        try:
+            value = json.loads(text)
+            continue
+        except json.JSONDecodeError:
+            pass
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            break
+        try:
+            value = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            break
+    if isinstance(value, dict):
+        return dict(value), ""
+    shown = raw if isinstance(raw, str) else json.dumps(raw, default=str)
+    return {}, f"arguments were not a JSON object: {shown[:200]}"
+
+
 def _parse_openai(payload: dict[str, Any]) -> ModelTurn:
     message = payload["choices"][0]["message"]
     calls: list[ToolCall] = []
     for index, call in enumerate(message.get("tool_calls") or []):
         function = call.get("function") or {}
-        raw = function.get("arguments") or "{}"
-        if isinstance(raw, str):
-            try:
-                arguments = json.loads(raw)
-            except json.JSONDecodeError:
-                arguments = {}
-        else:
-            arguments = dict(raw)
-        if not isinstance(arguments, dict):
-            arguments = {}
+        arguments, error = decode_arguments(function.get("arguments"))
         calls.append(
             ToolCall(
                 id=str(call.get("id") or f"call_{index}"),
                 name=str(function.get("name") or ""),
                 arguments=arguments,
+                error=error,
             )
         )
     text = message.get("content") or ""
@@ -245,14 +268,13 @@ def _parse_anthropic(payload: dict[str, Any]) -> ModelTurn:
         if block.get("type") == "text":
             texts.append(str(block.get("text") or ""))
         elif block.get("type") == "tool_use":
-            arguments = block.get("input") or {}
-            if not isinstance(arguments, dict):
-                arguments = {}
+            arguments, error = decode_arguments(block.get("input"))
             calls.append(
                 ToolCall(
                     id=str(block.get("id") or f"call_{len(calls)}"),
                     name=str(block.get("name") or ""),
                     arguments=arguments,
+                    error=error,
                 )
             )
     return ModelTurn(message="".join(texts), tool_calls=tuple(calls))

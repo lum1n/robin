@@ -248,6 +248,7 @@ def _converse(
             return Reply("reply", "That turn was replaced by a newer message.", decision.route)
         tools = assistant.tools(task.account_id)
         allowed = {tool["name"] for tool in tools}
+        schemas = {tool["name"]: tool.get("parameters") or {} for tool in tools}
         turn = _complete(model, messages=messages, tools=tools)
         if _superseded():
             return Reply("reply", "That turn was replaced by a newer message.", decision.route)
@@ -277,6 +278,10 @@ def _converse(
                 return Reply("reply", "That turn was replaced by a newer message.", decision.route)
             if call.name not in allowed:
                 return Reply("reply", "That action is not available.", decision.route)
+            problem = _argument_problem(call, schemas.get(call.name) or {})
+            if problem:
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": problem})
+                continue
             outcome = assistant.invoke(
                 task.account_id,
                 task.conversation_id,
@@ -623,6 +628,23 @@ def _system(assistant: Assistant, account_id: str, text: str = "") -> str:
         if released:
             lines.extend(released)
     return "\n".join(lines)
+
+
+def _argument_problem(call: ToolCall, schema: dict[str, Any]) -> str:
+    """Tell the model to call again instead of running a tool with unusable arguments."""
+    if call.error:
+        return f"Not run: {call.error}. Call {call.name} again with a JSON object matching its parameters."
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if not isinstance(required, list):
+        return ""
+    missing = [
+        str(key)
+        for key in required
+        if call.arguments.get(key) is None or (isinstance(call.arguments.get(key), str) and not call.arguments[key].strip())
+    ]
+    if not missing:
+        return ""
+    return f"Not run: missing required argument(s) {', '.join(missing)}. Call {call.name} again with them filled in."
 
 
 def _user_message(spoken: str, history: str) -> str:
