@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
@@ -54,7 +56,9 @@ class ChatModel:
         if tools:
             body["tools"] = [_function(tool) for tool in tools]
         try:
-            payload = self.transport(f"{self.base_url}/v1/chat/completions", body)
+            payload = _send(self.transport, f"{self.base_url}/v1/chat/completions", body)
+        except HTTPError as exc:
+            return ModelTurn(_http_problem(exc))
         except TimeoutError:
             return ModelTurn("The model did not answer in time.")
         except URLError as exc:
@@ -160,7 +164,9 @@ class AnthropicModel:
                 for tool in tools
             ]
         try:
-            payload = self.transport(f"{self.base_url}/v1/messages", body)
+            payload = _send(self.transport, f"{self.base_url}/v1/messages", body)
+        except HTTPError as exc:
+            return ModelTurn(_http_problem(exc))
         except TimeoutError:
             return ModelTurn("The model did not answer in time.")
         except URLError as exc:
@@ -196,6 +202,42 @@ def urllib_transport(
     )
     with urlopen(request, timeout=240) as response:  # noqa: S310
         return json.loads(response.read().decode())
+
+
+def _send(transport: Transport, url: str, body: dict[str, Any]) -> dict[str, Any]:
+    """One retry when the provider is rate limited or briefly failing."""
+    try:
+        return transport(url, body)
+    except HTTPError as exc:
+        if exc.code != 429 and exc.code < 500:
+            raise
+        time.sleep(_retry_after(exc))
+        return transport(url, body)
+
+
+def _retry_after(exc: HTTPError) -> float:
+    try:
+        return min(max(float(exc.headers.get("Retry-After") or 2), 0.5), 10.0)
+    except (AttributeError, TypeError, ValueError):
+        return 2.0
+
+
+def _http_problem(exc: HTTPError) -> str:
+    try:
+        detail = exc.read().decode(errors="replace")[:2000]
+    except Exception:  # noqa: BLE001
+        detail = ""
+    print(f"robin: model HTTP {exc.code}: {detail}", file=sys.stderr, flush=True)
+    lowered = detail.lower()
+    if exc.code == 429:
+        return "The model is rate limited right now. Try again in a moment."
+    if exc.code in (401, 403):
+        return "The model rejected Robin's API key."
+    if "context" in lowered and ("length" in lowered or "window" in lowered) or "too long" in lowered or exc.code == 413:
+        return "That conversation got too long for the model. Start a new thread and ask again."
+    if exc.code >= 500:
+        return "The model service had an error. Try again in a moment."
+    return f"The model refused the request (HTTP {exc.code})."
 
 
 def _function(tool: dict[str, Any]) -> dict[str, Any]:

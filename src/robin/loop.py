@@ -211,6 +211,8 @@ def _converse(
     generation: int = 0,
     messages: list[dict[str, Any]] | None = None,
     seed_calls: list[dict[str, Any]] | None = None,
+    batch: tuple[ToolCall, ...] = (),
+    queued: tuple[ToolCall, ...] = (),
 ) -> Reply:
     decision = assistant.decide(task, record=messages is None)
     vault = assistant.vaults.get(task.account_id, task.conversation_id)
@@ -242,6 +244,7 @@ def _converse(
 
     repeats: dict[str, int] = {}
     steps_used = 0
+    assistant_index = _last_assistant_index(messages) if queued else -1
     for _ in range(max_steps):
         steps_used += 1
         if _superseded():
@@ -249,31 +252,22 @@ def _converse(
         tools = assistant.tools(task.account_id)
         allowed = {tool["name"] for tool in tools}
         schemas = {tool["name"]: tool.get("parameters") or {} for tool in tools}
-        turn = _complete(model, messages=messages, tools=tools)
-        if _superseded():
-            return Reply("reply", "That turn was replaced by a newer message.", decision.route)
-        if not turn.tool_calls:
-            reply = _reply_text(turn.message, vault, vocabulary, decision.route)
-            return _after_turn(assistant, task, model, reply, trace)
+        if queued:
+            # Calls the model asked for alongside one the person just confirmed.
+            calls, queued = queued, ()
+        else:
+            turn = _complete(model, messages=messages, tools=tools)
+            if _superseded():
+                return Reply("reply", "That turn was replaced by a newer message.", decision.route)
+            if not turn.tool_calls:
+                reply = _reply_text(turn.message, vault, vocabulary, decision.route)
+                return _after_turn(assistant, task, model, reply, trace)
+            messages.append(_assistant_message(turn.message, turn.tool_calls))
+            assistant_index = len(messages) - 1
+            calls = batch = turn.tool_calls
+        nudges: list[dict[str, Any]] = []
 
-        assistant_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": turn.message or "",
-            "tool_calls": [
-                {
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": json.dumps(call.arguments),
-                    },
-                }
-                for call in turn.tool_calls
-            ],
-        }
-        messages.append(assistant_message)
-
-        for index, call in enumerate(turn.tool_calls):
+        for index, call in enumerate(calls):
             if _superseded():
                 return Reply("reply", "That turn was replaced by a newer message.", decision.route)
             if call.name not in allowed:
@@ -290,16 +284,8 @@ def _converse(
                 for_model=True,
             )
             if outcome["status"] == "confirm":
-                # Keep messages through prior tool results; resume re-adds this assistant turn.
-                prior = messages[:-1]
-                pending_calls = [
-                    {
-                        "id": remaining.id,
-                        "name": remaining.name,
-                        "arguments": dict(remaining.arguments),
-                    }
-                    for remaining in turn.tool_calls[index:]
-                ]
+                # Resume re-adds this assistant turn, the results so far, and runs the rest.
+                prior, pending_calls, done = _split_batch(messages, assistant_index, batch)
                 _store_transcript(
                     assistant,
                     task,
@@ -307,6 +293,7 @@ def _converse(
                     call,
                     pending_calls,
                     decision.route.value,
+                    done=done,
                 )
                 return Reply(
                     "confirm",
@@ -319,15 +306,7 @@ def _converse(
                     free_text=task.free_text,
                 )
             if _is_handoff(outcome.get("result") or ""):
-                prior = messages[:-1]
-                pending_calls = [
-                    {
-                        "id": remaining.id,
-                        "name": remaining.name,
-                        "arguments": dict(remaining.arguments),
-                    }
-                    for remaining in turn.tool_calls[index:]
-                ]
+                prior, pending_calls, done = _split_batch(messages, assistant_index, batch)
                 # Resume re-reads the page after the person clears the wall — do not re-open.
                 record_call = ToolCall(id=call.id, name="browser_read", arguments={})
                 _store_handoff(
@@ -338,6 +317,7 @@ def _converse(
                     pending_calls,
                     decision.route.value,
                     snapshot=str(outcome["result"]),
+                    done=done,
                 )
                 live = _live_url(assistant, task.account_id)
                 trace.handoff = True
@@ -388,7 +368,7 @@ def _converse(
                 }
             )
             if stuck:
-                messages.append(
+                nudges.append(
                     {
                         "role": "user",
                         "content": (
@@ -398,6 +378,8 @@ def _converse(
                         ),
                     }
                 )
+        # Tool results must directly follow their assistant turn; nudges come after.
+        messages.extend(nudges[:1])
         _trim_messages(messages)
 
     if _superseded():
@@ -479,6 +461,65 @@ def _mark_lessons_used(assistant: Assistant, task: Task) -> None:
         return
 
 
+def _assistant_message(content: str, calls: tuple[ToolCall, ...]) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": content or "",
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+            }
+            for call in calls
+        ],
+    }
+
+
+def _last_assistant_index(messages: list[dict[str, Any]]) -> int:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant" and messages[index].get("tool_calls"):
+            return index
+    return len(messages)
+
+
+def _split_batch(
+    messages: list[dict[str, Any]], assistant_index: int, batch: tuple[ToolCall, ...]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Messages before the tool-call turn, every call in it, and the results already in."""
+    prior = messages[:assistant_index]
+    pending_calls = [{"id": item.id, "name": item.name, "arguments": dict(item.arguments)} for item in batch]
+    done = [
+        {"id": message["tool_call_id"], "result": message.get("content") or ""}
+        for message in messages[assistant_index + 1 :]
+        if message.get("role") == "tool" and message.get("tool_call_id")
+    ]
+    return prior, pending_calls, done
+
+
+def _paired(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every assistant tool call gets exactly one result right after it; orphan results are dropped."""
+    out: list[dict[str, Any]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        index += 1
+        if message.get("role") == "tool":
+            continue
+        out.append(message)
+        ids = [str(item.get("id")) for item in message.get("tool_calls") or []] if message.get("role") == "assistant" else []
+        if not ids:
+            continue
+        results: dict[str, dict[str, Any]] = {}
+        while index < len(messages) and messages[index].get("role") == "tool":
+            result = messages[index]
+            results.setdefault(str(result.get("tool_call_id")), result)
+            index += 1
+        for call_id in ids:
+            out.append(results.get(call_id) or {"role": "tool", "tool_call_id": call_id, "content": "Not run."})
+    return out
+
+
 def _store_transcript(
     assistant: Assistant,
     task: Task,
@@ -486,6 +527,8 @@ def _store_transcript(
     call: ToolCall,
     pending_calls: list[dict[str, Any]],
     route: str,
+    *,
+    done: list[dict[str, Any]] | None = None,
 ) -> None:
     record = {
         "tool": call.name,
@@ -496,6 +539,7 @@ def _store_transcript(
         "free_text": task.free_text,
         "messages": messages,
         "pending_calls": pending_calls,
+        "done_calls": done or [],
         "call_id": call.id,
     }
     assistant._pending[(task.account_id, task.conversation_id)] = record
@@ -512,6 +556,7 @@ def _store_handoff(
     route: str,
     *,
     snapshot: str,
+    done: list[dict[str, Any]] | None = None,
 ) -> None:
     record = {
         "tool": "browser_read",
@@ -522,6 +567,7 @@ def _store_handoff(
         "free_text": task.free_text,
         "messages": messages,
         "pending_calls": pending_calls,
+        "done_calls": done or [],
         "call_id": call.id,
         "kind": "handoff",
         "snapshot": snapshot[:2000],
@@ -703,6 +749,7 @@ def _complete(model: Model, *, messages: list[dict[str, Any]], tools: list[dict]
     clock = _clock.get()
     if clock is not None:
         clock.tools = len(tools)
+    messages = _paired(messages)
     _log_model(messages=messages, tools=tools)
     started = time.perf_counter()
     turn = model.complete(messages=messages, tools=tools)
@@ -1161,28 +1208,21 @@ def resume(
     )
     messages = list(pending.get("messages") or [])
     call_id = str(pending.get("call_id") or "call_0")
-    seed = [{"id": call_id, "result": outcome["result"]}]
+    done = [item for item in pending.get("done_calls") or [] if item.get("id") != call_id]
+    seed = [*done, {"id": call_id, "result": outcome["result"]}]
     # Re-attach the assistant tool_calls message that was waiting for confirm.
     pending_calls = pending.get("pending_calls") or [
         {"id": call_id, "name": pending["tool"], "arguments": pending["arguments"]}
     ]
-    messages.append(
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": item["id"],
-                    "type": "function",
-                    "function": {
-                        "name": item["name"],
-                        "arguments": json.dumps(item.get("arguments") or {}),
-                    },
-                }
-                for item in pending_calls
-            ],
-        }
+    batch = tuple(
+        ToolCall(name=str(item["name"]), arguments=dict(item.get("arguments") or {}), id=str(item["id"]))
+        for item in pending_calls
     )
+    finished = {item["id"] for item in seed}
+    ids = [item.id for item in batch]
+    after = ids.index(call_id) + 1 if call_id in ids else len(batch)
+    queued = tuple(item for item in batch[after:] if item.id not in finished)
+    messages.append(_assistant_message("", batch))
     try:
         reply = _converse(
             assistant,
@@ -1191,6 +1231,8 @@ def resume(
             max_steps=max_steps,
             messages=messages,
             seed_calls=seed,
+            batch=batch,
+            queued=queued,
         )
     finally:
         current_task.reset(token)

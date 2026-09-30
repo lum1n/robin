@@ -666,3 +666,98 @@ def test_a_call_missing_required_arguments_is_sent_back_to_the_model() -> None:
     assert "missing required argument(s) list" in tool_messages[0]["content"]
     assert "not a JSON object" in tool_messages[1]["content"]
     assert "Not run" not in tool_messages[2]["content"]
+
+
+def _tool_pairs_ok(messages: list[dict]) -> bool:
+    for index, message in enumerate(messages):
+        ids = [call["id"] for call in message.get("tool_calls") or []]
+        if not ids:
+            continue
+        following = []
+        for later in messages[index + 1 :]:
+            if later.get("role") != "tool":
+                break
+            following.append(later["tool_call_id"])
+        if following != ids:
+            return False
+    return all(
+        message.get("role") != "tool" or index > 0 and messages[index - 1].get("role") in ("assistant", "tool")
+        for index, message in enumerate(messages)
+    )
+
+
+def test_confirming_one_of_several_calls_runs_the_rest() -> None:
+    from robin.loop import resume
+
+    screen = Screen(owner="ada", text="desk", password="")
+    lists = Lists(members={"ada"}, shared=[{"item": "milk", "list": "groceries", "loyalty": ""}], private={})
+    assistant = Assistant(ner=StubNer())
+    assistant.add(screen)
+    assistant.add(lists)
+    model = Scripted(
+        [
+            ModelTurn(
+                "",
+                (
+                    ToolCall("lists_show", {"list": "groceries"}, id="a"),
+                    ToolCall("screen_submit", {}, id="b"),
+                    ToolCall("lists_show", {"list": "groceries"}, id="c"),
+                ),
+            ),
+            ModelTurn("Done."),
+        ]
+    )
+    held = converse(assistant, Task("ada", "t", "check and send"), model)
+    assert held.status == "confirm"
+    reply = resume(assistant, "ada", "t", model)
+    assert reply.text == "Done."
+    assert screen.submitted is True
+    final = model.seen[-1][0]
+    assert _tool_pairs_ok(final)
+    results = {message["tool_call_id"]: message["content"] for message in final if message.get("role") == "tool"}
+    assert set(results) == {"a", "b", "c"}
+    assert "milk" in results["a"].casefold() and "milk" in results["c"].casefold()
+
+
+def test_model_requests_always_pair_tool_calls() -> None:
+    from robin.loop import _paired
+
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "tool", "tool_call_id": "orphan", "content": "x"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "a"}, {"id": "b"}]},
+        {"role": "tool", "tool_call_id": "a", "content": "ra"},
+        {"role": "user", "content": "nudge"},
+    ]
+    paired = _paired(messages)
+    assert [m.get("tool_call_id") for m in paired if m.get("role") == "tool"] == ["a", "b"]
+    assert paired[-1]["content"] == "nudge"
+    assert paired[3]["content"] == "Not run."
+
+
+def test_model_http_errors_are_named() -> None:
+    import io
+    from urllib.error import HTTPError
+
+    def refuse(code: int, body: str):
+        def transport(url, body_):
+            raise HTTPError(url, code, "err", {"Retry-After": "0"}, io.BytesIO(body.encode()))
+
+        return transport
+
+    turn = ChatModel(transport=refuse(400, '{"error":{"message":"tool_call_ids did not have response messages"}}')).complete(messages=[], tools=[])
+    assert "HTTP 400" in turn.message and "not running" not in turn.message
+    turn = ChatModel(transport=refuse(400, '{"error":{"code":"context_length_exceeded"}}')).complete(messages=[], tools=[])
+    assert "too long" in turn.message
+    turn = ChatModel(transport=refuse(429, "slow down")).complete(messages=[], tools=[])
+    assert "rate limited" in turn.message
+
+    attempts = []
+
+    def flaky(url, body):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise HTTPError(url, 503, "err", {"Retry-After": "0"}, io.BytesIO(b""))
+        return {"choices": [{"message": {"content": "hi"}}]}
+
+    assert ChatModel(transport=flaky).complete(messages=[], tools=[]).message == "hi"
