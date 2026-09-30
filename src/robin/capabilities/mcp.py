@@ -67,6 +67,9 @@ class Mcp(Capability):
             description=(
                 "Start attaching an MCP server. transport is http or stdio. "
                 "For http pass url; for stdio pass command and optional args (admins only). "
+                "url must be the server's MCP endpoint (for example https://mcp.example.com/mcp), "
+                "not a directory or docs page — if the person links instructions, web_fetch them first "
+                "and copy the url, or command and args, from the config they show. "
                 "auth is none, bearer, or oauth (many remote MCPs such as Sentry use oauth)."
             ),
             parameters={
@@ -478,7 +481,7 @@ class Mcp(Capability):
             return "name is required"
         if transport == "http":
             url = str(arguments.get("url") or "").strip()
-            err = _validate_url(url)
+            err = _validate_url(url) or _directory_page(url)
             if err:
                 return err
             if auth == "oauth":
@@ -510,7 +513,10 @@ class Mcp(Capability):
             return f"Draft MCP {name} saved (http, oauth). Call mcp_setup_oauth or mcp_setup_test to authorize."
         if auth == "bearer":
             return f"Draft MCP {name} saved ({transport}). Ask for the bearer secret, then mcp_setup_test."
-        return f"Draft MCP {name} saved ({transport}). Ask for any secrets, then mcp_setup_test."
+        return (
+            f"Draft MCP {name} saved ({transport}). Call mcp_setup_test now; "
+            "only ask for a secret if the test or the server's docs say one is needed."
+        )
 
     def _ask_secret(self, account_id: str, arguments: dict[str, Any]) -> str:
         name = _sanitize(str(arguments.get("name") or ""))
@@ -548,11 +554,11 @@ class Mcp(Capability):
             session = self._session_for(account_id, draft)
             tools = session.list_tools()
         except Exception as exc:
-            message = str(exc)
+            message = _error_text(exc)
             if "401" in message or "Unauthorized" in message or "oauth" in message.casefold():
                 draft["auth"] = "oauth"
                 return self._start_oauth(account_id, name)
-            return f"MCP test failed: {exc}"
+            return f"MCP test failed: {message}"
         return self._record_test(account_id, name, draft, tools)
 
     def _start_oauth(self, account_id: str, name: str) -> str:
@@ -605,7 +611,7 @@ class Mcp(Capability):
         if flow.finished.is_set() and not flow.auth_url:
             self._oauth_flows.pop(account_id, None)
             if flow.result_error is not None:
-                return f"OAuth failed: {flow.result_error}"
+                return f"OAuth failed: {_error_text(flow.result_error)}"
             tools = list(draft.get("tools") or flow.tools or [])
             if tools:
                 return self._record_test(account_id, name, draft, tools)
@@ -665,7 +671,7 @@ class Mcp(Capability):
         if flow is not None and flow.state:
             self._oauth_by_state.pop(flow.state, None)
         if flow is not None and flow.result_error is not None:
-            return SecretAccepted(reply=f"OAuth failed: {flow.result_error}")
+            return SecretAccepted(reply=f"OAuth failed: {_error_text(flow.result_error)}")
         draft = self._drafts.get(account_id, {}).get(name)
         if draft is not None and draft.get("tested"):
             count = len(draft.get("tools") or [])
@@ -1001,6 +1007,43 @@ def _validate_url(url: str) -> str:
     if host in {"metadata.google.internal", "169.254.169.254"} or host.startswith("169.254."):
         return "url host is not allowed"
     return ""
+
+
+_DIRECTORY_HOSTS = frozenset(
+    {
+        "lobehub.com",
+        "market.lobehub.com",
+        "smithery.ai",
+        "mcp.so",
+        "glama.ai",
+        "pulsemcp.com",
+        "mcpservers.org",
+        "mcpmarket.com",
+        "github.com",
+        "npmjs.com",
+        "pypi.org",
+    }
+)
+
+
+def _directory_page(url: str) -> str:
+    host = (urlparse(url).hostname or "").casefold().removeprefix("www.")
+    if host not in _DIRECTORY_HOSTS:
+        return ""
+    return (
+        "That link is an MCP directory or docs page, not a server endpoint. "
+        "web_fetch it and use the config it shows: a url means transport http with that url; "
+        "command and args (npx, uvx, docker) mean transport stdio. "
+        "If it needs a separate login or setup command run in a terminal, tell the person Robin cannot do that step."
+    )
+
+
+def _error_text(exc: BaseException) -> str:
+    """Unwrap anyio TaskGroup errors so the real cause (HTTP 401, 404, …) is visible."""
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 def _stdio_allowed(command: str) -> bool:

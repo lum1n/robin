@@ -20,7 +20,7 @@ Connect in chat: `home_connect` with the base URL, then a secure form for the lo
 
 ## MCP servers
 
-Attach servers in chat with `mcp_setup_start` → secrets or OAuth → `mcp_setup_test` → `mcp_setup_finish` (confirm).
+Attach servers in chat with `mcp_setup_start` → `mcp_setup_test` (secrets or OAuth only when the test asks) → `mcp_setup_finish` (confirm). Directory pages (lobehub, smithery, GitHub, …) are refused as endpoints; the model reads them with `web_fetch` and copies the url or command from their config.
 
 - **Bearer / header / env:** `mcp_setup_ask_secret` shows a secure form; values stay in the broker.
 - **OAuth (authorization code + PKCE):** set `auth=oauth` on start (or call `mcp_setup_oauth`). Robin discovers the authorization server, registers itself with redirect URI `robin://oauth/callback`, and returns the authorize link as `InputRequest.open_url` with no fields. The app opens it in the system sign-in sheet (`ASWebAuthenticationSession` / `WebBrowser.openAuthSessionAsync`), catches the `robin://` callback, and posts it as `{"redirect": <callback URL>}`. The house does not need a public URL, and the person never sees or pastes a redirect. Access and refresh tokens plus the dynamic client registration live in the broker (`mcp:<name>:oauth_tokens` / `oauth_client`), with the token expiry and authorization-server metadata (`oauth_expires_at` / `oauth_metadata`) so expired access tokens refresh silently; a registration made with a different redirect is replaced. Works with remote MCPs such as Sentry.

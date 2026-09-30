@@ -224,6 +224,32 @@ def test_mcp_stdio_refused_for_non_admin() -> None:
     assert "admins" in result
 
 
+def test_mcp_setup_rejects_directory_page_and_tests_before_asking() -> None:
+    mcp = Mcp(open_session=lambda config: FakeMcpSession(), admins={"ada"})
+    refused = mcp.invoke(
+        "ada",
+        "mcp_setup_start",
+        {"name": "oda", "transport": "http", "url": "https://lobehub.com/mcp/kolonialno-oda-mcp"},
+    )
+    assert "directory" in refused and "web_fetch" in refused
+    assert "oda" not in mcp._drafts.get("ada", {})
+    started = mcp.invoke("ada", "mcp_setup_start", {"name": "oda", "transport": "http", "url": "https://mcp.example/mcp"})
+    assert "mcp_setup_test now" in started
+    assert "Ask for any secrets" not in started
+
+
+def test_mcp_setup_test_unwraps_taskgroup_errors() -> None:
+    class Broken:
+        def list_tools(self):
+            raise ExceptionGroup("unhandled errors in a TaskGroup", [RuntimeError("HTTP 404 Not Found")])
+
+    mcp = Mcp(open_session=lambda config: Broken(), admins={"ada"})
+    mcp.invoke("ada", "mcp_setup_start", {"name": "x", "transport": "http", "url": "https://mcp.example/mcp"})
+    result = mcp.invoke("ada", "mcp_setup_test", {"name": "x"})
+    assert result == "MCP test failed: RuntimeError: HTTP 404 Not Found"
+
+
+
 
 class _OAuthFakeSession:
     """Blocks list_tools until OAuth code is delivered — mirrors OAuthClientProvider."""
