@@ -34,6 +34,7 @@ final class ShellModel: ObservableObject {
     @Published var failure: String?
     @Published private(set) var waiting = false
     @Published private(set) var serverTiming = ""
+    @Published var inputValues: [String: String] = [:]
 
     private let shell: Shell
 
@@ -76,6 +77,30 @@ final class ShellModel: ObservableObject {
     func confirm() async {
         await perform {
             try await self.shell.confirm(conversationID: self.conversationID)
+        }
+    }
+
+    func submitInput() async {
+        guard case .input(_, _, let request) = phase else { return }
+        let values = inputValues
+        inputValues = [:]
+        await perform {
+            try await self.shell.submitInput(
+                conversationID: self.conversationID,
+                requestID: request.requestID,
+                values: values
+            )
+        }
+    }
+
+    func cancelInput() async {
+        guard case .input(_, _, let request) = phase else { return }
+        inputValues = [:]
+        await perform {
+            try await self.shell.cancelInput(
+                conversationID: self.conversationID,
+                requestID: request.requestID
+            )
         }
     }
 
@@ -239,7 +264,7 @@ struct RobinRootView: View {
             switch model.phase {
             case .signedOut:
                 SignInForm(model: model)
-            case .ready, .confirm, .handoff:
+            case .ready, .confirm, .handoff, .input:
                 ConversationForm(model: model)
             }
         }
@@ -312,6 +337,8 @@ private struct ConversationForm: View {
                 if let failure = model.failure {
                     Text(failure)
                 }
+            case .input(_, let prompt, let request):
+                InputFormView(model: model, prompt: prompt, request: request)
             case .signedOut:
                 EmptyView()
             }
@@ -384,6 +411,83 @@ private struct ConversationForm: View {
         }
         .navigationTitle(model.accountID)
     }
+}
+
+private struct InputFormView: View {
+    @ObservedObject var model: ShellModel
+    let prompt: String
+    let request: InputRequest
+
+    private var canSubmit: Bool {
+        request.fields.allSatisfy { field in
+            !field.required || !(model.inputValues[field.fieldID] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(request.title).font(.headline)
+            Text(prompt.isEmpty ? request.reason : prompt)
+            ForEach(request.fields) { field in
+                inputField(field)
+            }
+            HStack {
+                Button("Cancel") {
+                    Task { await model.cancelInput() }
+                }
+                Button("Submit") {
+                    Task { await model.submitInput() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSubmit || model.waiting)
+            }
+            if let failure = model.failure {
+                Text(failure)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func inputField(_ field: InputField) -> some View {
+        let binding = Binding(
+            get: { model.inputValues[field.fieldID] ?? "" },
+            set: { model.inputValues[field.fieldID] = $0 }
+        )
+        Text(field.label)
+        if field.kind == "secret" || field.kind == "otp" {
+            SecureField(field.placeholder.isEmpty ? field.label : field.placeholder, text: binding)
+                .robinField()
+                #if os(iOS)
+                .textContentType(field.kind == "otp" ? .oneTimeCode : .password)
+                #endif
+        } else if field.kind == "choice", !field.options.isEmpty {
+            Picker(field.label, selection: binding) {
+                Text("").tag("")
+                ForEach(field.options, id: \.self) { option in
+                    Text(option).tag(option)
+                }
+            }
+        } else {
+            TextField(field.placeholder.isEmpty ? field.label : field.placeholder, text: binding)
+                .robinField()
+                #if os(iOS)
+                .textContentType(contentType(for: field.kind))
+                .keyboardType(field.kind == "url" ? .URL : field.kind == "email" ? .emailAddress : field.kind == "number" ? .decimalPad : .default)
+                #endif
+        }
+    }
+
+    #if os(iOS)
+    private func contentType(for kind: String) -> UITextContentType? {
+        switch kind {
+        case "username": return .username
+        case "email": return .emailAddress
+        case "url": return .URL
+        case "otp": return .oneTimeCode
+        default: return nil
+        }
+    }
+    #endif
 }
 
 private struct RobinFields<Content: View>: View {

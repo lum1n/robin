@@ -12,7 +12,18 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
-from robin.capability import ActiveTurn, Capability, Effect, FieldClass, FieldSpec, SecretAccepted, Tool, current_task
+from robin.capability import (
+    ActiveTurn,
+    Capability,
+    Effect,
+    FieldClass,
+    FieldSpec,
+    InputField,
+    InputRequest,
+    SecretAccepted,
+    Tool,
+    current_task,
+)
 
 
 def _active_text() -> str:
@@ -1457,6 +1468,74 @@ class Browser(Capability):
             free_text=bool(waiting.get("free_text")),
         )
 
+    def pending_input(self, account_id: str, conversation_id: str) -> InputRequest | None:
+        waiting = self._wait(account_id, conversation_id)
+        if waiting is None:
+            return None
+        host = (waiting.get("hosts") or ["that site"])[0]
+        request_id = str(waiting.get("request_id") or f"browser-{conversation_id}")
+        failed = bool(waiting.get("failed"))
+        if waiting.get("kind") == "code":
+            return InputRequest(
+                request_id=request_id,
+                title=f"Code for {host}",
+                reason=self._direct.get(account_id) or _ask_code(host, failed=failed),
+                fields=(InputField(id="code", label="Code", kind="otp"),),
+                owner=self.id,
+            )
+        return InputRequest(
+            request_id=request_id,
+            title=f"Sign in to {host}",
+            reason=self._direct.get(account_id) or _ask_text(host, failed=failed),
+            fields=(
+                InputField(id="username", label="Username", kind="username"),
+                InputField(id="password", label="Password", kind="secret"),
+            ),
+            owner=self.id,
+        )
+
+    def accept_input(
+        self,
+        account_id: str,
+        conversation_id: str,
+        request_id: str,
+        values: dict[str, str],
+        *,
+        cancel: bool = False,
+    ) -> SecretAccepted | None:
+        waiting = self._wait(account_id, conversation_id)
+        if waiting is None:
+            return None
+        expected = str(waiting.get("request_id") or f"browser-{conversation_id}")
+        if request_id != expected:
+            return None
+        if cancel:
+            self._codes.pop((account_id, conversation_id), None)
+            self._clear_wait(account_id, conversation_id)
+            return SecretAccepted(reply="Sign-in cancelled.")
+        if waiting.get("kind") == "code":
+            code = str(values.get("code") or "").strip()
+            if not code:
+                return SecretAccepted(reply="Enter the code.")
+            self._codes[(account_id, conversation_id)] = code
+            self._clear_wait(account_id, conversation_id)
+            return SecretAccepted(
+                resume=str(waiting["task"]),
+                allow_cloud=bool(waiting.get("allow_cloud")),
+                free_text=bool(waiting.get("free_text")),
+            )
+        user = str(values.get("username") or "").strip()
+        password = str(values.get("password") or "").strip()
+        if not user or not password:
+            return SecretAccepted(reply="Username and password are required.")
+        self._save(account_id, list(waiting["hosts"]), user, password)
+        self._clear_wait(account_id, conversation_id)
+        return SecretAccepted(
+            resume=str(waiting["task"]),
+            allow_cloud=bool(waiting.get("allow_cloud")),
+            free_text=bool(waiting.get("free_text")),
+        )
+
     def peel_secret(self, account_id: str, text: str) -> str | None:
         if self.broker is None:
             return None
@@ -1472,7 +1551,8 @@ class Browser(Capability):
     def available_tools(self, account_id: str) -> list[Tool]:
         if self._page_open(account_id):
             return list(self.tools)
-        return [tool for tool in self.tools if tool.name == "browser_open"]
+        # Keep read so "no page is open" is a clear tool result; hide click/type until open.
+        return [tool for tool in self.tools if tool.name in {"browser_open", "browser_read"}]
 
     def status(self, account_id: str) -> str:
         if self._page_open(account_id):
@@ -2025,6 +2105,8 @@ class Browser(Capability):
             "hosts": hosts,
             "task": task,
             "kind": kind,
+            "failed": failed,
+            "request_id": f"browser-{conversation_id or 'open'}-{kind}",
             "allow_cloud": bool(turn.allow_cloud) if isinstance(turn, ActiveTurn) else False,
             "free_text": bool(turn.free_text) if isinstance(turn, ActiveTurn) else False,
         }

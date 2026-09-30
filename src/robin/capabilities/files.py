@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from robin.capabilities.identity import claim, give
-from robin.capability import Capability, Effect, FieldClass, FieldSpec, Tool
+from robin.capability import Capability, Effect, FieldClass, FieldSpec, Result, Tool
 
 _LIMIT = 1_000_000
 _VISIT_CAP = 30_000
@@ -267,10 +267,17 @@ class Files(Capability):
         ),
         Tool(
             name="files_read",
-            description="Read a file this user owns. Another user's path is refused.",
+            description=(
+                "Read a file this user owns. PDF and docx extract text (optional page range for PDF). "
+                "Another user's path is refused."
+            ),
             parameters={
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "page_from": {"type": "number"},
+                    "page_to": {"type": "number"},
+                },
                 "required": ["path"],
             },
             effect=Effect.READ,
@@ -281,6 +288,19 @@ class Files(Capability):
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            effect=Effect.READ,
+        ),
+        Tool(
+            name="docs_find",
+            description="Find documents (pdf, txt, md, docx) by keyword. Returns path, title, and a short snippet.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "kind": {"type": "string"},
+                },
                 "required": ["query"],
             },
             effect=Effect.READ,
@@ -306,10 +326,16 @@ class Files(Capability):
             effect=Effect.EXTERNAL,
         ),
     ]
-    fields = [FieldSpec("name", FieldClass.ORDINARY)]
+    fields = [
+        FieldSpec("name", FieldClass.ORDINARY),
+        FieldSpec("path", FieldClass.ORDINARY),
+        FieldSpec("title", FieldClass.ORDINARY, free_text=True),
+        FieldSpec("snippet", FieldClass.ORDINARY, free_text=True),
+    ]
 
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(self, workspace: Workspace, store: Any = None) -> None:
         self.workspace = workspace
+        self.store = store
 
     def status(self, account_id: str) -> str:
         return "files: available"
@@ -317,7 +343,7 @@ class Files(Capability):
     def records(self, account_id: str) -> list[dict[str, str]]:
         return [{"name": name} for name in self.workspace.names(account_id)]
 
-    def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
+    def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str | Result:
         if tool_name == "files_list":
             paths = self.workspace.owned_files(account_id)
             if not paths:
@@ -328,9 +354,19 @@ class Files(Capability):
                 body += f"\n{len(shown)} of {len(paths)}"
             return body
         if tool_name == "files_read":
-            return self.workspace.read(account_id, str(arguments.get("path", "")))
+            path = str(arguments.get("path", ""))
+            text = _extract_text(
+                self.workspace,
+                account_id,
+                path,
+                page_from=arguments.get("page_from"),
+                page_to=arguments.get("page_to"),
+            )
+            return text[:12_000]
         if tool_name == "files_search":
             return self._search(account_id, str(arguments.get("query", "")))
+        if tool_name == "docs_find":
+            return self._docs_find(account_id, str(arguments.get("query", "")), str(arguments.get("kind") or ""))
         if tool_name == "files_write":
             self.workspace.write(account_id, str(arguments.get("path", "")), str(arguments.get("text", "")))
             return "wrote"
@@ -351,7 +387,7 @@ class Files(Capability):
             if path.suffix.lower() in IMAGE_SUFFIXES:
                 continue
             try:
-                text = path.read_text(errors="replace")[:_LIMIT]
+                text = _file_text(path)[:_LIMIT]
             except OSError:
                 continue
             if needle in text.casefold():
@@ -361,6 +397,109 @@ class Files(Capability):
         if not hits:
             return "no files matched"
         return "\n".join(hits)
+
+    def _docs_find(self, account_id: str, query: str, kind: str) -> str | Result:
+        needle = query.strip().casefold()
+        if not needle:
+            return "query is required"
+        suffixes = {".pdf", ".txt", ".md", ".docx"}
+        if kind:
+            suffixes = {f".{kind.lstrip('.').lower()}"} & suffixes or suffixes
+        records = []
+        for path in self.workspace.owned_files(account_id, suffixes=suffixes):
+            try:
+                text = _file_text(path)
+            except OSError:
+                continue
+            if needle not in text.casefold() and needle not in str(path).casefold():
+                continue
+            lower = text.casefold()
+            at = lower.find(needle)
+            snippet = text[max(0, at - 40) : at + 120].replace("\n", " ").strip() if at >= 0 else text[:120]
+            records.append(
+                {
+                    "path": str(path),
+                    "title": path.stem,
+                    "snippet": snippet,
+                }
+            )
+            if len(records) >= 30:
+                break
+        if not records:
+            return "no documents matched"
+        return Result(text="Documents:", records=records)
+
+
+def _extract_text(workspace: Workspace, account_id: str, path: str, *, page_from: Any, page_to: Any) -> str:
+    target = Path(path)
+    # Prefer workspace.read for ordinary text; fall back to typed extractors.
+    suffix = target.suffix.lower()
+    if suffix == ".pdf":
+        return _pdf_text(workspace, account_id, path, page_from=page_from, page_to=page_to)
+    if suffix == ".docx":
+        raw = workspace.read(account_id, path)
+        # workspace.read may return binary error; try path directly when owned.
+        try:
+            owned = workspace.owned_files(account_id, suffixes={".docx"})
+            match = next((item for item in owned if str(item) == path or item.name == Path(path).name), None)
+            if match is not None:
+                return _docx_text(match)
+        except Exception:
+            pass
+        return raw
+    return workspace.read(account_id, path)
+
+
+def _file_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return _pdf_path_text(path)
+    if suffix == ".docx":
+        return _docx_text(path)
+    return path.read_text(errors="replace")
+
+
+def _pdf_text(workspace: Workspace, account_id: str, path: str, *, page_from: Any, page_to: Any) -> str:
+    owned = workspace.owned_files(account_id, suffixes={".pdf"})
+    match = next((item for item in owned if str(item) == path or item.name == Path(path).name), None)
+    if match is None:
+        return workspace.read(account_id, path)
+    return _pdf_path_text(match, page_from=page_from, page_to=page_to)
+
+
+def _pdf_path_text(path: Path, *, page_from: Any = None, page_to: Any = None) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return "PDF reading needs the docs extra (pip install robin[docs])."
+    try:
+        reader = PdfReader(str(path))
+    except Exception as exc:
+        return f"could not read PDF: {exc}"
+    start = max(0, int(page_from) - 1) if page_from is not None else 0
+    end = int(page_to) if page_to is not None else len(reader.pages)
+    chunks = []
+    for page in reader.pages[start:end]:
+        chunks.append(page.extract_text() or "")
+    return "\n".join(chunks)
+
+
+def _docx_text(path: Path) -> str:
+    import zipfile
+    from xml.etree import ElementTree
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml = archive.read("word/document.xml")
+    except Exception as exc:
+        return f"could not read docx: {exc}"
+    root = ElementTree.fromstring(xml)
+    texts = [
+        node.text
+        for node in root.iter()
+        if node.tag.endswith("}t") and node.text
+    ]
+    return "\n".join(texts)
 
 
 def _owner_uid(path: Path) -> int:

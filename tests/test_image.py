@@ -18,7 +18,8 @@ def test_pinned_image_contains_robin_and_does_not_start_until_enroll() -> None:
     assert "playwright install --with-deps chromium" in dockerfile
     assert "PLAYWRIGHT_BROWSERS_PATH=/opt/robin/ms-playwright" in dockerfile
     assert "PLAYWRIGHT_BROWSERS_PATH=/opt/robin/ms-playwright" in unit
-    assert "--extra ner" not in dockerfile
+    assert "--extra ner" in dockerfile
+    assert "--extra stealth" in dockerfile
     assert "systemctl enable" not in dockerfile
     assert "shelley.socket" in dockerfile
     assert "ssh.service" in dockerfile

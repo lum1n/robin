@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     boot_cmd.add_argument("--port", type=int, default=8787)
     boot_cmd.add_argument("--model-url", default="http://127.0.0.1:8080")
     boot_cmd.add_argument("--model-name", default="local")
+    boot_cmd.add_argument("--mcp-config", default="/etc/robin/mcp.json")
     boot_cmd.add_argument(
         "--ner-model",
         default="",
@@ -216,7 +217,7 @@ def _boot(args: argparse.Namespace) -> int:
     ner = GlinerNer(model_name)
     ner.warm()
     assistant = Assistant(store=store, ner=ner)
-    install(assistant)
+    install(assistant, mcp_config=getattr(args, "mcp_config", "") or "")
     if not ner._installed:
         print(
             "robin: WARNING local NER is not installed (uv sync --extra ner). "

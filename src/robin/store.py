@@ -93,6 +93,10 @@ class HouseholdStore:
         self._db.execute("CREATE TABLE IF NOT EXISTS memory (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS skills (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS learning (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS home_rules (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS home_state (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS mcp (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS doc_index (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS notifications (
@@ -417,6 +421,66 @@ class HouseholdStore:
 
     def load_learning(self) -> dict[str, dict]:
         rows = self._db.execute("SELECT account_id, body FROM learning").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
+
+    def save_home_rules(self, account_id: str, rules: list[dict]) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO home_rules (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(rules, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_home_rules(self) -> dict[str, list[dict]]:
+        rows = self._db.execute("SELECT account_id, body FROM home_rules").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
+
+    def save_home_state(self, account_id: str, state: dict[str, str]) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO home_state (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(state, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_home_state(self) -> dict[str, dict[str, str]]:
+        rows = self._db.execute("SELECT account_id, body FROM home_state").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
+
+    def save_mcp(self, account_id: str, servers: list[dict]) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO mcp (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(servers, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_mcp(self) -> dict[str, list[dict]]:
+        rows = self._db.execute("SELECT account_id, body FROM mcp").fetchall()
+        return {account_id: json.loads(self._open(body)) for account_id, body in rows}
+
+    def save_doc_index(self, account_id: str, index: list[dict]) -> None:
+        self.ensure_account(account_id)
+        self._db.execute(
+            """
+            INSERT INTO doc_index (account_id, body) VALUES (?, ?)
+            ON CONFLICT (account_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, self._seal(json.dumps(index, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_doc_index(self) -> dict[str, list[dict]]:
+        rows = self._db.execute("SELECT account_id, body FROM doc_index").fetchall()
         return {account_id: json.loads(self._open(body)) for account_id, body in rows}
 
     def save_notification(self, account_id: str, text: str) -> None:

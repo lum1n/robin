@@ -270,7 +270,7 @@ def test_a_blocked_sign_in_keeps_the_password_and_hands_the_form_to_the_model() 
             return (
                 'URL: https://accounts.store.example/login\n\n'
                 'Interactive:\n[1] textbox "Email"\n[2] textbox "Password"\n\n'
-                "Content:\nUnusual activity detected. Please verify you are human.",
+                "Content:\nSaved credentials could not be applied automatically. Finish the form.",
                 "",
             )
 

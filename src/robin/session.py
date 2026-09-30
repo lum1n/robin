@@ -240,6 +240,22 @@ class Assistant:
                 return peeled
         return None
 
+    def pending_input(self, account_id: str, conversation_id: str):
+        return self.registry.pending_input(account_id, conversation_id)
+
+    def accept_input(
+        self,
+        account_id: str,
+        conversation_id: str,
+        request_id: str,
+        values: dict[str, str],
+        *,
+        cancel: bool = False,
+    ) -> SecretAccepted | None:
+        return self.registry.accept_input(
+            account_id, conversation_id, request_id, values, cancel=cancel
+        )
+
     def due(self, now: datetime) -> list[DueWork]:
         found: list[DueWork] = []
         for capability in self.registry._capabilities:
@@ -296,14 +312,16 @@ class Assistant:
         vault = self.vaults.get(account_id, conversation_id)
         vocabulary = self.vocabulary.get(account_id, ())
         if tool.egress:
-            raw = {key: str(value) for key, value in arguments.items()}
+            raw = {key: value for key, value in arguments.items()}
             if not confirmed and _egress_needs_restore(raw, vault):
                 return {"status": "confirm", "tool": tool_name, "reason": "egress"}
-            raw = {key: vault.restore(value) for key, value in raw.items()}
+            raw = {key: _restore_arg(value, vault) for key, value in raw.items()}
         else:
-            raw = {key: vault.restore(str(value)) for key, value in arguments.items()}
-        logged_input = {key: "" if key in tool.drop_arguments else value for key, value in raw.items()}
-        logged, _ = redact(json.dumps(logged_input, sort_keys=True), Vault(account_id, "activity"))
+            raw = {key: _restore_arg(value, vault) for key, value in arguments.items()}
+        logged_input = {
+            key: "" if key in tool.drop_arguments else _log_arg(value) for key, value in raw.items()
+        }
+        logged, _ = redact(json.dumps(logged_input, sort_keys=True, default=str), Vault(account_id, "activity"))
         entry = {"tool": tool_name, "arguments": logged}
         self.activity.append(account_id, entry)
         if self.store is not None:
@@ -356,14 +374,46 @@ class Assistant:
         self.schedules.update(self.store.load_schedules())
 
 
-def _egress_needs_restore(arguments: dict[str, str], vault: Vault) -> bool:
+def _egress_needs_restore(arguments: dict[str, Any], vault: Vault) -> bool:
     """True when an egress argument still holds a placeholder the person must approve."""
     for value in arguments.values():
-        if "[" in value and "]" in value:
-            restored = vault.restore(value)
-            if restored != value:
-                return True
+        if _arg_needs_restore(value, vault):
+            return True
     return False
+
+
+def _arg_needs_restore(value: Any, vault: Vault) -> bool:
+    if isinstance(value, str):
+        if "[" in value and "]" in value:
+            return vault.restore(value) != value
+        return False
+    if isinstance(value, list):
+        return any(_arg_needs_restore(item, vault) for item in value)
+    if isinstance(value, dict):
+        return any(_arg_needs_restore(item, vault) for item in value.values())
+    return False
+
+
+def _restore_arg(value: Any, vault: Vault) -> Any:
+    if isinstance(value, str):
+        return vault.restore(value)
+    if isinstance(value, list):
+        return [_restore_arg(item, vault) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _restore_arg(item, vault) for key, item in value.items()}
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return vault.restore(str(value))
+
+
+def _log_arg(value: Any) -> Any:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return [_log_arg(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _log_arg(item) for key, item in value.items()}
+    return value
 
 
 def _lesson_needs_confirm() -> bool:

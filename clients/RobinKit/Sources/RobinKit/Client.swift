@@ -43,6 +43,28 @@ public actor RobinClient {
         return try await postMessage(body)
     }
 
+    public func submitInput(conversationID: String, requestID: String, values: [String: String]) async throws -> Reply {
+        let body = try encode(
+            InputMessageBody(
+                accountID: accountID,
+                conversationID: conversationID,
+                input: InputPayload(requestID: requestID, values: values, cancel: nil)
+            )
+        )
+        return try await postMessage(body)
+    }
+
+    public func cancelInput(conversationID: String, requestID: String) async throws -> Reply {
+        let body = try encode(
+            InputMessageBody(
+                accountID: accountID,
+                conversationID: conversationID,
+                input: InputPayload(requestID: requestID, values: nil, cancel: true)
+            )
+        )
+        return try await postMessage(body)
+    }
+
     public func setSchedule(enabled: Bool) async throws {
         let body = try encode(ScheduleBody(accountID: accountID, enabled: enabled))
         let raw = try await transport.call(
@@ -206,14 +228,24 @@ public struct Reply: Decodable, Sendable, Equatable {
     public let tool: String?
     public let timing: String?
     public let liveURL: String?
+    public let input: InputRequest?
 
-    public init(status: String, text: String, route: String, tool: String?, timing: String? = nil, liveURL: String? = nil) {
+    public init(
+        status: String,
+        text: String,
+        route: String,
+        tool: String?,
+        timing: String? = nil,
+        liveURL: String? = nil,
+        input: InputRequest? = nil
+    ) {
         self.status = status
         self.text = text
         self.route = route
         self.tool = tool
         self.timing = timing
         self.liveURL = liveURL
+        self.input = input
     }
 
     public init(from decoder: Decoder) throws {
@@ -224,11 +256,73 @@ public struct Reply: Decodable, Sendable, Equatable {
         tool = try container.decodeIfPresent(String.self, forKey: .tool)
         timing = try container.decodeIfPresent(String.self, forKey: .timing)
         liveURL = try container.decodeIfPresent(String.self, forKey: .liveURL)
+        input = try container.decodeIfPresent(InputRequest.self, forKey: .input)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case status, text, route, tool, timing
+        case status, text, route, tool, timing, input
         case liveURL = "live_url"
+    }
+}
+
+public struct InputRequest: Decodable, Sendable, Equatable {
+    public let requestID: String
+    public let title: String
+    public let reason: String
+    public let owner: String
+    public let fields: [InputField]
+
+    private enum CodingKeys: String, CodingKey {
+        case requestID = "request_id"
+        case title, reason, owner, fields
+    }
+}
+
+public struct InputField: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String { fieldID }
+    public let fieldID: String
+    public let label: String
+    public let kind: String
+    public let required: Bool
+    public let placeholder: String
+    public let options: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case fieldID = "id"
+        case label, kind, required, placeholder, options
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        fieldID = try container.decode(String.self, forKey: .fieldID)
+        label = try container.decode(String.self, forKey: .label)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "text"
+        required = try container.decodeIfPresent(Bool.self, forKey: .required) ?? true
+        placeholder = try container.decodeIfPresent(String.self, forKey: .placeholder) ?? ""
+        options = try container.decodeIfPresent([String].self, forKey: .options) ?? []
+    }
+}
+
+private struct InputMessageBody: Encodable {
+    var accountID: String
+    var conversationID: String
+    var input: InputPayload
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case conversationID = "conversation_id"
+        case input
+    }
+}
+
+private struct InputPayload: Encodable {
+    var requestID: String
+    var values: [String: String]?
+    var cancel: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case requestID = "request_id"
+        case values, cancel
     }
 }
 

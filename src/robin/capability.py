@@ -85,6 +85,51 @@ class SecretAccepted:
     free_text: bool = False
 
 
+_INPUT_KINDS = frozenset({"text", "secret", "url", "email", "username", "otp", "number", "choice"})
+
+
+@dataclass(frozen=True)
+class InputField:
+    id: str
+    label: str
+    kind: str = "text"
+    required: bool = True
+    placeholder: str = ""
+    options: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.kind not in _INPUT_KINDS:
+            raise ValueError(f"unknown input kind {self.kind!r}")
+
+
+@dataclass(frozen=True)
+class InputRequest:
+    request_id: str
+    title: str
+    reason: str
+    fields: tuple[InputField, ...]
+    owner: str
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "title": self.title,
+            "reason": self.reason,
+            "owner": self.owner,
+            "fields": [
+                {
+                    "id": field.id,
+                    "label": field.label,
+                    "kind": field.kind,
+                    "required": field.required,
+                    "placeholder": field.placeholder,
+                    "options": list(field.options),
+                }
+                for field in self.fields
+            ],
+        }
+
+
 class Capability:
     id: str
     tools: list[Tool]
@@ -111,6 +156,20 @@ class Capability:
     def peel_secret(self, account_id: str, text: str) -> str | None:
         return None
 
+    def pending_input(self, account_id: str, conversation_id: str) -> InputRequest | None:
+        return None
+
+    def accept_input(
+        self,
+        account_id: str,
+        conversation_id: str,
+        request_id: str,
+        values: dict[str, str],
+        *,
+        cancel: bool = False,
+    ) -> SecretAccepted | None:
+        return None
+
     def due(self, now: datetime) -> list[DueWork]:
         return []
 
@@ -134,12 +193,25 @@ class Registry:
             self._names[tool.name] = capability.id
         self._capabilities.append(capability)
 
+    def claim_names(self, capability_id: str, names: list[str]) -> None:
+        """Register dynamic tool names (for example MCP). Refuses collisions."""
+        for name in names:
+            prior = self._names.get(name)
+            if prior is not None and prior != capability_id:
+                raise ValueError(f"duplicate tool name {name!r} from {capability_id!r} and {prior!r}")
+            self._names[name] = capability_id
+
+    def release_names(self, capability_id: str, names: list[str]) -> None:
+        for name in names:
+            if self._names.get(name) == capability_id:
+                del self._names[name]
+
     def for_account(self, account_id: str) -> list[Capability]:
         return [capability for capability in self._capabilities if capability.visible_to(account_id)]
 
     def resolve(self, account_id: str, tool_name: str) -> tuple[Capability, Tool]:
         for capability in self.for_account(account_id):
-            for tool in capability.tools:
+            for tool in capability.available_tools(account_id):
                 if tool.name == tool_name:
                     return capability, tool
         raise KeyError(tool_name)
@@ -172,6 +244,30 @@ class Registry:
         for capability in self.for_account(account_id):
             lines.extend(capability.guidance(account_id, text))
         return lines
+
+    def pending_input(self, account_id: str, conversation_id: str) -> InputRequest | None:
+        for capability in self.for_account(account_id):
+            found = capability.pending_input(account_id, conversation_id)
+            if found is not None:
+                return found
+        return None
+
+    def accept_input(
+        self,
+        account_id: str,
+        conversation_id: str,
+        request_id: str,
+        values: dict[str, str],
+        *,
+        cancel: bool = False,
+    ) -> SecretAccepted | None:
+        for capability in self.for_account(account_id):
+            accepted = capability.accept_input(
+                account_id, conversation_id, request_id, values, cancel=cancel
+            )
+            if accepted is not None:
+                return accepted
+        return None
 
 
 def render_records(

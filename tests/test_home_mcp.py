@@ -1,0 +1,250 @@
+"""Input requests, Home Assistant, and MCP setup."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+from robin.capabilities.ask import Ask
+from robin.capabilities.bills import Bills
+from robin.capabilities.home import Home
+from robin.capabilities.mcp import Mcp
+from robin.capability import InputField, InputRequest
+from robin.loop import converse
+from robin.model import ModelTurn, ToolCall
+from robin.policy import Task
+from robin.session import Assistant
+from robin.store import HouseholdStore
+from robin.vault import new_key
+
+
+class Scripted:
+    def __init__(self, turns: list[ModelTurn]) -> None:
+        self.turns = list(turns)
+        self.seen: list[tuple[list[dict], list[str]]] = []
+
+    def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
+        self.seen.append((messages, [tool["name"] for tool in tools]))
+        return self.turns.pop(0)
+
+
+class FakeHA:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self.states = [
+            {
+                "entity_id": "light.kitchen",
+                "state": "off",
+                "attributes": {"friendly_name": "Kitchen", "brightness": 0},
+            },
+            {
+                "entity_id": "lock.front",
+                "state": "locked",
+                "attributes": {"friendly_name": "Front door"},
+            },
+            {
+                "entity_id": "cover.garage",
+                "state": "closed",
+                "attributes": {"friendly_name": "Garage", "device_class": "garage"},
+            },
+            {
+                "entity_id": "person.ada",
+                "state": "home",
+                "attributes": {"friendly_name": "Ada"},
+            },
+            {
+                "entity_id": "media_player.living",
+                "state": "idle",
+                "attributes": {"friendly_name": "Living room"},
+            },
+        ]
+
+    def __call__(self, creds: dict, method: str, path: str, body: dict | None = None):
+        self.calls.append((method, path, body))
+        if path == "/api/config":
+            return {"version": "2024.1.0"}
+        if path == "/api/states":
+            return list(self.states)
+        if path.startswith("/api/states/"):
+            entity_id = path.rsplit("/", 1)[-1]
+            for item in self.states:
+                if item["entity_id"] == entity_id:
+                    return item
+            return {"entity_id": entity_id, "state": "unknown", "attributes": {}}
+        if path == "/api/template":
+            return "kitchen|light.kitchen,;hall|lock.front,;"
+        if path.startswith("/api/services/"):
+            return {}
+        return {}
+
+
+class FakeMcpSession:
+    def __init__(self, tools: list[dict] | None = None) -> None:
+        self._tools = tools or [
+            {"name": "search", "description": "Search things", "readOnlyHint": True, "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "delete", "description": "Delete things", "destructiveHint": True, "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        self.calls: list[tuple[str, dict]] = []
+
+    def list_tools(self) -> list[dict]:
+        return list(self._tools)
+
+    def call_tool(self, name: str, arguments: dict) -> str:
+        self.calls.append((name, arguments))
+        return f"ok:{name}"
+
+
+def test_ask_person_returns_input_status() -> None:
+    assistant = Assistant()
+    ask = Ask()
+    assistant.add(ask)
+    model = Scripted([ModelTurn("", (ToolCall("ask_person", {"title": "Name", "fields": [{"id": "name", "label": "Name", "kind": "text"}]}),))])
+    reply = converse(assistant, Task("ada", "t", "ask my name"), model)
+    assert reply.status == "input"
+    assert reply.input is not None
+    assert reply.input.fields[0].id == "name"
+
+
+def test_input_secrets_never_reach_turns(tmp_path: Path) -> None:
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    assistant = Assistant(store=store)
+    home = Home(broker=assistant.broker, store=store, call=FakeHA())
+    assistant.add(home)
+    home.invoke("ada", "home_connect", {"url": "http://ha.local:8123"})
+    pending = home.pending_input("ada", "t")
+    assert pending is not None
+    accepted = home.accept_input("ada", "t", pending.request_id, {"token": "super-secret-token"})
+    assert accepted is not None
+    assert "super-secret-token" not in (accepted.resume or "")
+    store.append_turn("ada", "t", "user", "provided: Access token")
+    turns = store.turns("ada", "t")
+    blob = str(turns)
+    assert "super-secret-token" not in blob
+
+
+def test_home_set_and_secure(tmp_path: Path) -> None:
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    ha = FakeHA()
+    assistant = Assistant(store=store)
+    home = Home(broker=assistant.broker, store=store, call=ha)
+    assistant.add(home)
+    assistant.broker.put("ada", "homeassistant", '{"url":"http://ha.local:8123","token":"t"}')
+    assert "Use home_secure" in home.invoke("ada", "home_set", {"entity_id": "lock.front", "state": "unlocked"})
+    held = assistant.invoke("ada", "t", "home_secure", {"entity_id": "lock.front", "state": "unlocked"})
+    assert held["status"] == "confirm"
+    done = assistant.invoke(
+        "ada", "t", "home_secure", {"entity_id": "lock.front", "state": "unlocked"}, confirmed=True
+    )
+    assert done["status"] == "done"
+    assert any(path.endswith("/lock/unlock") for _m, path, _b in ha.calls)
+    garage = assistant.invoke("ada", "t", "home_set", {"entity_id": "cover.garage", "state": "open"})
+    assert "home_secure" in garage["result"]
+
+
+def test_home_list_filters_area(tmp_path: Path) -> None:
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    ha = FakeHA()
+    home = Home(broker=None, store=store, call=ha)
+    # Inject creds via monkey by setting broker on a tiny stub.
+    class B:
+        def reveal(self, account_id: str, name: str) -> str:
+            return '{"url":"http://ha.local:8123","token":"t"}'
+
+    home.broker = B()
+    result = home.invoke("ada", "home_list", {"area": "kitchen"})
+    assert hasattr(result, "records")
+    assert result.records and result.records[0]["entity_id"] == "light.kitchen"
+
+
+def test_home_rule_fires_on_change(tmp_path: Path) -> None:
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    ha = FakeHA()
+
+    class B:
+        def reveal(self, account_id: str, name: str) -> str:
+            return '{"url":"http://ha.local:8123","token":"t"}'
+
+    home = Home(broker=B(), store=store, call=ha)
+    home.invoke(
+        "ada",
+        "home_rule_add",
+        {"entity_id": "person.ada", "from_state": "home", "to_state": "not_home", "action": "turn off lights"},
+    )
+    # Prime last state.
+    home._last["ada"] = {"person.ada": "home"}
+    ha.states[3]["state"] = "not_home"
+    due = home.due(datetime.now(timezone.utc))
+    assert len(due) == 1
+    assert due[0].text == "turn off lights"
+    # Same state again should not re-fire.
+    due2 = home.due(datetime.now(timezone.utc))
+    assert due2 == []
+
+
+def test_mcp_chat_setup_and_tools() -> None:
+    assistant = Assistant()
+    session = FakeMcpSession()
+
+    def open_session(config: dict):
+        return session
+
+    mcp = Mcp(broker=assistant.broker, registry=assistant.registry, open_session=open_session, admins={"ada"})
+    assistant.add(mcp)
+    assert "Draft" in mcp.invoke("ada", "mcp_setup_start", {"name": "notes", "transport": "http", "url": "https://mcp.example/sse"})
+    ask = mcp.invoke("ada", "mcp_setup_ask_secret", {"name": "notes", "kind": "bearer"})
+    assert "Ask the person" in ask
+    pending = mcp.pending_input("ada", "t")
+    assert pending is not None
+    mcp.accept_input("ada", "t", pending.request_id, {"token": "tok"})
+    tested = mcp.invoke("ada", "mcp_setup_test", {"name": "notes"})
+    assert "2 tool(s)" in tested
+    finished = assistant.invoke(
+        "ada",
+        "t",
+        "mcp_setup_finish",
+        {"name": "notes", "trust": "ask"},
+        confirmed=True,
+        for_model=True,
+    )
+    assert "activated" in finished["result"]
+    names = {tool["name"] for tool in assistant.tools("ada")}
+    assert "mcp_notes_search" in names
+    assert "mcp_notes_delete" in names
+    # delete is destructive → confirm
+    held = assistant.invoke("ada", "t", "mcp_notes_delete", {}, for_model=True)
+    assert held["status"] == "confirm"
+    # other account does not see tools
+    other = {tool["name"] for tool in assistant.tools("bea")}
+    assert "mcp_notes_search" not in other
+
+
+def test_mcp_stdio_refused_for_non_admin() -> None:
+    mcp = Mcp(admins={"root"})
+    result = mcp.invoke("ada", "mcp_setup_start", {"name": "local", "transport": "stdio", "command": "npx"})
+    assert "admins" in result
+
+
+def test_bills_scan_parses_invoice() -> None:
+    class FakeMail:
+        def invoke(self, account_id: str, tool_name: str, arguments: dict):
+            from robin.capability import Result
+
+            return Result(
+                records=[
+                    {
+                        "from": "Power Co",
+                        "subject": "Faktura",
+                        "body": "Forfall: 2026-10-15 beløp kr 1 234,50 KID: 12345678901",
+                    }
+                ]
+            )
+
+    class B:
+        def reveal(self, account_id: str, name: str) -> str:
+            return "x"
+
+    bills = Bills(mail=FakeMail(), broker=B())
+    result = bills.invoke("ada", "bills_scan", {"days": 30})
+    assert hasattr(result, "records")
+    assert result.records[0]["amount"]
+    assert "kid" not in result.records[0]

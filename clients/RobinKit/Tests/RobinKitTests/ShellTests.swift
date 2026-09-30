@@ -93,6 +93,46 @@ struct ShellTests {
         #expect(await shell.phase == .ready(threads: ["desk"], reply: "hello"))
     }
 
+    @Test func inputFormSubmitsAndCancels() async throws {
+        let inputJSON = #"{"status":"input","text":"Enter the token.","route":"local","tool":null,"input":{"request_id":"req-1","title":"Home Assistant","reason":"Enter the token.","owner":"home","fields":[{"id":"token","label":"Access token","kind":"secret","required":true,"placeholder":"","options":[]}]}}"#
+        let transport = ScriptedTransport(responses: [
+            raw(200, #"{"token":"sess-1"}"#),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, #"{"enabled":false}"#),
+            raw(200, inputJSON),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, #"{"status":"reply","text":"connected","route":"local","tool":null}"#),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, inputJSON),
+            raw(200, #"{"threads":["home"]}"#),
+            raw(200, #"{"status":"reply","text":"cancelled","route":"local","tool":null}"#),
+            raw(200, #"{"threads":["home"]}"#),
+        ])
+        let shell = Shell(transport: transport)
+        try await shell.signIn(instance: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", password: "pw")
+        try await shell.send(conversationID: "home", text: "connect ha")
+        guard case .input(let threads, let prompt, let request) = await shell.phase else {
+            Issue.record("expected input phase")
+            return
+        }
+        #expect(threads == ["home"])
+        #expect(prompt == "Enter the token.")
+        #expect(request.requestID == "req-1")
+        #expect(request.fields.first?.kind == "secret")
+        try await shell.submitInput(conversationID: "home", requestID: "req-1", values: ["token": "secret-token"])
+        #expect(await shell.phase == .ready(threads: ["home"], reply: "connected"))
+        let calls = await transport.calls
+        let submit = String(decoding: calls[5].body ?? Data(), as: UTF8.self)
+        #expect(submit.contains("\"request_id\":\"req-1\""))
+        #expect(submit.contains("secret-token"))
+        try await shell.send(conversationID: "home", text: "again")
+        try await shell.cancelInput(conversationID: "home", requestID: "req-1")
+        #expect(await shell.phase == .ready(threads: ["home"], reply: "cancelled"))
+        let cancelCall = await transport.calls.reversed().first(where: { $0.body != nil })
+        let cancelBody = String(decoding: cancelCall?.body ?? Data(), as: UTF8.self)
+        #expect(cancelBody.contains("\"cancel\":true"))
+    }
+
     @Test func connectingAMailboxDoesNotKeepThePassword() async throws {
         let transport = ScriptedTransport(responses: [
             raw(200, #"{"token":"sess-1"}"#),
@@ -143,6 +183,8 @@ struct ShellTests {
         #expect(source.contains("import RobinKit"))
         #expect(source.contains("import SwiftUI"))
         #expect(source.contains("SecureField"))
+        #expect(source.contains("InputFormView"))
+        #expect(source.contains("submitInput"))
         #expect(source.contains("Connect mail"))
         #expect(source.contains("Connect calendar"))
         #expect(source.contains("Check mail and calendar"))

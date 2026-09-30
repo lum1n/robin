@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from robin.capabilities.ask import Ask
+from robin.capabilities.bills import Bills
 from robin.capabilities.browser import Browser, Desk, open_chromium
 from robin.capabilities.calendar import CalDAV, Calendar
 from robin.capabilities.contacts import CardDAV, Contacts
@@ -15,6 +17,7 @@ from robin.capabilities.history import History
 from robin.capabilities.home import Home
 from robin.capabilities.jobs import Jobs
 from robin.capabilities.mail import ImapMailbox, Mail
+from robin.capabilities.mcp import Mcp, load_household_mcp
 from robin.capabilities.memory import Memory
 from robin.capabilities.notify import Notify
 from robin.capabilities.photos import Photos
@@ -55,16 +58,18 @@ def _can_use(path: Path) -> bool:
     return os.access(path, os.W_OK)
 
 
-def install(assistant: Assistant) -> None:
+def install(assistant: Assistant, *, mcp_config: str = "") -> None:
     root = files_root(assistant)
     root.mkdir(parents=True, exist_ok=True)
     workspace = Workspace(root, volume=Path("/"))
-    assistant.add(Mail(ImapMailbox(assistant.broker)))
+    mail = Mail(ImapMailbox(assistant.broker))
+    assistant.add(mail)
     browser = Browser(desk=Desk(open_chromium, profiles=root), broker=assistant.broker)
     assistant.add(Calendar(CalDAV(assistant.broker)))
     assistant.add(Contacts(CardDAV(assistant.broker)))
     assistant.add(Lists(store=assistant.store))
     assistant.add(Jobs(store=assistant.store))
+    assistant.add(Ask())
     memory = Memory(store=assistant.store)
     assistant.add(memory)
     skills = Skills(store=assistant.store)
@@ -74,11 +79,21 @@ def install(assistant: Assistant) -> None:
     assistant.add(Notify(store=assistant.store))
     assistant.add(browser)
     assistant.add(Desktop())
-    assistant.add(Files(workspace))
+    assistant.add(Files(workspace, store=assistant.store))
     assistant.add(Photos(workspace, store=assistant.store))
     assistant.add(Terminal(ShellBox(root)))
     assistant.add(Web(broker=assistant.broker))
     assistant.add(Weather())
     assistant.add(Transit())
-    assistant.add(Home(broker=assistant.broker))
+    assistant.add(Home(broker=assistant.broker, store=assistant.store))
+    assistant.add(Bills(mail=mail, broker=assistant.broker, store=assistant.store))
+    household, admins = load_household_mcp(mcp_config) if mcp_config else ([], set())
+    mcp = Mcp(
+        broker=assistant.broker,
+        store=assistant.store,
+        registry=assistant.registry,
+        household=household,
+        admins=admins,
+    )
+    assistant.add(mcp)
     skills.known_tools = set(assistant.registry._names)

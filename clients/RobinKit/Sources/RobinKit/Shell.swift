@@ -6,6 +6,7 @@ public enum ShellPhase: Equatable, Sendable {
     case ready(threads: [String], reply: String?)
     case confirm(threads: [String], prompt: String, tool: String)
     case handoff(threads: [String], prompt: String, liveURL: String)
+    case input(threads: [String], prompt: String, request: InputRequest)
 }
 
 public actor Shell {
@@ -105,6 +106,18 @@ public actor Shell {
         }
     }
 
+    public func submitInput(conversationID: String, requestID: String, values: [String: String]) async throws {
+        let current = try signedIn()
+        let reply = try await current.submitInput(conversationID: conversationID, requestID: requestID, values: values)
+        try await show(reply, on: current)
+    }
+
+    public func cancelInput(conversationID: String, requestID: String) async throws {
+        let current = try signedIn()
+        let reply = try await current.cancelInput(conversationID: conversationID, requestID: requestID)
+        try await show(reply, on: current)
+    }
+
     private func isTimeout(_ error: Error) -> Bool {
         if let urlError = error as? URLError, urlError.code == .timedOut {
             return true
@@ -132,6 +145,8 @@ public actor Shell {
             phase = .confirm(threads: threads, prompt: reply.text, tool: reply.tool ?? "")
         } else if reply.status == "handoff" {
             phase = .handoff(threads: threads, prompt: reply.text, liveURL: reply.liveURL ?? "")
+        } else if reply.status == "input", let request = reply.input {
+            phase = .input(threads: threads, prompt: reply.text, request: request)
         } else {
             phase = .ready(threads: threads, reply: reply.text)
         }

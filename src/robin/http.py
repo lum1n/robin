@@ -75,6 +75,8 @@ def dispatch(
         return _post_profile(service, headers, body)
     if method == "GET" and path == "/v1/profile":
         return _get_profile(service, headers, query)
+    if method == "GET" and path == "/v1/mcp":
+        return _get_mcp(service, headers, query)
     if method == "POST" and path == "/v1/private":
         return _post_private(service, headers, body)
     if method == "GET" and path == "/v1/private":
@@ -303,6 +305,9 @@ def _post_message(service: Service, headers: dict[str, str], body: dict[str, Any
         except PendingMissing:
             return 409, {"error": "nothing to confirm"}
         return 200, _public_reply(reply)
+    incoming = body.get("input")
+    if isinstance(incoming, dict) and incoming.get("request_id"):
+        return _post_input(service, account_id, conversation_id, incoming, body)
     service.assistant.clear_pending(account_id, conversation_id)
     ner = service.assistant.ner
     if getattr(ner, "_installed", False) and not ner.available():
@@ -320,6 +325,54 @@ def _post_message(service: Service, headers: dict[str, str], body: dict[str, Any
             text=str(body.get("text") or ""),
             allow_cloud=bool(body.get("allow_cloud")),
             free_text=bool(body.get("free_text")),
+        ),
+        service.model,
+    )
+    return 200, _public_reply(reply)
+
+
+def _post_input(
+    service: Service,
+    account_id: str,
+    conversation_id: str,
+    incoming: dict[str, Any],
+    body: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    request_id = str(incoming.get("request_id") or "")
+    cancel = incoming.get("cancel") is True
+    raw_values = incoming.get("values") if isinstance(incoming.get("values"), dict) else {}
+    values = {str(key): str(value) for key, value in raw_values.items()}
+    pending = service.assistant.pending_input(account_id, conversation_id)
+    if pending is None or pending.request_id != request_id:
+        return 409, {"error": "nothing to fill in"}
+    labels = [field.label for field in pending.fields if field.id in values and str(values[field.id]).strip()]
+    accepted = service.assistant.accept_input(
+        account_id, conversation_id, request_id, values, cancel=cancel
+    )
+    if accepted is None:
+        return 409, {"error": "nothing to fill in"}
+    if labels and not cancel and service.assistant.store is not None:
+        service.assistant.store.append_turn(
+            account_id,
+            conversation_id,
+            "user",
+            "provided: " + ", ".join(labels),
+        )
+    if accepted.reply and not accepted.resume:
+        return 200, {
+            "status": "reply",
+            "text": accepted.reply,
+            "route": "local",
+            "timing": "",
+        }
+    reply = converse(
+        service.assistant,
+        Task(
+            account_id=account_id,
+            conversation_id=conversation_id,
+            text=accepted.resume or "continue",
+            allow_cloud=bool(body.get("allow_cloud", accepted.allow_cloud)),
+            free_text=bool(body.get("free_text", accepted.free_text)),
         ),
         service.model,
     )
@@ -451,6 +504,20 @@ def _get_profile(service: Service, headers: dict[str, str], query: dict[str, str
         return denied
     fields = service.assistant.get_profile(account_id)
     return 200, {"fields": fields, "present": filled_keys(fields)}
+
+
+def _get_mcp(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    account_id = query.get("account_id")
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    servers: list[dict[str, Any]] = []
+    for capability in service.assistant.registry.for_account(account_id or ""):
+        summary = getattr(capability, "summary", None)
+        if callable(summary) and getattr(capability, "id", "") == "mcp":
+            servers = summary(account_id)
+            break
+    return 200, {"servers": servers}
 
 
 def _post_private(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -638,4 +705,7 @@ def _public_reply(reply: Any) -> dict[str, Any]:
     live = getattr(reply, "live_url", "") or ""
     if live:
         payload["live_url"] = live
+    request = getattr(reply, "input", None)
+    if request is not None and hasattr(request, "public"):
+        payload["input"] = request.public()
     return payload
