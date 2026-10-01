@@ -25,6 +25,36 @@ actor ScriptedTransport: RobinTransport {
 }
 
 struct ClientTests {
+    @Test func requestAddsThisAccountAndRefusesOtherPaths() async throws {
+        let transport = ScriptedTransport(responses: [
+            RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"name":"oda"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"servers":[]}"#.utf8)),
+            RobinRaw(status: 400, data: Data(#"{"error":"only household admins"}"#.utf8)),
+        ])
+        let client = RobinClient(baseURL: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", transport: transport)
+        try await client.login(password: "correct-horse")
+        let added = try await client.request(
+            method: "POST",
+            path: "/v1/mcp/add",
+            json: Data(#"{"docs_url":"https://github.com/o/r","account_id":"bea"}"#.utf8)
+        )
+        #expect(String(decoding: added, as: UTF8.self).contains("oda"))
+        _ = try await client.request(method: "GET", path: "/v1/mcp")
+        await #expect(throws: RobinFailure.self) {
+            try await client.request(method: "POST", path: "/v1/mcp/add", json: nil)
+        }
+        await #expect(throws: RobinFailure.self) {
+            try await client.request(method: "GET", path: "/admin")
+        }
+        let calls = await transport.calls
+        let sent = String(decoding: calls[1].body ?? Data(), as: UTF8.self)
+        #expect(sent.contains("\"account_id\":\"ada\"") && sent.contains("docs_url"))
+        #expect(calls[1].token == "sess-1")
+        #expect(calls[2].url.absoluteString == "http://127.0.0.1:8787/v1/mcp?account_id=ada")
+        #expect(calls.count == 4)
+    }
+
     @Test func loginThenSendUsesTheSessionAndNotAModel() async throws {
         let transport = ScriptedTransport(responses: [
             RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),

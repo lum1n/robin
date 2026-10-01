@@ -369,6 +369,26 @@ def test_thread_history_is_sent_redacted(tmp_path) -> None:
     assert "[PERSON_1]" in prompt or "hello" in prompt
 
 
+def test_history_drops_unconfirmed_tool_calls(tmp_path) -> None:
+    from robin.loop import _history
+    from robin.store import HouseholdStore
+    from robin.vault import new_key
+
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    assistant = Assistant(ner=StubNer(), store=store)
+    store.append_turn("ada", "t", "user", "cheapest fuel nearby?")
+    store.append_turn(
+        "ada", "t", "confirm", 'Confirm mcp_tavily_tavily_research before Robin does it. {"topic": "cheapest fuel"}'
+    )
+    store.append_turn("ada", "t", "reply", "Prices vary. I can remember how I did this on example.com for next time.")
+    text = _history(
+        assistant, Task("ada", "t", "answer in English", allow_cloud=True), assistant.vaults.get("ada", "t"), (), assistant.ner
+    )
+    assert "mcp_tavily_tavily_research" not in text
+    assert "I can remember" not in text
+    assert "robin: Prices vary." in text
+
+
 def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     from robin.loop import _history
     from robin.store import HouseholdStore

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,6 +13,19 @@ from robin.vault import Vault
 
 _GUIDANCE_CHARS = 1500
 _KINDS = frozenset({"preference", "correction", "fact"})
+_SITE = re.compile(r"(?<![\w@.-])(?:https?://)?(?:www\.)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?![\w-])", re.IGNORECASE)
+
+
+def _sites(text: str) -> list[str]:
+    return [match.group(1).casefold() for match in _SITE.finditer(text)]
+
+
+def _site_named(site: str, haystack: str) -> bool:
+    """finn.no matches "finn.no" or the bare brand "finn" in the task text."""
+    if site in haystack:
+        return True
+    stem = site.split(".", 1)[0]
+    return len(stem) >= 3 and re.search(r"(?<!\w)" + re.escape(stem) + r"(?!\w)", haystack) is not None
 
 
 def _now() -> str:
@@ -168,6 +182,10 @@ class Memory(Capability):
         for row in self._facts.get(account_id, []):
             tags = [str(tag) for tag in row.get("tags") or []]
             if tags and not any(tag.casefold() in haystack for tag in tags):
+                continue
+            # A lesson about one site (finn.no) must not steer tasks on another site.
+            sites = _sites(str(row.get("text") or ""))
+            if not tags and sites and not any(_site_named(site, haystack) for site in sites):
                 continue
             ranked.append(row)
         ranked.sort(

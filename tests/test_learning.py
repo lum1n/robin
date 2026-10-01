@@ -74,6 +74,33 @@ def test_tagged_lesson_only_when_relevant(tmp_path: Path) -> None:
     assert "filters" in selected[0]["text"]
 
 
+def test_untagged_site_lesson_only_for_that_site() -> None:
+    memory = Memory(facts={"ada": []})
+    memory.invoke("ada", "lesson_save", {"text": "Search car models by year on finn.no"})
+    memory.invoke("ada", "lesson_save", {"text": "Always use the tavily mcp for web searches"})
+    other = [row["text"] for row in memory.select("ada", "search prisjakt.no for a TV")]
+    assert other == ["Always use the tavily mcp for web searches"]
+    assert len(memory.select("ada", "find a Golf on finn")) == 2
+    assert len(memory.select("ada", "search https://www.finn.no/bap for bikes")) == 2
+
+
+def test_lesson_placeholders_share_the_conversation_vault() -> None:
+    from robin.airlock import VocabularyTerm
+
+    assistant = Assistant()
+    assistant.add(Memory(facts={"ada": []}))
+    assistant.set_vocabulary("ada", (VocabularyTerm("Jane Doe"), VocabularyTerm("Bob Berg")))
+    assistant.registry._capabilities[-1].invoke("ada", "lesson_save", {"text": "Jane Doe likes short replies"})
+    model = Scripted([ModelTurn("ok")])
+    converse(assistant, Task("ada", "t", "ask Bob Berg, then Jane Doe"), model)
+    messages = model.seen[0][0]
+    vault = assistant.vaults.get("ada", "t")
+    jane = vault.token("PERSON", "Jane Doe")
+    assert f"{jane} likes short replies" in _system(messages)
+    assert jane in messages[1]["content"]
+    assert vault.restore(jane) == "Jane Doe"
+
+
 def test_guidance_cap_prefers_hits(tmp_path: Path) -> None:
     rows = []
     for index in range(40):

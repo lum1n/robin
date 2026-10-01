@@ -77,6 +77,8 @@ def dispatch(
         return _get_profile(service, headers, query)
     if method == "GET" and path == "/v1/mcp":
         return _get_mcp(service, headers, query)
+    if method == "POST" and path in _MCP_ACTIONS:
+        return _post_mcp(service, headers, body, path.removeprefix("/v1/mcp/"))
     if method == "GET" and path == "/v1/status":
         return _get_status(service, headers, query)
     if method == "GET" and path == "/v1/mcp/oauth/callback":
@@ -582,12 +584,30 @@ def _get_mcp(service: Service, headers: dict[str, str], query: dict[str, str]) -
     if denied is not None:
         return denied
     servers: list[dict[str, Any]] = []
+    admin = False
     for capability in service.assistant.registry.for_account(account_id or ""):
         summary = getattr(capability, "summary", None)
         if callable(summary) and getattr(capability, "id", "") == "mcp":
             servers = summary(account_id)
+            admin = account_id in getattr(capability, "admins", set())
             break
-    return 200, {"servers": servers}
+    return 200, {"servers": servers, "admin": admin}
+
+
+_MCP_ACTIONS = frozenset(f"/v1/mcp/{action}" for action in ("add", "test", "input", "finish", "tools", "remove"))
+
+
+def _post_mcp(
+    service: Service, headers: dict[str, str], body: dict[str, Any], action: str
+) -> tuple[int, dict[str, Any]]:
+    account_id = body.get("account_id")
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    capability = _mcp_capability(service)
+    if capability is None or not callable(getattr(capability, "manage", None)):
+        return 404, {"error": "MCP is not enabled."}
+    return capability.manage(str(account_id), action, body)
 
 
 def _get_status(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:

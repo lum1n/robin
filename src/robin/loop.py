@@ -29,6 +29,7 @@ from robin.learning import (
 from robin.model import Model, ToolCall
 from robin.policy import Route, Task
 from robin.session import Assistant
+from robin.vault import Vault
 
 SYSTEM = (
     "You are Robin, a household assistant. "
@@ -50,6 +51,8 @@ SYSTEM = (
     "Robin will ask for secrets through a secure form. "
     "When the person names a website or URL (vg.no, finn.no, https://…), browser_open that host "
     "and finish the task on the page — do not use web_search as a substitute for opening the site. "
+    "The site the latest Person line names always wins: never switch to a site from earlier turns, "
+    "lessons, or skills, and if the open page is a different host, browser_open the named one first. "
     "calendar_* tools are only this account's own calendar, not a third-party booking site. "
     "For reminders ('remind me …', 'an hour before …'), use jobs_add with at or in_minutes; "
     "notify_person only sends now. Never say a reminder is set unless jobs_add saved it. "
@@ -78,6 +81,8 @@ SYSTEM = (
     "When the Person line names a site as [ORG_n], pass that placeholder to browser_open — do not invent another host. "
     "The latest Person line is the current task. Conversation history is context only — "
     "do not resume an earlier website, news, or booking task unless the person asks again. "
+    "Only call tools the latest Person line needs; never repeat a search, lookup, or action "
+    "from earlier turns unless the person asks for it again. "
     "Greetings and identity questions (who are you, what is Robin) need a short plain-text "
     "answer — do not open websites or search the web for them."
 )
@@ -225,7 +230,7 @@ def _converse(
         spoken = _release(task.text, vault, vocabulary, ner, free_text=task.free_text)
         history = _history(assistant, task, vault, vocabulary, ner)
         messages = [
-            {"role": "system", "content": _system(assistant, task.account_id, task.text)},
+            {"role": "system", "content": _system(assistant, task.account_id, task.text, vault=vault)},
             {"role": "user", "content": _user_message(spoken, history)},
         ]
         _trim_messages(messages)
@@ -652,7 +657,7 @@ def _note_repeated_failure(
     return notice, count >= 3
 
 
-def _system(assistant: Assistant, account_id: str, text: str = "") -> str:
+def _system(assistant: Assistant, account_id: str, text: str = "", *, vault: Vault | None = None) -> str:
     now = datetime.now().astimezone()
     stamp = now.strftime("%Y-%m-%d %H:%M %Z")
     lines = [SYSTEM, f"Current local time: {stamp}."]
@@ -666,7 +671,9 @@ def _system(assistant: Assistant, account_id: str, text: str = "") -> str:
         lines.extend(f"- {line}" for line in statuses)
     guidance = assistant.registry.guidance(account_id, text)
     if guidance:
-        vault = assistant.vaults.get(account_id, "guidance")
+        # Share the conversation vault so [ORG_n] in lessons means the same site as in chat.
+        if vault is None:
+            vault = assistant.vaults.get(account_id, "guidance")
         vocabulary = assistant.vocabulary.get(account_id, ())
         # Lessons are checked for secrets at save time; release with free_text=False so
         # missing NER does not turn the whole section into [UNRESOLVED].
@@ -1022,6 +1029,9 @@ def _control_label_for(original: str, entities: tuple) -> str:
     return ""
 
 
+_SITE_OFFER = re.compile(r"\s*I can remember how I did this on \S+ for next time\.")
+
+
 def _history(assistant: Assistant, task: Task, vault, vocabulary, ner) -> str:
     """Recent turns of this conversation, after the airlock. Another conversation stays out."""
     if assistant.store is None:
@@ -1031,7 +1041,11 @@ def _history(assistant: Assistant, task: Task, vault, vocabulary, ner) -> str:
         turns = turns[:-1]
     lines: list[str] = []
     for turn in turns[-_HISTORY_TURNS:]:
-        body = _release(" ".join(turn["text"].split()), vault, vocabulary, ner, free_text=True)
+        if turn["role"] == "confirm":
+            # A new message cancels an unconfirmed action; its JSON arguments read like pending work.
+            continue
+        text = _SITE_OFFER.sub("", " ".join(turn["text"].split())).strip()
+        body = _release(text, vault, vocabulary, ner, free_text=True)
         if len(body) > _TURN_CHARS:
             body = body[:_TURN_CHARS]
         if not body:

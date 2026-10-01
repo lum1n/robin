@@ -231,6 +231,33 @@ public actor RobinClient {
         return nil
     }
 
+    /// JSON call to a `/v1/` route for this account. `json` is an encoded object (or nil);
+    /// `account_id` is added to the query (GET) or body.
+    public func request(method: String, path: String, json: Data? = nil) async throws -> Data {
+        guard path.hasPrefix("/v1/"), !path.contains("..") else {
+            throw RobinFailure(status: 400, message: "bad path")
+        }
+        let verb = method.uppercased()
+        var payload: [String: Any] = [:]
+        if let json, !json.isEmpty {
+            guard let object = try JSONSerialization.jsonObject(with: json) as? [String: Any] else {
+                throw RobinFailure(status: 400, message: "body must be a JSON object")
+            }
+            payload = object
+        }
+        payload["account_id"] = accountID
+        let target: URL
+        var data: Data?
+        if verb == "GET" {
+            target = try url(path: path, query: payload.mapValues { "\($0)" })
+        } else {
+            target = try url(path: path)
+            data = try JSONSerialization.data(withJSONObject: payload)
+        }
+        let raw = try await transport.call(url: target, method: verb, body: data, token: try sessionToken())
+        return try accepted(raw, status: 200)
+    }
+
     private func postMessage(_ body: Data) async throws -> Reply {
         let raw = try await transport.call(
             url: try url(path: "/v1/messages"),

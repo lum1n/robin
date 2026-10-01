@@ -83,6 +83,11 @@ public actor Shell {
         try await signedIn().overview()
     }
 
+    /// Raw JSON call to a `/v1/` route for the signed-in account (for screens such as MCP setup).
+    public func request(method: String, path: String, json: Data? = nil) async throws -> Data {
+        try await signedIn().request(method: method, path: path, json: json)
+    }
+
     /// Thread ids for the signed-in account (empty when signed out throws via signedIn()).
     public func listThreads() async throws -> [String] {
         try await signedIn().threads()

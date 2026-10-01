@@ -225,13 +225,20 @@ def test_mcp_stdio_refused_for_non_admin() -> None:
 
 
 def test_mcp_setup_rejects_directory_page_and_tests_before_asking() -> None:
-    mcp = Mcp(open_session=lambda config: FakeMcpSession(), admins={"ada"})
+    fetched: list[str] = []
+
+    def fetch(url: str) -> str:
+        fetched.append(url)
+        return "<html>Nothing useful here</html>"
+
+    mcp = Mcp(open_session=lambda config: FakeMcpSession(), admins={"ada"}, fetch=fetch)
     refused = mcp.invoke(
         "ada",
         "mcp_setup_start",
         {"name": "oda", "transport": "http", "url": "https://lobehub.com/mcp/kolonialno-oda-mcp"},
     )
-    assert "directory" in refused and "web_fetch" in refused
+    assert fetched == ["https://lobehub.com/mcp/kolonialno-oda-mcp"]
+    assert "No MCP server config found" in refused and "paste" in refused
     assert "oda" not in mcp._drafts.get("ada", {})
     started = mcp.invoke("ada", "mcp_setup_start", {"name": "oda", "transport": "http", "url": "https://mcp.example/mcp"})
     assert "mcp_setup_test now" in started
