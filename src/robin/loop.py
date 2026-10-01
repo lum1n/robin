@@ -51,6 +51,8 @@ SYSTEM = (
     "Robin will ask for secrets through a secure form. "
     "When the person names a website or URL (vg.no, finn.no, https://…), browser_open that host "
     "and finish the task on the page — do not use web_search as a substitute for opening the site. "
+    "A site named without a domain (a store, brand, or service name, or its [ORG_n]) is still a site: "
+    "pass that name to browser_open and Robin finds its website. "
     "The site the latest Person line names always wins: never switch to a site from earlier turns, "
     "lessons, or skills, and if the open page is a different host, browser_open the named one first. "
     "calendar_* tools are only this account's own calendar, not a third-party booking site. "

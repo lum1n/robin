@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urlparse
 
 from robin.capability import (
@@ -1427,6 +1427,8 @@ class Browser(Capability):
         self._once: dict[str, list[str]] = {}
         self._refs: dict[str, dict[str, tuple[str, str]]] = {}
         self._login_notes: dict[str, str] = {}
+        # (account_id, name) -> https URL of that site's homepage; set by install from web search.
+        self.find_site: Callable[[str, str], str | None] | None = None
 
     def accept_secret(self, account_id: str, conversation_id: str, text: str) -> SecretAccepted | None:
         waiting = self._wait(account_id, conversation_id)
@@ -1591,6 +1593,22 @@ class Browser(Capability):
             raise PermissionError(account_id)
         if tool_name == "browser_open":
             url = str(arguments.get("url", ""))
+            bare = _bare_name(url) if _site_alias(url) is None else None
+            # A bare word on an open page may be a choice (clinic); an [ORG_n] the person named is a site.
+            if bare is not None and (arguments.get("named_site") or not self._page_open(account_id)):
+                found = None
+                if self.find_site is not None:
+                    try:
+                        found = self.find_site(account_id, bare)
+                    except Exception:
+                        found = None
+                if found is None:
+                    return (
+                        f"{bare} is a name, not a web address. Find its official website "
+                        "(web_search), then browser_open that host — do not continue on a "
+                        "different site that is already open."
+                    )
+                url = found
             try:
                 url = _web_url(url)
             except ValueError as exc:
@@ -2751,6 +2769,16 @@ def _site_alias(url: str) -> str | None:
     key = re.sub(r"\s+", " ", cleaned.lower())
     key = key.strip("?.!,;:\"'")
     return _SITE_ALIASES.get(key)
+
+
+def _bare_name(url: str) -> str | None:
+    """A site named without a domain (a store or brand name), not a URL or host."""
+    cleaned = url.strip().strip("?.!,;:\"'")
+    if not cleaned or "." in cleaned or "/" in cleaned or ":" in cleaned or _PLACEHOLDER.search(cleaned):
+        return None
+    if len(cleaned.split()) > 4 or len(cleaned) > 60:
+        return None
+    return cleaned
 
 
 def _host_ok(host: str) -> bool:

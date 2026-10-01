@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -366,6 +367,9 @@ class Assistant:
         self.activity.append(account_id, entry)
         if self.store is not None:
             self.store.append_activity(account_id, entry)
+        if tool_name == "browser_open" and _PLACEHOLDER_ONLY.fullmatch(str(arguments.get("url", "")).strip()):
+            # The person named this site (NER tagged it); the browser may resolve a bare name to its website.
+            raw["named_site"] = True
         if (tool.effect is Effect.EXTERNAL or tool.confirm) and not confirmed:
             return {"status": "confirm", "tool": tool_name}
         if (
@@ -412,6 +416,9 @@ class Assistant:
         for account_id, name, value in self.store.load_secrets():
             self.broker._secrets[(account_id, name)] = value
         self.schedules.update(self.store.load_schedules())
+
+
+_PLACEHOLDER_ONLY = re.compile(r"\[[A-Z]+_\d+\]")
 
 
 def _egress_needs_restore(arguments: dict[str, Any], vault: Vault) -> bool:

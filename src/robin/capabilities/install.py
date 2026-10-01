@@ -82,7 +82,9 @@ def install(assistant: Assistant, *, mcp_config: str = "") -> None:
     assistant.add(Files(workspace, store=assistant.store))
     assistant.add(Photos(workspace, store=assistant.store))
     assistant.add(Terminal(ShellBox(root)))
-    assistant.add(Web(broker=assistant.broker))
+    web = Web(broker=assistant.broker)
+    browser.find_site = web.find_site
+    assistant.add(web)
     assistant.add(Weather())
     assistant.add(Transit())
     assistant.add(Home(broker=assistant.broker, store=assistant.store))

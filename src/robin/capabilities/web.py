@@ -7,7 +7,7 @@ import os
 import re
 from html.parser import HTMLParser
 from typing import Any, Protocol
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote_plus, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from robin.capability import Capability, Effect, FieldClass, FieldSpec, Result, Tool
@@ -123,6 +123,14 @@ class Web(Capability):
             text = _readable(body)[:8000]
             return text or "empty page"
         raise NotImplementedError(tool_name)
+
+    def find_site(self, account_id: str, name: str) -> str | None:
+        """Homepage of the site called `name`, from the top search result. Runs on this machine."""
+        for row in self._search(account_id, name):
+            parsed = urlparse(row.get("url") or "")
+            if parsed.scheme in ("http", "https") and parsed.hostname:
+                return f"https://{parsed.hostname}/"
+        return None
 
     def _search(self, account_id: str, query: str) -> list[dict[str, str]]:
         key = ""

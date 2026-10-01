@@ -50,3 +50,10 @@ def test_access_spam_collapses_prior_refusals() -> None:
     )
     assert _bot_block_spam(blocked)
     assert not _access_spam(blocked)
+
+
+def test_find_site_returns_homepage_of_top_result() -> None:
+    def fake(url: str, headers: dict | None = None) -> str:
+        return '{"results": [{"title": "Shop", "url": "https://www.shop.example/no/home?x=1"}]}'
+
+    assert Web(fetch=fake).find_site("ada", "Some Shop") == "https://www.shop.example/"

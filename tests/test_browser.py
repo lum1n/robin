@@ -1508,3 +1508,55 @@ def test_bot_wall_note_flags_captcha_and_empty_iframe() -> None:
 
     ok = "URL: https://example.com/\nTitle: Hi\n\nInteractive:\n[1] link \"Home\"\n\nContent:\nHello"
     assert _bot_wall_note(ok) == ""
+
+
+def test_named_site_without_domain_resolves_even_with_another_page_open() -> None:
+    page = MemoryPage("https://www.finn.no/")
+    browser = Browser("ada", page)
+    asked: list[str] = []
+
+    def find(account_id: str, name: str) -> str | None:
+        asked.append(name)
+        return "https://www.shop.example/"
+
+    browser.find_site = find
+    browser.invoke("ada", "browser_open", {"url": "Some Shop", "named_site": True})
+    assert asked == ["Some Shop"]
+    assert page.text == "https://www.shop.example/"
+
+    # Without the person naming it, a bare word on an open page stays a page choice.
+    result = browser.invoke("ada", "browser_open", {"url": "clinic"})
+    assert asked == ["Some Shop"]
+    assert "browser_click" in result
+
+
+def test_unresolved_site_name_does_not_steer_back_to_open_page() -> None:
+    page = MemoryPage("https://www.finn.no/")
+    browser = Browser("ada", page)
+    browser.find_site = lambda account_id, name: None
+    result = browser.invoke("ada", "browser_open", {"url": "Some Shop", "named_site": True})
+    assert page.text == "https://www.finn.no/"
+    assert "web_search" in result
+    assert "already open" in result
+
+
+def test_session_marks_placeholder_site_as_named(tmp_path) -> None:
+    from robin.capability import Capability, Effect, Tool
+
+    seen: dict = {}
+
+    class Spy(Capability):
+        id = "display"
+        tools = [Tool(name="browser_open", description="", parameters={}, effect=Effect.READ)]
+        fields = ()
+
+        def invoke(self, account_id, tool_name, arguments):
+            seen.update(arguments)
+            return "ok"
+
+    assistant = Assistant()
+    assistant.add(Spy())
+    vault = assistant.vaults.get("ada", "t")
+    token = vault.token("ORG", "Some Shop")
+    assistant.invoke("ada", "t", "browser_open", {"url": token}, confirmed=True)
+    assert seen == {"url": "Some Shop", "named_site": True}
