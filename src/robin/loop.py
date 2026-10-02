@@ -43,6 +43,12 @@ SYSTEM = (
     "Never invent, shorten, change the type of, or reuse references from another conversation. "
     "A blocked reference is not an executed action: obtain a valid reference or ask the person. "
     "[UNRESOLVED] means text was withheld; do not guess its contents. "
+    "Use browser_find or scoped browser_read to discover omitted search/filter/sort controls before scrolling blindly. "
+    "Reach the site's actual search/results page, not just its category landing page. "
+    "Set checkbox filters with browser_set_checked and verify range limits and selected sorting in the new snapshot. "
+    "No observable change is not progress. Try a different justified action after two unchanged attempts. "
+    "Empty, truncated or withheld Content does not mean zero search results. "
+    "Only claim no matches when the page explicitly says so after the requested filters are applied. "
     "Never invent passwords or national IDs. "
     "When the person corrects how you did something or states a lasting preference, call lesson_save "
     "with one imperative line and optional tags (tool names or website hosts). "
@@ -280,6 +286,7 @@ def _converse(
             calls = batch = turn.tool_calls
         nudges: list[dict[str, Any]] = []
 
+        browser_acted = False
         for index, call in enumerate(calls):
             if _superseded():
                 return Reply("reply", "That turn was replaced by a newer message.", decision.route)
@@ -289,13 +296,27 @@ def _converse(
             if problem:
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": problem})
                 continue
-            outcome = assistant.invoke(
-                task.account_id,
-                task.conversation_id,
-                call.name,
-                call.arguments,
-                for_model=True,
-            )
+            repeat_key = json.dumps({"name": call.name, "arguments": call.arguments}, sort_keys=True, default=str)
+            if repeats.get(repeat_key, 0) >= 4 and call.name.startswith("browser_"):
+                return Reply("reply", "The browser made no progress after repeated actions. "
+                             "I could not verify the requested filters or results.", decision.route)
+            browser_action = call.name.startswith("browser_") and call.name not in {"browser_read", "browser_find"}
+            if browser_acted and browser_action:
+                outcome = {"status": "error", "result": (
+                    "Action blocked: inspect the preceding browser result before another action. "
+                    "Request this action in the next turn using its current Interactive refs."
+                )}
+            elif repeats.get(repeat_key, 0) >= 2 and call.name.startswith("browser_"):
+                outcome = {"status": "error", "result": (
+                    "Action blocked: repeated operation made no progress. "
+                    "Use browser_find, scoped browser_read, or a different current control; "
+                    "the requested filters/results have not been verified."
+                )}
+            else:
+                browser_acted = browser_acted or browser_action
+                outcome = assistant.invoke(
+                    task.account_id, task.conversation_id, call.name, call.arguments, for_model=True,
+                )
             if outcome["status"] == "confirm":
                 # Resume re-adds this assistant turn, the results so far, and runs the rest.
                 prior, pending_calls, done = _split_batch(messages, assistant_index, batch)
@@ -347,8 +368,14 @@ def _converse(
                 )
                 return _after_turn(assistant, task, model, reply, trace)
             result = _release_result(outcome["result"], vault, vocabulary, ner)
+            action_lead = result.split("\nURL:", 1)[0] if not result.startswith("URL:") else ""
+            if any(line.startswith(("changed: url ", "changed: popup opened",
+                                    "changed: page closed", "changed: dialog open",
+                                    "changed: control state changed"))
+                   for line in action_lead.splitlines()):
+                repeats.clear()
             if len(result) > _TOOL_RESULT_CHARS:
-                result = result[:_TOOL_RESULT_CHARS]
+                result = _bound_tool_result(result)
             _mark_tainted(call.name)
             failed = outcome["status"] == "error" or is_tool_failure(result)
             trace.note_call(call.name, call.arguments, result, failed=failed)
@@ -637,8 +664,11 @@ def _note_repeated_failure(
 ) -> tuple[str, bool]:
     """Detect identical failing tool calls so the model stops retrying the same dead end."""
     line = (result or "").strip().splitlines()[0].strip() if result else ""
+    lead = result.split("\nURL:", 1)[0] if not result.startswith("URL:") else ""
     failed = bool(line) and (
-        bool(_FAILURE_LEAD.match(line))
+        "no observable change" in lead
+        or line.startswith("Action blocked: repeated operation")
+        or bool(_FAILURE_LEAD.match(line))
         or "not clickable" in line.lower()
         or "gone or not clickable" in line.lower()
         or "could not be clicked" in line.lower()
@@ -655,11 +685,10 @@ def _note_repeated_failure(
     if count < 2:
         return result, False
     notice = (
-        f"{line}\n"
         "Same action failed again — do not retry these arguments. "
         "browser_read or pick a different Interactive ref."
     )
-    return notice, count >= 3
+    return f"{result}\n{notice}", count >= 3
 
 
 def _system(assistant: Assistant, account_id: str, text: str = "", *, vault: Vault | None = None) -> str:
@@ -718,10 +747,16 @@ def _user_message(spoken: str, history: str) -> str:
 
 def _trim_messages(messages: list[dict[str, Any]]) -> None:
     """Keep the transcript under budget by eliding the oldest tool results first."""
+    latest_page = next(
+        (message for message in reversed(messages)
+         if message.get("role") == "tool" and "Interactive:" in str(message.get("content") or "")),
+        None,
+    )
     while _size(messages) > _MODEL_CHARS:
         elided = False
         for message in messages:
-            if message.get("role") == "tool" and message.get("content") != "[result elided]":
+            if (message is not latest_page and message.get("role") == "tool"
+                    and message.get("content") != "[result elided]"):
                 if len(str(message.get("content") or "")) > 40:
                     message["content"] = "[result elided]"
                     elided = True
@@ -803,6 +838,34 @@ def _release_result(text: str, vault, vocabulary, ner) -> str:
     return _release(text, vault, vocabulary, ner, free_text=True)
 
 
+def _bound_tool_result(text: str) -> str:
+    """Keep whole rows/references and reserve room for observed result content."""
+    if len(text) <= _TOOL_RESULT_CHARS:
+        return text
+    head, separator, content = text.partition("\nContent:\n")
+    notice = (
+        "\n(output omitted; browser_find or scoped browser_read for more)" if separator
+        else "\n(output omitted; request a smaller result)"
+    )
+    if separator:
+        content_lines: list[str] = []
+        for line in content.splitlines():
+            if len("\n".join(content_lines + [line])) > 3500:
+                break
+            content_lines.append(line)
+        tail = separator + "\n".join(content_lines) + notice
+    else:
+        head, tail = text, notice
+    lines: list[str] = []
+    used = len(tail)
+    for line in head.splitlines():
+        if used + len(line) + 1 > _TOOL_RESULT_CHARS:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines) + tail
+
+
 def _release_snapshot(text: str, vault, vocabulary, ner) -> str:
     """Redact a page snapshot with one NER pass for Content and one for control names."""
     lead, page = _split_snapshot(text)
@@ -858,7 +921,7 @@ def _release_snapshot(text: str, vault, vocabulary, ner) -> str:
 
 
 _REF_LINE = re.compile(
-    r'^\[(\d+)\]\s+(\w+)\s+"(.*)"(?:\s+\(([^)]*)\))?\s*$'
+    r'^\[(\d+)\]\s+(\w+)\s+"(.*)"(?:\s+\((.*)\))?\s*$'
 )
 
 
@@ -901,7 +964,13 @@ def _release_control_meta(meta: str, vault, vocabulary, ner) -> str:
                 continue
             parts.append(f"value={safe.replace(chr(34), chr(39))}")
             continue
-        parts.append(bit)
+        if bit in {"dialog", "main", "nav", "header", "page", "checked", "mixed", "expanded",
+                   "collapsed", "selected", "pressed", "invalid", "current", "focused", "disabled"}:
+            parts.append(bit)
+        else:
+            safe = _release(bit, vault, vocabulary, ner, free_text=True)
+            if safe and safe != "[UNRESOLVED]":
+                parts.append(safe)
     return ", ".join(parts)
 
 
@@ -913,7 +982,9 @@ def _release_content_section(lines: list[str], vault, vocabulary, ner) -> list[s
     if not body_lines:
         return list(lines)
     if not ner.available():
-        return [header] if header else []
+        return [header, "(withheld: local privacy detection unavailable)"] if header else [
+            "(withheld: local privacy detection unavailable)"
+        ]
     safe = _release("\n".join(body_lines), vault, vocabulary, ner, free_text=True)
     if not safe or safe == "[UNRESOLVED]":
         from robin.airlock import UNRESOLVED

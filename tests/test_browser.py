@@ -1332,7 +1332,7 @@ def test_stale_ref_click_does_not_fall_through_to_name() -> None:
         assert "do not retry" in str(exc)
 
 
-def test_ref_click_force_when_normal_click_blocked() -> None:
+def test_ref_click_does_not_bypass_an_obstruction() -> None:
     class Blocked:
         def __init__(self) -> None:
             self.frames = ()
@@ -1367,11 +1367,17 @@ def test_ref_click_force_when_normal_click_blocked() -> None:
             raise RuntimeError("intercepts pointer events")
 
         def evaluate(self, script: str):
-            self.page.js = True
+            if "click()" in script:
+                self.page.js = True
+            return True
 
     page = Blocked()
-    PlaywrightPage(page).click("Bil", role="link", ref="22")
-    assert page.forced is True
+    import pytest
+
+    with pytest.raises(RuntimeError, match="could not be clicked"):
+        PlaywrightPage(page).click("Bil", role="link", ref="22")
+    assert page.forced is False
+    assert page.js is False
 
 
 def test_clear_gate_accepts_cookies_inside_an_iframe() -> None:

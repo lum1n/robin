@@ -37,6 +37,20 @@ Tools become `mcp_<server>_<tool>` (at most 40 per account). Results are untrust
 
 `notify_person` and background work (`robin tick`, `run_due`) that stop on `confirm` or `input` enqueue a per-account inbox item (`kind`, conversation, text). Items are encrypted in the household store. The Mac and iPhone apps poll `GET /v1/notifications` while signed in, show a “Needs you” list, post a local OS alert for new items, and clear them with `POST /v1/notifications` `{ack: [ids]}`. There is no Apple Push channel yet — delivery depends on a signed-in app (plus best-effort iOS background refresh).
 
+## Browser discovery and verified actions
+
+Browser observations prioritize active dialogs, form controls, and search/filter/sort entry points. Controls and Content have separate budgets; a long control list no longer consumes the result text. Omitted controls include a continuation cursor. `browser_read` accepts `query`, `region` (`dialog`, `main`, `nav`, `header`, or `page`), and `cursor`; `browser_find(query)` discovers matching labels, groups, or roles beyond the default window. Discovery is bounded locally at 2,000 matching controls. A narrower query is applied before that limit. Open shadow roots and same-origin frames are supported; inaccessible widgets must be reported as unsupported, not worked around with arbitrary JavaScript.
+
+Numeric Interactive refs identify the actual element, remain stable across rereads, and are not recycled on navigation. Actions require a ref from the latest observation; removed or replaced controls fail explicitly instead of targeting another element. Use a current ref when labels repeat. Range fields include available fieldset, heading, or shadow-host context so minimum/maximum year fields can be distinguished from price and mileage fields.
+
+`browser_set_checked(target, checked)` is idempotent and verifies the requested checkbox/switch state. Native checkboxes may be activated through their associated visible label, with normal actionability checks. `browser_select` accepts a unique native option label/value or an accessible custom dropdown option, and checks observable selection. Missing/ambiguous options and obstructed controls are errors; actions never use forced or JavaScript clicks. Dependent browser actions must be requested in separate model turns, using the preceding action's fresh observation.
+
+Readiness checks compare control state and actual content, wait through a bounded quiet period, and honor `aria-busy`. A timeout is explicit. An entered range value is not by itself proof that search results applied the filter: verify the resulting criteria and results. Scrolling reports movement or end-of-region and rejects invalid directions and stale/non-scrollable containers. After two unchanged or failed attempts with identical arguments, the loop blocks a third execution. Recovery uses fresh discovery or another justified control; continued blocked attempts end with a limitation.
+
+Empty or privacy-withheld Content is not evidence of zero matches. Reach the site's actual search/results page, verify every requested filter and sort choice, and report listings or a results-region empty indication. An empty option list elsewhere on the page does not establish an empty search. The newest page observation is retained when older tool results are elided.
+
+The browser/provider configuration, account isolation, confirmation contract, and person-facing live view are unchanged. Introduce these changes together; if login, booking, profile-fill, or popup workflows regress, revert this coherent browser/loop change rather than restoring unsafe targeting fallbacks. No deployment is required to run the local fixtures.
+
 ## Browser stealth and bot walls
 
 Robin opens pages with a **headed** Chromium (or Google Chrome when installed) on a per-account Xvfb display by default (`ROBIN_BROWSER_HEADLESS=0`). Automation flags are stripped. Engines: `ROBIN_BROWSER_ENGINE=playwright|patchright|camoufox` (patchright ships with Robin and is preferred by default; camoufox remains an optional extra). Per-account persistent profiles keep cookies between visits.

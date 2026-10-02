@@ -32,6 +32,15 @@ Details, including the threat model and private VMs, are in [docs/privacy.md](do
 
 The tests stand in for IMAP, SMTP, and the model. They do not open a network connection.
 
+Run the fast suite with `uv run pytest -q`. Real-DOM browser fixtures are opt-in and use a fresh local Chromium context, synthetic pages, and a scripted model; they never contact Finn or a model provider:
+
+```bash
+uv run playwright install chromium
+ROBIN_BROWSER_TESTS=1 ROBIN_LOG_MODEL=0 uv run pytest -q tests/test_browser_dom.py
+```
+
+If using a virtual environment directly, run the same commands with `.venv/bin/python -m playwright` and `PYTHONPATH=src .venv/bin/python -m pytest`. The fixtures cover discovery beyond the default control window, native/custom dropdowns, idempotent checkboxes, grouped/shadow-DOM ranges, delayed results, stale refs, nested scrolling, privacy round trips, and five clean full-loop filter/sort runs. See [browser discovery and verified actions](docs/capabilities.md#browser-discovery-and-verified-actions) for the tool contract and recovery limits.
+
 ## Inspect one string
 
 ```bash

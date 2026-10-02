@@ -224,6 +224,99 @@ def test_a_page_snapshot_keeps_refs_after_the_airlock() -> None:
     assert "Content:" in released
 
 
+def test_new_browser_metadata_is_private_even_with_parentheses() -> None:
+    from robin.loop import _release_snapshot
+    from robin.vault import Vault
+
+    vault = Vault("ada", "t")
+    email = "jane@example.test"
+    reference = vault.token("EMAIL", email)
+    person = vault.token("PERSON", "Jane Doe")
+    snapshot = (
+        'URL: https://example.test/\n\nInteractive:\n'
+        f'[7] combobox "Jane Doe: Recipient" (main, options=Other (work) / {email})\n\n'
+        'Content:\nNo matching listings'
+    )
+    safe = _release_snapshot(snapshot, vault, (), StubNer())
+    assert email not in safe and "Jane Doe" not in safe
+    assert reference in safe and person in safe
+    withheld = _release_snapshot(snapshot, vault, (), UnavailableNer())
+    assert email not in withheld and "Jane Doe" not in withheld
+    assert "withheld:" in withheld
+    assert "No matching listings" not in withheld
+
+
+def test_browser_budget_preserves_content_and_complete_references() -> None:
+    from robin.loop import _bound_tool_result, _TOOL_RESULT_CHARS
+    from robin.vault import Vault, REFERENCE
+
+    reference = Vault("ada", "t").token("PERSON", "Jane Doe")
+    rows = [f'[{i}] link "{reference} row {i}" (main)' for i in range(200)]
+    snapshot = 'URL: https://example.test/\n\nInteractive:\n' + "\n".join(rows) + (
+        '\n\nContent:\n2 verified results\n' + reference
+    )
+    bounded = _bound_tool_result(snapshot)
+    assert len(bounded) <= _TOOL_RESULT_CHARS
+    assert "2 verified results" in bounded
+    assert "(output omitted" in bounded
+    assert bounded.count("[PERSON_") == len(list(REFERENCE.finditer(bounded)))
+
+
+def test_trimming_keeps_latest_browser_observation_and_task() -> None:
+    from robin.loop import _trim_messages, _MODEL_CHARS, _size
+
+    messages = [
+        {"role": "system", "content": "Operate safely."},
+        {"role": "user", "content": "GLC, exact year 2027, lowest price first."},
+        {"role": "tool", "content": "old results " * 6000},
+        {"role": "tool", "content": 'URL: https://example.test/\nInteractive:\n'
+         '[1] combobox "Sort" (value=Lowest price)\nContent:\n2 matches'},
+    ]
+    latest = messages[-1]["content"]
+    _trim_messages(messages)
+    assert messages[2]["content"] == "[result elided]"
+    assert messages[-1]["content"] == latest
+    assert "exact year 2027" in messages[1]["content"]
+    assert _size(messages) <= _MODEL_CHARS
+
+
+def test_dependent_browser_batch_waits_for_next_observation_turn() -> None:
+    from robin.capabilities.browser import Browser
+
+    class Page:
+        def __init__(self):
+            self.clicked = []
+
+        def location(self):
+            return "https://example.test/"
+
+        def read(self):
+            return (
+                'URL: https://example.test/\n\nInteractive:\n'
+                '[1] button "First"\n[2] button "Second"\n\nContent:\nReady', ""
+            )
+
+        def click(self, target, **kwargs):
+            self.clicked.append(target)
+
+    page = Page()
+    browser = Browser("ada", page)
+    browser._refs["ada"] = {"1": ("button", "First"), "2": ("button", "Second")}
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (
+            ToolCall("browser_click", {"target": "1"}, id="first"),
+            ToolCall("browser_click", {"target": "2"}, id="second"),
+        )),
+        ModelTurn("I need the updated observation before proceeding."),
+    ])
+    converse(assistant, Task("ada", "t", "Open both panels"), model)
+    assert page.clicked == ["First"]
+    assert any("inspect the preceding browser result" in str(message.get("content", ""))
+               for message in model.seen[-1][0])
+
+
 def test_form_field_labels_stay_targetable_after_airlock() -> None:
     from robin.airlock import Entity, VocabularyTerm
     from robin.loop import _release_labels, _release_snapshot

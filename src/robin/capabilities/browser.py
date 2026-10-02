@@ -34,7 +34,9 @@ def _active_text() -> str:
 
 
 class Page(Protocol):
-    def read(self) -> tuple[str, str]: ...
+    def read(self, *, query: str = "", cursor: int = 0, region: str = "") -> tuple[str, str]: ...
+
+    def set_checked(self, target: str, checked: bool, ref: str = "") -> None: ...
 
     def open(self, url: str) -> None: ...
 
@@ -67,6 +69,7 @@ class PlaywrightPage:
         self._tabs: list[Any] = [page]
         self._active = 0
         self._refs: dict[str, tuple[str, str]] = {}
+        self._next_ref = 1
         self._downloads: list[str] = []
         self._context: Any = None
         self._watch(page)
@@ -178,38 +181,57 @@ class PlaywrightPage:
         self.clear_gate()
         self.settle()
 
-    def read(self) -> tuple[str, str]:
-        data = self._collect()
+    def read(self, *, query: str = "", cursor: int = 0, region: str = "") -> tuple[str, str]:
+        data = self._collect(query=query, region=region)
+        controls = list(data.get("interactive") or [])
+        if query:
+            needle = query.casefold()
+            controls = [
+                item for item in controls
+                if needle in f"{item.get('name', '')} {item.get('group', '')} {item.get('role', '')}".casefold()
+            ]
+        if region:
+            controls = [item for item in controls if item.get("region") == region]
+        data["total_controls"] = len(controls)
+        data["cursor"] = cursor
+        data["interactive"] = controls[cursor:cursor + _MAX_INTERACTIVE]
         data["pages"] = self.page_list()
         data["downloads"] = self.downloads()
-        refs: dict[str, tuple[str, str]] = {}
-        for index, item in enumerate(data.get("interactive") or (), start=1):
-            key = str(item.get("ref") or index)
-            refs[key] = (str(item.get("role") or "link"), str(item.get("name") or ""))
-        self._refs = refs
         text = _format_snapshot(data)
+        self._refs = _parse_refs(text)
         secrets = list(data.get("secrets") or [])
         for secret in secrets:
             if secret:
                 text = text.replace(secret, "")
         return text, " ".join(secret for secret in secrets if secret)
 
-    def _collect(self) -> dict[str, Any]:
+    def _collect(self, *, query: str = "", region: str = "") -> dict[str, Any]:
         evaluate = getattr(self._page, "evaluate", None)
         if callable(evaluate):
             try:
-                raw = evaluate(_SNAPSHOT_JS)
+                script = _SNAPSHOT_JS.replace("let nextRef = 1;", f"let nextRef = {self._next_ref};")
+                script = script.replace("const discovery = {};", "const discovery = " + json.dumps(
+                    {"query": query, "region": region}
+                ) + ";")
+                raw = evaluate(script)
                 if isinstance(raw, dict):
+                    controls = list(raw.get("interactive") or [])
+                    for item in controls:
+                        ref = str(item.get("ref") or "")
+                        if ref.isdigit():
+                            self._next_ref = max(self._next_ref, int(ref) + 1)
                     return {
                         "url": str(raw.get("url") or self.location()),
                         "title": str(raw.get("title") or ""),
-                        "interactive": list(raw.get("interactive") or [])[:_MAX_INTERACTIVE],
+                        "interactive": controls,
                         "content": str(raw.get("content") or ""),
                         "more_below": bool(raw.get("moreBelow") or raw.get("more_below")),
                         "secrets": list(raw.get("secrets") or []),
+                        "discovery_limited": bool(raw.get("discoveryLimited")),
+                        "scroll": raw.get("scroll"),
                     }
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError("could not inspect page controls — browser_read before continuing") from exc
         content = self._main_text()
         secrets = self._password_values()
         for secret in secrets:
@@ -271,20 +293,22 @@ class PlaywrightPage:
             try:
                 url = str(getattr(page, "url", "") or "")
                 inputs = int(self._fields("input, textarea, select").count())
-                try:
-                    body_len = len(str(page.locator("body").inner_text())[:800])
-                except Exception:
-                    body_len = 0
-                fingerprint = f"{url}|{inputs}|{body_len}"
-            except Exception:
-                url = ""
-                inputs = 0
-                fingerprint = last
+                state = self._collect()
+                fingerprint = json.dumps({
+                    "url": url, "inputs": inputs, "content": state.get("content"),
+                    "controls": [(item.get("role"), item.get("name"), item.get("states"), item.get("value"))
+                                 for item in state.get("interactive") or []],
+                }, sort_keys=True)
+                loading = page.evaluate(
+                    "() => !!document.querySelector('[aria-busy=\"true\"]')"
+                ) is True if callable(getattr(page, "evaluate", None)) else False
+            except Exception as exc:
+                raise RuntimeError("could not verify page readiness — browser_read before continuing") from exc
             # A /login URL with no fields yet is still loading the SPA form.
             waiting_for_form = inputs == 0 and bool(_LOGIN_PATH.search(url))
             if fingerprint and fingerprint == last:
                 stable += 1
-                if stable >= 2 and not waiting_for_form:
+                if stable >= 5 and not waiting_for_form and not loading:
                     return
             else:
                 stable = 0
@@ -297,6 +321,7 @@ class PlaywrightPage:
                 except Exception:
                     pass
             time.sleep(0.2)
+        raise RuntimeError("page is still loading or changing — browser_read before continuing")
 
     def click(self, target: str, role: str = "", ref: str = "") -> None:
         if ref:
@@ -308,7 +333,7 @@ class PlaywrightPage:
             )
         if role in {"link", "button"}:
             try:
-                control = self._page.get_by_role(role, name=target)
+                control = self._page.get_by_role(role, name=target, exact=True)
                 count = int(control.count())
                 if count > 1:
                     raise RuntimeError(_ambiguous_message(target, count, role))
@@ -344,26 +369,17 @@ class PlaywrightPage:
                     _call_timeout(control.first.click, 5000)
                     return
                 if count > 1:
-                    # Prefer the shortest exact-looking match.
-                    for index in range(min(count, 8)):
-                        try:
-                            node = control.nth(index)
-                            text = str(node.inner_text() or "")
-                            if fragment.lower() in text.lower():
-                                _raise_if_disabled(node, target)
-                                _call_timeout(node.click, 5000)
-                                return
-                        except RuntimeError:
-                            raise
-                        except Exception:
-                            continue
+                    raise RuntimeError(_ambiguous_message(target, count, "control"))
             except RuntimeError:
                 raise
             except Exception:
                 pass
         try:
             control = self._page.get_by_text(target)
-            if int(control.count()) > 0:
+            count = int(control.count())
+            if count > 1:
+                raise RuntimeError(_ambiguous_message(target, count, "control"))
+            if count == 1:
                 _raise_if_disabled(control.first, target)
                 _call_timeout(control.first.click, 5000)
                 return
@@ -374,32 +390,44 @@ class PlaywrightPage:
         raise RuntimeError(f'no clickable control matching "{target}"')
 
     def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
-        if ref and self._act_ref(ref, "fill", text):
-            return
+        if ref:
+            if self._act_ref(ref, "fill", text):
+                return
+            raise RuntimeError(f"control [{ref}] is stale — browser_read for a fresh snapshot")
         try:
-            labeled = self._page.get_by_label(target)
-            if int(labeled.count()) > 0:
+            labeled = self._page.get_by_label(target, exact=True)
+            count = int(labeled.count())
+            if count > 1:
+                raise RuntimeError(_ambiguous_message(target, count, "field"))
+            if count == 1:
                 _call_timeout(labeled.first.fill, 5000, text)
                 return
+        except RuntimeError:
+            raise
         except Exception:
             pass
         try:
-            box = self._page.get_by_role(role or "textbox", name=target)
-            if int(box.count()) > 0:
+            box = self._page.get_by_role(role or "textbox", name=target, exact=True)
+            count = int(box.count())
+            if count > 1:
+                raise RuntimeError(_ambiguous_message(target, count, "field"))
+            if count == 1:
                 _call_timeout(box.first.fill, 5000, text)
                 return
+        except RuntimeError:
+            raise
         except Exception:
             pass
         try:
-            box = self._page.get_by_role("textbox", name=target)
-            if int(box.count()) > 0:
+            box = self._page.get_by_role("textbox", name=target, exact=True)
+            count = int(box.count())
+            if count > 1:
+                raise RuntimeError(_ambiguous_message(target, count, "field"))
+            if count == 1:
                 _call_timeout(box.first.fill, 5000, text)
                 return
-        except Exception:
-            pass
-        try:
-            if self._fill_named(target, text):
-                return
+        except RuntimeError:
+            raise
         except Exception:
             pass
         raise RuntimeError(f'no text field matching "{target}"')
@@ -412,57 +440,125 @@ class PlaywrightPage:
         fields.first.fill(text)
 
     def select_option(self, target: str, value: str, ref: str = "") -> None:
-        if ref and self._act_ref(ref, "select", value):
-            return
-        try:
-            labeled = self._page.get_by_label(target)
-            if int(labeled.count()) > 0:
-                labeled.first.select_option(value)
+        if ref:
+            if self._act_ref(ref, "select", value):
                 return
-        except Exception:
-            pass
-        try:
-            boxes = self._page.locator("select")
-            if int(boxes.count()) > 0:
-                boxes.first.select_option(value)
-                return
-        except Exception:
-            pass
-        raise RuntimeError(f'no select matching "{target}"')
+            raise RuntimeError(f"control [{ref}] is stale — browser_read for a fresh snapshot")
+        labeled = self._page.get_by_label(target, exact=True)
+        if int(labeled.count()) != 1:
+            raise RuntimeError(f'no unique select matching "{target}" — use a current ref')
+        self._select_control(labeled.first, value)
 
-    def scroll(self, direction: str, ref: str = "") -> None:
-        amount = {"up": -800, "down": 800, "top": -100000, "bottom": 100000}.get(direction.lower(), 800)
+    def _select_control(self, control: Any, value: str, root: Any = None) -> None:
+        tag = control.evaluate("(node) => node.tagName.toLowerCase()")
+        if tag == "select":
+            options = control.locator("option")
+            labels = [str(options.nth(i).inner_text()).strip() for i in range(int(options.count()))]
+            values = [str(options.nth(i).get_attribute("value") or "") for i in range(int(options.count()))]
+            if labels.count(value) == 1:
+                control.select_option(label=value, timeout=5000)
+            elif values.count(value) == 1:
+                control.select_option(value=value, timeout=5000)
+            else:
+                raise RuntimeError("option is missing or ambiguous — inspect this control's options")
+            return
+        if control.get_attribute("role") not in {"combobox", "listbox"}:
+            raise RuntimeError("control is not a supported dropdown")
+        _call_timeout(control.click, 5000)
+        owner = control.get_attribute("aria-controls") or control.get_attribute("aria-owns")
+        root = root or self._page
+        if owner:
+            root = root.locator(f"[id={json.dumps(owner)}]")
+        option = root.get_by_role("option", name=value, exact=True)
+        option.first.wait_for(state="visible", timeout=5000)
+        if int(option.count()) != 1:
+            raise RuntimeError("option is ambiguous — inspect the open listbox")
+        _call_timeout(option.first.click, 5000)
+        selected = control.evaluate(
+            """(node, wanted) => node.value === wanted
+              || node.getAttribute('aria-valuetext') === wanted
+              || String(node.textContent || '').trim() === wanted""",
+            value,
+        )
+        if not selected and (int(option.count()) != 1 or option.first.get_attribute("aria-selected") != "true"):
+            raise RuntimeError("dropdown selection is not observable — browser_read to verify the selected option")
+
+    def set_checked(self, target: str, checked: bool, ref: str = "") -> None:
+        if not ref:
+            raise RuntimeError("check-state changes require a current Interactive ref")
+        if self._act_ref(ref, "check" if checked else "uncheck"):
+            return
+        raise RuntimeError(f"control [{ref}] is stale — browser_read for a fresh snapshot")
+
+    def scroll(self, direction: str, ref: str = "") -> dict[str, Any]:
+        amounts = {"up": -800, "down": 800, "top": -100000, "bottom": 100000}
+        if direction.lower() not in amounts:
+            raise ValueError("scroll direction must be up, down, top, or bottom")
+        amount = amounts[direction.lower()]
         if ref:
             selector = f'[data-robin-ref="{ref}"]'
             try:
-                self._page.locator(selector).first.evaluate(
-                    "(node, delta) => { node.scrollBy(0, delta); }",
-                    amount,
-                )
-                return
-            except Exception:
-                pass
-        self._page.evaluate(f"window.scrollBy(0, {int(amount)})")
+                for frame in self._action_frames():
+                    locator = frame.locator(selector)
+                    count = int(locator.count())
+                    if count == 0:
+                        continue
+                    if count != 1:
+                        raise RuntimeError("scroll container is ambiguous")
+                    return locator.first.evaluate(
+                        """(node, delta) => {
+                          const refs = node.ownerDocument.defaultView.__robinControlRefs;
+                          if (!refs || refs.get(node) !== node.getAttribute('data-robin-ref'))
+                            throw new Error('stale scroll container');
+                          if (node.scrollHeight <= node.clientHeight)
+                            throw new Error('control is not a scroll container');
+                          const before = node.scrollTop;
+                          node.scrollBy({top: delta, behavior: 'instant'});
+                          return {before, after: node.scrollTop, maximum: node.scrollHeight - node.clientHeight};
+                        }""",
+                        amount,
+                    )
+            except Exception as exc:
+                raise RuntimeError("scroll container is stale or unavailable") from exc
+            raise RuntimeError("scroll container is stale or unavailable")
+        return self._page.evaluate("""delta => {
+          const before = window.scrollY;
+          window.scrollBy({top: delta, behavior: 'instant'});
+          return {before, after: window.scrollY,
+            maximum: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)};
+        }""", amount)
 
     def press_key(self, key: str) -> None:
         self._page.keyboard.press(key)
 
     def hover(self, target: str, role: str = "", ref: str = "") -> None:
-        if ref and self._act_ref(ref, "hover"):
-            return
+        if ref:
+            if self._act_ref(ref, "hover"):
+                return
+            raise RuntimeError(f"control [{ref}] is stale — browser_read for a fresh snapshot")
         if role:
             try:
-                control = self._page.get_by_role(role, name=target)
-                if int(control.count()) > 0:
+                control = self._page.get_by_role(role, name=target, exact=True)
+                count = int(control.count())
+                if count > 1:
+                    raise RuntimeError(_ambiguous_message(target, count, "control"))
+                if count == 1:
                     control.first.hover(timeout=5000)
                     return
+            except RuntimeError:
+                raise
             except Exception:
                 pass
         try:
             control = self._page.get_by_text(target, exact=True)
-            if int(control.count()) > 0:
+            count = int(control.count())
+            if count > 1:
+                raise RuntimeError(_ambiguous_message(target, count, "control"))
+            if count == 1:
                 control.first.hover(timeout=5000)
                 return
+        except RuntimeError:
+            raise
         except Exception:
             pass
         raise RuntimeError(f'no hover target matching "{target}"')
@@ -480,16 +576,30 @@ class PlaywrightPage:
     def go_back(self) -> None:
         self._page.go_back(wait_until="domcontentloaded", timeout=15000)
 
+    def _action_frames(self) -> list[Any]:
+        main = getattr(self._page, "main_frame", None)
+        return [self._page] + [
+            frame for frame in (getattr(self._page, "frames", None) or ())
+            if frame is not None and frame is not main
+        ]
+
     def _act_ref(self, ref: str, action: str, text: str = "") -> bool:
         selector = f'[data-robin-ref="{ref}"]'
-        frames: list[Any] = [self._page]
-        frames.extend(frame for frame in (getattr(self._page, "frames", None) or ()) if frame is not None)
         saw = False
         last_error: Exception | None = None
-        for frame in frames:
+        for frame in self._action_frames():
             try:
                 locator = frame.locator(selector)
-                if int(locator.count()) == 0:
+                count = int(locator.count())
+                if count == 0:
+                    continue
+                if count != 1:
+                    raise RuntimeError(f"control [{ref}] is ambiguous — browser_read")
+                identity = locator.first.evaluate(
+                    "(node) => { const refs = node.ownerDocument.defaultView.__robinControlRefs; "
+                    "return !!refs && refs.get(node) === node.getAttribute('data-robin-ref'); }"
+                ) if callable(getattr(locator.first, "evaluate", None)) else True
+                if identity is False:
                     continue
                 saw = True
                 target = locator.first
@@ -507,11 +617,44 @@ class PlaywrightPage:
                         return True
                     continue
                 if action == "select":
-                    _call_timeout(target.select_option, 5000, text)
+                    self._select_control(target, text, root=frame)
+                elif action in {"check", "uncheck"}:
+                    wanted = action == "check"
+                    tag = target.evaluate("(node) => node.tagName.toLowerCase()")
+                    if tag == "input" and target.get_attribute("type") in {"checkbox", "radio"}:
+                        if target.is_checked() != wanted:
+                            label_handle = target.evaluate_handle(
+                                "(node) => node.labels?.length === 1 ? node.labels[0] : null"
+                            )
+                            try:
+                                label = label_handle.as_element()
+                                if label is not None and label.is_visible():
+                                    _call_timeout(label.click, 5000)
+                                else:
+                                    target.set_checked(wanted, timeout=5000)
+                            finally:
+                                label_handle.dispose()
+                        if target.is_checked() != wanted:
+                            raise RuntimeError("requested check state was not applied")
+                    elif target.get_attribute("role") in {"checkbox", "switch", "menuitemcheckbox"}:
+                        current = target.get_attribute("aria-checked")
+                        if current not in {"true", "false"}:
+                            raise RuntimeError("check state is not observable")
+                        if (current == "true") != wanted:
+                            _call_timeout(target.click, 5000)
+                        if target.get_attribute("aria-checked") != str(wanted).lower():
+                            raise RuntimeError("requested check state was not applied")
+                    else:
+                        raise RuntimeError("control does not support check-state changes")
                 elif action == "hover":
                     _call_timeout(target.hover, 5000)
                 else:
                     _call_timeout(target.fill, 5000, text)
+                    valid = target.evaluate(
+                        "(node) => node.type !== 'number' || node.validity.valid"
+                    ) if callable(getattr(target, "evaluate", None)) else True
+                    if valid is False:
+                        raise RuntimeError("numeric value is outside this field's allowed range")
                 return True
             except RuntimeError:
                 raise
@@ -521,8 +664,10 @@ class PlaywrightPage:
         if saw:
             detail = str(last_error).splitlines()[0].strip() if last_error else ""
             suffix = f" ({detail[:120]})" if detail else ""
+            verb = {"fill": "filled", "select": "selected", "hover": "hovered",
+                    "check": "checked", "uncheck": "unchecked"}.get(action, "clicked")
             raise RuntimeError(
-                f'control [{ref}] could not be clicked{suffix} — browser_read, then try another Interactive ref'
+                f'control [{ref}] could not be {verb}{suffix} — browser_read, then try another Interactive ref'
             )
         return False
 
@@ -1245,8 +1390,26 @@ class Browser(Capability):
         Tool(
             name="browser_read",
             description="Read the structured text snapshot of this account's page (URL, interactive refs, content).",
-            parameters={"type": "object", "properties": {}},
+            parameters={"type": "object", "properties": {
+                "query": {"type": "string"},
+                "region": {"type": "string", "enum": ["dialog", "main", "nav", "header", "page"]},
+                "cursor": {"type": "integer", "minimum": 0, "maximum": 2000},
+            }},
             effect=Effect.READ,
+        ),
+        Tool(
+            name="browser_find",
+            description="Find omitted controls by label, group or role across the page. Returns current refs; use before blind scrolling.",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            effect=Effect.READ,
+        ),
+        Tool(
+            name="browser_set_checked",
+            description="Set a checkbox or switch to checked=true or false, without toggling an already correct state.",
+            parameters={"type": "object", "properties": {
+                "target": {"type": "string"}, "checked": {"type": "boolean"},
+            }, "required": ["target", "checked"]},
+            effect=Effect.MUTATE,
         ),
         Tool(
             name="browser_click",
@@ -1427,6 +1590,7 @@ class Browser(Capability):
         self._codes: dict[tuple[str, str], str] = {}
         self._once: dict[str, list[str]] = {}
         self._refs: dict[str, dict[str, tuple[str, str]]] = {}
+        self._last_snapshots: dict[str, str] = {}
         self._login_notes: dict[str, str] = {}
         # (account_id, name) -> https URL of that site's homepage; set by install from web search.
         self.find_site: Callable[[str, str], str | None] | None = None
@@ -1636,6 +1800,22 @@ class Browser(Capability):
             except Exception as exc:
                 return f"could not open the page. {_open_failure(exc)}"
         try:
+            if tool_name == "browser_set_checked":
+                target = str(arguments.get("target", ""))
+                checked = arguments.get("checked")
+                if not isinstance(checked, bool):
+                    raise ValueError("checked must be a boolean")
+                before = self._glance(account_id)
+                role, name, ref = self._resolve(account_id, target, prefer=("checkbox", "switch"))
+                if role not in {"checkbox", "switch", "menuitemcheckbox", "radio"} or not ref:
+                    raise RuntimeError("no current checkbox or switch matching the target")
+                self._use(account_id, lambda page: page.set_checked(name, checked, ref=ref))
+                self._settle(account_id)
+                after = self._observe(account_id)
+                change = _action_diff(before, after)
+                if "no observable change" in change:
+                    change = "outcome: already satisfied"
+                return f"set checked={str(checked).lower()} on {target}\n{change}\n{after}"
             if tool_name == "browser_click":
                 target = str(arguments.get("target", ""))
                 before = self._glance(account_id)
@@ -1655,7 +1835,7 @@ class Browser(Capability):
                 text = str(arguments.get("text", ""))
                 before = self._glance(account_id)
                 try:
-                    role, name, ref = self._resolve(account_id, target, prefer=("textbox", "searchbox", "combobox"))
+                    role, name, ref = self._resolve(account_id, target, prefer=("textbox", "searchbox", "combobox", "spinbutton"))
                 except RuntimeError as exc:
                     return str(exc)
                 try:
@@ -1687,10 +1867,18 @@ class Browser(Capability):
                         _role, _name, ref = self._resolve(account_id, target, prefer=())
                     except RuntimeError as exc:
                         return str(exc)
-                self._use(account_id, lambda page: _scroll(page, direction, ref=ref))
+                    if not ref:
+                        raise RuntimeError("no current scroll container matching the target")
+                movement = self._use(account_id, lambda page: _scroll(page, direction, ref=ref))
                 self._settle(account_id)
                 after = self._observe(account_id)
-                return f"scrolled {direction}\n{_action_diff(before, after)}\n{after}"
+                change = _action_diff(before, after)
+                if isinstance(movement, dict):
+                    if movement.get("before") == movement.get("after"):
+                        change = "changed: no observable change (end of scroll region)"
+                    else:
+                        change = f"changed: scroll position {movement.get('after')}"
+                return f"scrolled {direction}\n{change}\n{after}"
             if tool_name == "browser_press":
                 key = str(arguments.get("key", ""))
                 before = self._glance(account_id)
@@ -1758,15 +1946,27 @@ class Browser(Capability):
                 self._settle(account_id)
                 after = self._observe(account_id)
                 return f"submitted\n{_action_diff(before, after)}\n{after}"
-            if tool_name == "browser_read":
-                return self._observe(account_id)
+            if tool_name in {"browser_read", "browser_find"}:
+                cursor = arguments.get("cursor", 0)
+                if isinstance(cursor, bool) or not isinstance(cursor, int) or not 0 <= cursor <= 2000:
+                    raise ValueError("cursor must be an integer between 0 and 2000")
+                query = arguments.get("query", "")
+                region = arguments.get("region", "")
+                if (not isinstance(query, str) or not isinstance(region, str)
+                        or len(query) > 200 or region not in {"", "dialog", "main", "nav", "header", "page"}
+                        or (tool_name == "browser_find" and not query.strip())):
+                    raise ValueError("invalid control discovery query or region")
+                return self._observe(account_id, query=query, cursor=cursor, region=region)
         except Exception as exc:
             return _action_failure(exc)
         raise NotImplementedError(tool_name)
 
-    def _observe(self, account_id: str) -> str:
+    def _observe(self, account_id: str, *, query: str = "", cursor: int = 0, region: str = "") -> str:
         def work(page: Page) -> tuple[str, str, dict[str, tuple[str, str]], str]:
-            text, password = page.read()
+            if query or cursor or region:
+                text, password = page.read(query=query, cursor=cursor, region=region)
+            else:
+                text, password = page.read()
             refs = dict(getattr(page, "_refs", {}) or {})
             located = ""
             if not text.startswith("URL:"):
@@ -1795,8 +1995,7 @@ class Browser(Capability):
             text = f"{profile_note}\n\n{text}"
         if wall:
             text = f"{_HANDOFF_PREFIX} {wall}\n\n{text}"
-        if len(text) > 4000:
-            text = text[:4000]
+        self._last_snapshots[account_id] = text
         return text
 
     def _profile_note(self, account_id: str, snapshot: str) -> str:
@@ -1911,6 +2110,8 @@ class Browser(Capability):
         if key in refs:
             role, name = refs[key]
             return role, name, key
+        if key.isdigit():
+            raise RuntimeError("control ref is stale or not in the latest observation — browser_read")
         exact = [(ref, role, name) for ref, (role, name) in refs.items() if name == key]
         preferred = [item for item in exact if not prefer or item[1] in prefer]
         chosen = preferred or exact
@@ -1982,7 +2183,10 @@ class Browser(Capability):
                     downloads = len(downs())
                 except Exception:
                     downloads = 0
-            return {"url": url, "pages": pages, "downloads": downloads}
+            snapshot = self._last_snapshots.get(account_id)
+            if isinstance(page, PlaywrightPage):
+                snapshot, _password = page.read()
+            return {"url": url, "pages": pages, "downloads": downloads, "snapshot": snapshot}
 
         try:
             return self._use(account_id, work)
@@ -1990,10 +2194,7 @@ class Browser(Capability):
             return {"url": "", "pages": 1, "downloads": 0}
 
     def _settle(self, account_id: str) -> None:
-        try:
-            self._use(account_id, lambda page: _settle(page))
-        except Exception:
-            return
+        self._use(account_id, lambda page: _settle(page))
 
     def _use(self, account_id: str, function: Any) -> Any:
         if self.desk is not None:
@@ -2238,7 +2439,7 @@ def _call_timeout(method: Any, timeout_ms: int, *args: Any) -> Any:
 
 
 def _click_locator(locator: Any) -> bool:
-    """Click a stamped control; scroll and force when the normal click is blocked."""
+    """Only report clicks that pass Playwright's normal actionability checks."""
     try:
         scroll = getattr(locator, "scroll_into_view_if_needed", None)
         if callable(scroll):
@@ -2255,22 +2456,7 @@ def _click_locator(locator: Any) -> bool:
         return True
     except Exception:
         pass
-    try:
-        locator.click(timeout=5000, force=True)
-        return True
-    except TypeError:
-        try:
-            locator.click(force=True)
-            return True
-        except Exception:
-            pass
-    except Exception:
-        pass
-    try:
-        locator.evaluate("(node) => node.click()")
-        return True
-    except Exception:
-        return False
+    return False
 
 
 def _click_fragment(target: str) -> str:
@@ -2803,6 +2989,7 @@ _REF_LINE = re.compile(
 )
 
 _SNAPSHOT_JS = """() => {
+  const discovery = {};
   const cleanLabel = (value) => String(value || "")
     .replace(/\\s+/g, " ")
     .replace(/\\bikon av\\b/gi, "")
@@ -2857,7 +3044,7 @@ _SNAPSHOT_JS = """() => {
     return implicitRole(node);
   };
   const visible = (node) => {
-    if (!(node instanceof Element)) return false;
+    if (!node || node.nodeType !== 1) return false;
     if (node.getAttribute("aria-hidden") === "true") return false;
     try {
       const style = window.getComputedStyle(node);
@@ -2868,11 +3055,27 @@ _SNAPSHOT_JS = """() => {
       return true;
     }
   };
+  const parentOf = node => node.parentElement || node.getRootNode()?.host;
+  const groupOf = node => {
+    for (let parent = parentOf(node), depth = 0; parent && depth < 10; parent = parentOf(parent), depth++) {
+      if (parent.tagName === "FIELDSET") {
+        const legend = parent.querySelector("legend");
+        if (legend) return cleanLabel(legend.textContent);
+      }
+      const label = parent.getAttribute("aria-label") || labeledBy(parent);
+      if (label) return cleanLabel(label);
+      const heading = [...parent.children].find(child => /^H[1-6]$/.test(child.tagName));
+      if (heading) return cleanLabel(heading.textContent);
+    }
+    return "";
+  };
   const regionOf = (node) => {
-    if (node.closest('[role="dialog"], dialog[open], [aria-modal="true"]')) return "dialog";
-    if (node.closest("header, [role='banner']")) return "header";
-    if (node.closest("nav, [role='navigation']")) return "nav";
-    if (node.closest("main, article, [role='main']")) return "main";
+    for (let parent = node; parent; parent = parentOf(parent)) {
+      if (parent.matches('[role="dialog"], dialog[open], [aria-modal="true"]')) return "dialog";
+      if (parent.matches("header, [role='banner']")) return "header";
+      if (parent.matches("nav, [role='navigation']")) return "nav";
+      if (parent.matches("main, article, [role='main']")) return "main";
+    }
     return "page";
   };
   const labeledBy = (node) => {
@@ -2880,20 +3083,25 @@ _SNAPSHOT_JS = """() => {
     if (!ids) return "";
     const parts = [];
     for (const id of ids.split(/\\s+/)) {
-      const el = (node.ownerDocument || document).getElementById(id);
+      const el = node.getRootNode().getElementById?.(id) || (node.ownerDocument || document).getElementById(id);
       if (el) parts.push(cleanLabel(el.innerText || el.textContent || ""));
     }
     return cleanLabel(parts.filter(Boolean).join(" "));
   };
   const associatedLabel = (node) => {
+    const labelText = label => {
+      const copy = label.cloneNode(true);
+      copy.querySelectorAll("input,select,textarea,button").forEach(child => child.remove());
+      return cleanLabel(copy.textContent || "");
+    };
     if (node.id) {
       try {
-        const label = (node.ownerDocument || document).querySelector('label[for="' + CSS.escape(node.id) + '"]');
-        if (label) return cleanLabel(label.innerText || label.textContent || "");
+        const label = node.getRootNode().querySelector('label[for="' + CSS.escape(node.id) + '"]');
+        if (label) return labelText(label);
       } catch (err) {}
     }
     const parent = node.closest("label");
-    if (parent) return cleanLabel(parent.innerText || parent.textContent || "");
+    if (parent) return labelText(parent);
     return "";
   };
   const neighbor = (node) => {
@@ -2951,7 +3159,7 @@ _SNAPSHOT_JS = """() => {
     if (node.getAttribute("aria-expanded") === "false") states.push("collapsed");
     if (node.getAttribute("aria-selected") === "true" || node.selected) states.push("selected");
     if (node.getAttribute("aria-pressed") === "true") states.push("pressed");
-    if (node.getAttribute("aria-invalid") === "true") states.push("invalid");
+    if (node.getAttribute("aria-invalid") === "true" || (node.validity && !node.validity.valid)) states.push("invalid");
     if (node.getAttribute("aria-current")) states.push("current");
     if (document.activeElement === node) states.push("focused");
     return states;
@@ -2983,28 +3191,39 @@ _SNAPSHOT_JS = """() => {
     }
   };
   const add = (node, role) => {
-    if (!(node instanceof Element) || interactive.length >= 80) return;
+    if (!node || node.nodeType !== 1 || interactive.length >= 2000) return;
     if (!INTERACTIVE.has(role) && !(node.tabIndex >= 0 && role && !SKIP_ROLE.has(role))) return;
     if (!visible(node)) return;
     if (node.getAttribute("data-robin-ref")) return;
     if (passwordToggle(node, role)) return;
-    const ref = String(nextRef++);
+    const name = nameOf(node, role);
+    const group = ["textbox", "searchbox", "spinbutton", "slider", "checkbox", "radio", "switch", "combobox", "listbox"].includes(role) ? groupOf(node) : "";
+    const region = regionOf(node);
+    if (discovery.query && !(name + " " + group + " " + role).toLowerCase().includes(discovery.query.toLowerCase())) return;
+    if (discovery.region && discovery.region !== region) return;
+    const owner = node.ownerDocument.defaultView;
+    const refMap = owner.__robinControlRefs || (owner.__robinControlRefs = new WeakMap());
+    const ref = refMap.get(node) || String(nextRef++);
+    refMap.set(node, ref);
     try {
       node.setAttribute("data-robin-ref", ref);
     } catch (err) {}
     interactive.push({
       ref,
       role,
-      name: nameOf(node, role),
-      region: regionOf(node),
+      name,
+      region,
       states: statesOf(node),
       value: valueOf(node, role),
+      group,
+      viewport: node.getBoundingClientRect().top < window.innerHeight && node.getBoundingClientRect().bottom > 0,
+      options: node.tagName === "SELECT" ? [...node.options].slice(0, 40).map(option => cleanLabel(option.text)) : [],
     });
   };
   const walkTree = (root) => {
     if (!root) return;
     const visit = (node) => {
-      if (!(node instanceof Element)) return;
+      if (!node || node.nodeType !== 1) return;
       const role = roleOf(node);
       if (role && !SKIP_ROLE.has(role)) add(node, role);
       else if (node.tabIndex >= 0) add(node, role || "button");
@@ -3014,7 +3233,7 @@ _SNAPSHOT_JS = """() => {
       }
       for (const child of node.children || []) visit(child);
     };
-    if (root instanceof Element) visit(root);
+    if (root.nodeType === 1) visit(root);
     else if (root.body) visit(root.body);
     else if (root.documentElement) visit(root.documentElement);
     else if (root.children) {
@@ -3022,7 +3241,7 @@ _SNAPSHOT_JS = """() => {
     }
   };
   const isCookieDialog = (node) => {
-    if (!(node instanceof Element)) return false;
+    if (!node || node.nodeType !== 1) return false;
     const id = String(node.id || "").toLowerCase();
     const cls = String(node.className || "").toLowerCase();
     const title = String(node.getAttribute("aria-label") || node.getAttribute("title") || "").toLowerCase();
@@ -3054,10 +3273,19 @@ _SNAPSHOT_JS = """() => {
   const contentLines = [];
   const contentSeen = new Set();
   let moreBelow = false;
+  const contentPriority = node => {
+    if (node.matches("h1,h2,h3,h4,h5,h6,[role='heading'],[role='status'],[aria-live],output")) return 3;
+    if (node.childElementCount === 0 && /^\\d[\\d\\s.,]*\\s+(treff|results?|matches?|annonser|ads)\\b/i.test(node.textContent || "")) return 3;
+    if (node.matches("p,pre,blockquote")) return 2;
+    return 1;
+  };
   const blocks = contentRoot
-    ? contentRoot.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading'],p,li,td,th,pre,blockquote,label,dt,dd")
+    ? [...contentRoot.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading'],[role='status'],[aria-live],output,p,li,td,th,pre,blockquote,label,dt,dd,div,span")]
+        .sort((a, b) => contentPriority(b) - contentPriority(a))
     : [];
   for (const node of blocks) {
+    if (["DIV", "SPAN"].includes(node.tagName)
+        && (node.childElementCount > 0 || node.closest("label,button,a,nav"))) continue;
     if (!visible(node)) continue;
     let rect;
     try {
@@ -3115,7 +3343,12 @@ _SNAPSHOT_JS = """() => {
       } catch (err) {}
     }
   }
-  const content = contentLines.join("\\n").slice(0, 3500);
+  const renderedContent = contentLines.join("\\n");
+  const content = renderedContent.split("\\n").reduce((lines, line) => {
+    if (lines.join("\\n").length + line.length + 1 <= 3500) lines.push(line);
+    return lines;
+  }, []).join("\\n");
+  if (content.length < renderedContent.length) moreBelow = true;
   const secrets = [];
   for (const node of document.querySelectorAll("input[type='password']")) {
     if (node.value) secrets.push(String(node.value));
@@ -3123,7 +3356,14 @@ _SNAPSHOT_JS = """() => {
   return {
     url: location.href || "",
     title: cleanLabel(document.title || ""),
-    interactive: interactive.slice(0, 80),
+    interactive: interactive.sort((a, b) => {
+      const score = item => (item.region === "dialog" ? 100 : 0)
+        + (["textbox", "searchbox", "spinbutton", "checkbox", "radio", "switch", "combobox", "listbox"].includes(item.role) ? 50 : 0)
+        + (item.viewport ? 20 : 0) + (/filter|sort|søk|search|alle biler/i.test(item.name) ? 30 : 0);
+      return score(b) - score(a);
+    }),
+    discoveryLimited: interactive.length >= 2000,
+    scroll: Math.round(window.scrollY),
     content,
     moreBelow,
     secrets,
@@ -3140,11 +3380,18 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     content, truncated = _content_lines(str(data.get("content") or ""))
     more_below = bool(data.get("more_below") or data.get("moreBelow") or truncated)
     if len(content) > _MAX_CONTENT:
-        content = content[:_MAX_CONTENT]
+        kept: list[str] = []
+        for line in content.splitlines():
+            if len("\n".join(kept + [line])) > _MAX_CONTENT:
+                break
+            kept.append(line)
+        content = "\n".join(kept) or "(content omitted: excerpt exceeds its budget)"
         more_below = True
     lines = [f"URL: {url or '(unknown)'}"]
     if title:
         lines.append(f"Title: {title}")
+    if isinstance(data.get("scroll"), (int, float)):
+        lines.append(f"Scroll position: {data['scroll']}")
     if len(pages) > 1 or downloads:
         lines.append("")
         lines.append("Pages:")
@@ -3166,9 +3413,14 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     lines.append("")
     lines.append("Interactive:")
     if interactive:
+        control_chars = 0
+        emitted = 0
         for index, item in enumerate(interactive, start=1):
             role = str(item.get("role") or "link")
             name = str(item.get("name") or "").replace('"', "'")
+            group = str(item.get("group") or "").replace('"', "'")
+            if group:
+                name = f"{group}: {name}"
             ref = str(item.get("ref") or index)
             meta: list[str] = []
             region = str(item.get("region") or "").strip()
@@ -3181,8 +3433,29 @@ def _format_snapshot(data: dict[str, Any]) -> str:
             value = str(item.get("value") or "").strip()
             if value and role != "password":
                 meta.append(f"value={value.replace(chr(34), chr(39))}")
+            options = item.get("options") or []
+            if options:
+                labels: list[str] = []
+                for option in options:
+                    label = str(option).replace('"', "'")
+                    if len(" / ".join(labels + [label])) > 500:
+                        break
+                    labels.append(label)
+                if labels:
+                    meta.append("options=" + " / ".join(labels))
+                if len(labels) < len(options):
+                    meta.append("options omitted")
             suffix = f" ({', '.join(meta)})" if meta else ""
-            lines.append(f'[{ref}] {role} "{name}"{suffix}')
+            row = f'[{ref}] {role} "{name}"{suffix}'
+            if control_chars + len(row) > 6500:
+                break
+            lines.append(row)
+            control_chars += len(row) + 1
+            emitted += 1
+        total = int(data.get("total_controls") or len(interactive))
+        cursor = int(data.get("cursor") or 0)
+        if cursor + emitted < total:
+            lines.append(f"Controls omitted: {total - cursor - emitted}. browser_read cursor={cursor + emitted} or browser_find.")
     else:
         lines.append("(none)")
     lines.append("")
@@ -3190,6 +3463,8 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     lines.append(content or "(empty)")
     if more_below and content:
         lines.append("(more below)")
+    if data.get("discovery_limited"):
+        lines.append("Discovery limit reached; inspect a narrower region.")
     return "\n".join(lines)
 
 
@@ -3286,10 +3561,39 @@ def _action_diff(before: dict[str, Any] | str, snapshot: str) -> str:
     before_downloads = int(before.get("downloads") or 0)
     if after_downloads > before_downloads:
         bits.append("download started")
-    if " (dialog" in snapshot:
+    if " (dialog" in snapshot and " (dialog" not in str(before.get("snapshot") or ""):
         bits.append("dialog open")
     if not bits:
-        bits.append("page updated")
+        previous = before.get("snapshot")
+        if isinstance(previous, str):
+            def control_state(text: str) -> list[tuple[str, str, str]]:
+                states = []
+                for line in text.splitlines():
+                    match = re.match(r'^\[\d+\]\s+(\w+)\s+"(.*)"\s+\((.*)\)$', line)
+                    if not match:
+                        continue
+                    role, name, meta = match.groups()
+                    relevant = [bit.strip() for bit in meta.split(",")
+                                if bit.strip() in {"checked", "mixed", "expanded", "collapsed",
+                                                   "selected", "pressed", "disabled", "invalid"}
+                                or bit.strip().startswith("value=")]
+                    if relevant:
+                        name = re.sub(r"\s+\([\d\s,]+\)$", "", name)
+                        states.append((role, name, ", ".join(relevant)))
+                return sorted(states)
+
+            def semantic(text: str) -> str:
+                return "\n".join(
+                    re.sub(r",?\s*\bfocused\b", "", re.sub(r"^\[\d+\]", "[ref]", line))
+                    for line in text.splitlines()
+                    if "Controls omitted:" not in line
+                )
+            if control_state(previous) != control_state(snapshot):
+                bits.append("control state changed")
+            else:
+                bits.append("no observable change" if semantic(previous) == semantic(snapshot) else "page updated")
+        else:
+            bits.append("change not verified (no previous observation)")
     return "changed: " + ", ".join(bits)
 
 
@@ -3358,15 +3662,13 @@ def _select_option(page: Page, target: str, value: str, ref: str = "") -> None:
     raise RuntimeError("select is not available")
 
 
-def _scroll(page: Page, direction: str, ref: str = "") -> None:
+def _scroll(page: Page, direction: str, ref: str = "") -> dict[str, Any] | None:
     scroll = getattr(page, "scroll", None)
     if callable(scroll):
         try:
-            scroll(direction, ref=ref)
-            return
+            return scroll(direction, ref=ref)
         except TypeError:
-            scroll(direction)
-            return
+            return scroll(direction)
     raise RuntimeError("scroll is not available")
 
 
