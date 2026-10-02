@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-from robin.vault import Vault
+from robin.vault import REFERENCE, REFERENCE_CANDIDATE, Vault
 
 REDACTED = "[REDACTED]"
 UNRESOLVED = "[UNRESOLVED]"
@@ -204,7 +204,26 @@ def redact(
     ner_available: bool = False,
     extra: tuple[Entity, ...] = (),
 ) -> tuple[str, Report]:
-    entities = tuple(_select([*detect(text, vocabulary), *extra]))
+    protected = [
+        (match.start(), match.end()) for match in REFERENCE.finditer(text)
+        if vault.has_reference(match.group())
+    ]
+    invalid = [
+        Entity(match.start(), match.end(), "SECRET")
+        for match in REFERENCE_CANDIDATE.finditer(text)
+        if not vault.has_reference(match.group())
+    ]
+    known = [
+        Entity(start, end, label) for start, end, label in vault.spans(text)
+        if not any(start >= left and end <= right for left, right in protected)
+    ]
+    known_spans = {(entity.start, entity.end) for entity in known}
+    detected = [
+        entity for entity in [*detect(text, vocabulary), *extra, *invalid]
+        if not any(entity.start < end and entity.end > start for start, end in protected)
+        and (entity.disposition is Disposition.DROP or (entity.start, entity.end) not in known_spans)
+    ]
+    entities = tuple(_select([*detected, *known]))
     pieces: list[str] = []
     cursor = 0
     for entity in entities:
@@ -216,7 +235,9 @@ def redact(
             pieces.append(vault.token(entity.label, value))
         cursor = entity.end
     pieces.append(text[cursor:])
-    return "".join(pieces), Report(entities=entities, unresolved=free_text and not ner_available)
+    return vault.canonicalize("".join(pieces)), Report(
+        entities=entities, unresolved=free_text and not ner_available
+    )
 
 
 def release(

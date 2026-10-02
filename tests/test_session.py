@@ -221,5 +221,11 @@ def test_threads_on_one_account_do_not_share_a_vault() -> None:
     assistant.set_vocabulary("ada", (VocabularyTerm("Jane Doe"), VocabularyTerm("Bob Berg")))
     assistant.decide(Task("ada", "one", "Jane Doe"))
     assistant.decide(Task("ada", "two", "Bob Berg"))
-    assert assistant.vaults.get("ada", "one").restore("[PERSON_1]") == "Jane Doe"
-    assert assistant.vaults.get("ada", "two").restore("[PERSON_1]") == "Bob Berg"
+    one = assistant.vaults.get("ada", "one")
+    two = assistant.vaults.get("ada", "two")
+    jane = one.token("PERSON", "Jane Doe")
+    bob = two.token("PERSON", "Bob Berg")
+    assert jane != bob
+    assert one.restore(jane) == "Jane Doe"
+    assert two.restore(jane) == jane
+    assert two.restore(bob) == "Bob Berg"

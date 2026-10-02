@@ -24,6 +24,7 @@ from robin.capability import (
     Tool,
     current_task,
 )
+from robin.vault import REFERENCE
 
 
 def _active_text() -> str:
@@ -1223,7 +1224,7 @@ class Browser(Capability):
                 "Pass a full URL such as https://example.com (a bare host is accepted and treated as https). "
                 "If this site is already open, prefer browser_click/read on the current page instead of opening the homepage again. "
                 "Never pass a booking choice word (clinic, home visit, consultation) as the url — click that option on the page. "
-                "When the person names a site as [ORG_n] (or similar), pass that placeholder as url — confirm restores the real host. "
+                "When the person names a site with an ORG reference (or similar), pass that entire reference as url — confirm restores the real host. "
                 "Do not invent a different hostname from memory (for example lot.com when they said Google). "
                 "To click or type, use Interactive refs (for example target 1) or the visible name. "
                 "Use browser_select for dropdowns, browser_scroll to reveal more, browser_press for Enter or Tab, "
@@ -2712,7 +2713,7 @@ def _web_url(url: str) -> str:
         raise ValueError("url must be http or https")
     if _PLACEHOLDER.search(cleaned):
         raise ValueError(
-            "url still has an unresolved placeholder — pass the [ORG_n] token alone when the person "
+            "url still has an unresolved placeholder — pass the exact ORG reference alone when the person "
             "named that site (confirm restores it), or a real http(s) host; do not invent another host"
         )
     if cleaned.startswith("https://") or cleaned.startswith("http://"):
@@ -2792,7 +2793,7 @@ def _host_ok(host: str) -> bool:
     return _SITE.fullmatch(name) is not None
 
 
-_PLACEHOLDER = re.compile(r"\[[A-Z]+_\d+\]")
+_PLACEHOLDER = REFERENCE
 
 
 _MAX_INTERACTIVE = 80

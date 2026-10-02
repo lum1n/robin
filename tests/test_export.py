@@ -17,6 +17,7 @@ def test_a_vault_moves_to_another_instance_and_stays_off_the_other_account(tmp_p
     assistant = Assistant(store=HouseholdStore(path, key))
     assistant.set_vocabulary("ada", (VocabularyTerm(NAME),))
     assistant.decide(Task("ada", "kitchen", f"hello {NAME}"))
+    reference = assistant.vaults.get("ada", "kitchen").token("PERSON", NAME)
     service = Service(assistant, object())
     service.auth.register("ada", "ada-session-password")
     service.auth.register("bea", "bea-session-password")
@@ -63,7 +64,7 @@ def test_a_vault_moves_to_another_instance_and_stays_off_the_other_account(tmp_p
     assert rejected == 400
     assert rejected_body["error"] == "export belongs to another account"
     assert PASSPHRASE not in json.dumps(rejected_body)
-    assert private.vaults.get("bea", "kitchen").restore("[PERSON_1]") == "[PERSON_1]"
+    assert private.vaults.get("bea", "kitchen").restore(reference) == reference
 
     wrong, wrong_body = dispatch(
         private_service,
@@ -85,7 +86,8 @@ def test_a_vault_moves_to_another_instance_and_stays_off_the_other_account(tmp_p
     )
     assert imported == 200
     assert imported_body == {"imported": 1}
-    assert private.vaults.get("ada", "kitchen").restore("[PERSON_1]") == NAME
+    assert private.vaults.get("ada", "kitchen").restore(reference) == NAME
+    assert private.vaults.get("ada", "kitchen").token("PERSON", NAME) == reference
     assert private.vocabulary["ada"][0].text == NAME
     assert NAME.encode() not in other_path.read_bytes()
     assert PASSPHRASE.encode() not in other_path.read_bytes()

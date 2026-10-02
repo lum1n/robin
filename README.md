@@ -39,4 +39,4 @@ uv run robin redact --text 'mail jane@example.com'
 uv run robin decide --text 'buy milk' --allow-cloud
 ```
 
-`redact` can write an encrypted vault with `--vault-out` and `--key-out`. `restore` reads that vault back. The key file is the vault key. Keep it on the machine that runs Robin.
+`redact` can write an encrypted vault with `--vault-out` and `--key-out`. `restore` reads that vault back. Each reversible value gets a typed reference with a random conversation scope, reused across turns and tool results. Tool execution resolves exact references locally in one pass; unknown, malformed, foreign references and withheld markers block the action. The key file is the vault key. Keep it on the machine that runs Robin.

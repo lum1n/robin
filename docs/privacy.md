@@ -28,7 +28,11 @@ Apps talk only to the instance they are using. Connector credentials and model A
 
 Records a capability marks private, plus vocabulary, vault, cloud opt-in, and the activity log, belong to one account. A task's model context contains that account's data plus shared resources the account is a member of. Each model call is a new request. Robin sends the recent turns of that conversation with it, so the thread continues. An open page contributes an excerpt. The prompt stays within about 6,000 characters, which fits a 4096-token local context together with the tool list and the reply. Another conversation is left out. On the cloud route those turns are redacted the same way as the current message.
 
-Placeholder maps are keyed by account and conversation. `[PERSON_1]` in one conversation is unrelated to `[PERSON_1]` in another. Sharing something with another account is an external effect and needs a confirm.
+Placeholder maps are keyed by account and conversation. References have the form `[PERSON_<scope>_1]`, with a random 128-bit scope stored in the encrypted vault. A reference from another conversation never resolves in this one. Exact values reuse their typed references across turns, tool results, restarts, and vault export/import. Sharing something with another account is an external effect and needs a confirm.
+
+Tool arguments resolve locally in a single pass immediately before execution, including nested objects and lists. References inside restored values are not expanded again. Unknown, malformed, foreign references, conflicting restored object keys, and `[REDACTED]` or `[UNRESOLVED]` arguments block the action and produce an explicit error. References identify values, not permissions; tool visibility and confirmation checks still apply. Results and errors are scanned again, and known mapped values remain tokenized even if a later detector misses them. Existing references are protected from being tokenized again.
+
+Legacy encrypted vaults remain readable: their unscoped placeholders are migrated to scoped references. Local restoration and saved pending confirmations can upgrade legacy aliases; new model tool calls cannot execute an unscoped alias. Only the scoped form is released to the model.
 
 A person registers a password once, then logs in. The session token is returned once and is not stored. Later requests send it as a bearer token. The session has to belong to the account on the request. Another account's token is rejected. The one-time VM enroll token is separate and is not a person's session.
 
@@ -67,7 +71,7 @@ The model is remote. There is no local generator. Every string sent to it is the
 Three classes:
 
 - **Drop.** Never enters a model context and is never restored: API keys, passwords, cookies, recovery codes, national IDs including Norwegian fødselsnummer, and payment data (card numbers, IBAN, kontonummer).
-- **Tokenize.** Reversible placeholders, stable for one conversation: names, emails, phones, street addresses. `Jane Doe <jane@example.com>` becomes `[PERSON_1] <[EMAIL_1]>`.
+- **Tokenize.** Reversible placeholders, stable for one conversation: names, emails, phones, street addresses. `Jane Doe <jane@example.com>` becomes `[PERSON_<scope>_1] <[EMAIL_<scope>_1]>`. The scope is an opaque random identifier, not the name or account ID.
 - **Free text.** Bodies, titles, notes, and screen text. The cloud sees them only after the deterministic pass plus a local NER pass, and only if nothing is left unresolved. Otherwise the field is withheld from the cloud view.
 
 Ordinary text, such as a grocery item name, is still scanned. A secret typed into an ordinary field is dropped.

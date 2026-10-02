@@ -12,7 +12,7 @@ from typing import Any
 
 from robin.airlock import REDACTED, UNRESOLVED, Entity, Report, VocabularyTerm, redact
 from robin.ner import Ner, UnavailableNer
-from robin.vault import Vault
+from robin.vault import REFERENCE, Vault
 
 
 class Effect(Enum):
@@ -390,7 +390,14 @@ def _render_field(
         ner_available=ner.available(),
         extra=extra,
     )
-    if spec.klass is FieldClass.TOKENIZE and not spec.free_text and not report.has_critical and redacted == value and value:
+    if (
+        spec.klass is FieldClass.TOKENIZE
+        and not spec.free_text
+        and not report.has_critical
+        and redacted == value
+        and value
+        and not REFERENCE.search(value)
+    ):
         redacted = vault.token(spec.label, value)
         report = Report(entities=(Entity(0, len(value), spec.label),), unresolved=False)
     if for_cloud and spec.free_text and report.unresolved:

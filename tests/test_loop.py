@@ -39,22 +39,24 @@ def _user_text(messages: list[dict]) -> str:
 def test_local_model_sees_the_name_and_a_cloud_model_sees_the_placeholder() -> None:
     local = Assistant(ner=StubNer())
     local.set_vocabulary("ada", (VocabularyTerm("Jane Doe"),))
-    local_model = Scripted([ModelTurn("hello [PERSON_1]")])
+    local_reference = local.vaults.get("ada", "t").token("PERSON", "Jane Doe")
+    local_model = Scripted([ModelTurn(f"hello {local_reference}")])
     local_reply = converse(local, Task("ada", "t", "hello Jane Doe", allow_cloud=False), local_model)
     assert local_reply.route is Route.LOCAL
     prompt = _user_text(local_model.seen[0][0])
     assert "Jane Doe" not in prompt
-    assert "[PERSON_1]" in prompt
+    assert local_reference in prompt
     assert local_reply.text == "hello Jane Doe"
 
     cloud = Assistant(ner=StubNer())
     cloud.set_vocabulary("ada", (VocabularyTerm("Jane Doe"),))
-    cloud_model = Scripted([ModelTurn("hello [PERSON_1]")])
+    cloud_reference = cloud.vaults.get("ada", "t").token("PERSON", "Jane Doe")
+    cloud_model = Scripted([ModelTurn(f"hello {cloud_reference}")])
     cloud_reply = converse(cloud, Task("ada", "t", "hello Jane Doe", allow_cloud=True), cloud_model)
     assert cloud_reply.route is Route.CLOUD
     prompt = _user_text(cloud_model.seen[0][0])
     assert "Jane Doe" not in prompt
-    assert "[PERSON_1]" in prompt
+    assert cloud_reference in prompt
     assert cloud_reply.text == "hello Jane Doe"
 
 
@@ -366,7 +368,7 @@ def test_thread_history_is_sent_redacted(tmp_path) -> None:
     converse(assistant, Task("ada", "t", "again", allow_cloud=True), model)
     prompt = _user_text(model.seen[0][0])
     assert "Jane Doe" not in prompt
-    assert "[PERSON_1]" in prompt or "hello" in prompt
+    assert "[PERSON_" in prompt or "hello" in prompt
 
 
 def test_history_drops_unconfirmed_tool_calls(tmp_path) -> None:

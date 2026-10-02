@@ -24,7 +24,15 @@ from robin.capability import (
 from robin.ner import Ner, PublicTerms, UnavailableNer
 from robin.policy import Decision, Task, decide
 from robin.store import HouseholdStore
-from robin.vault import Vault, VaultAccessError, VaultStore, open_export, seal_export
+from robin.vault import (
+    REFERENCE,
+    ReferenceError,
+    Vault,
+    VaultAccessError,
+    VaultStore,
+    open_export,
+    seal_export,
+)
 
 
 @dataclass
@@ -352,17 +360,25 @@ class Assistant:
         capability, tool = self.registry.resolve(account_id, tool_name)
         vault = self.vaults.get(account_id, conversation_id)
         vocabulary = self.vocabulary.get(account_id, ())
-        if tool.egress:
-            raw = {key: value for key, value in arguments.items()}
-            if not confirmed and _egress_needs_restore(raw, vault):
-                return {"status": "confirm", "tool": tool_name, "reason": "egress"}
-            raw = {key: _restore_arg(value, vault) for key, value in raw.items()}
-        else:
-            raw = {key: _restore_arg(value, vault) for key, value in arguments.items()}
+        try:
+            raw = _restore_arg(arguments, vault)
+        except ReferenceError as exc:
+            entry = {"tool": tool_name, "arguments": "blocked: invalid reference"}
+            self.activity.append(account_id, entry)
+            if self.store is not None:
+                self.store.append_activity(account_id, entry)
+            return {"status": "error", "result": str(exc)}
+        if tool.egress and not confirmed and _egress_needs_restore(arguments, vault):
+            return {"status": "confirm", "tool": tool_name, "reason": "egress"}
         logged_input = {
-            key: "" if key in tool.drop_arguments else _log_arg(value) for key, value in raw.items()
+            redact(key, vault, vocabulary=vocabulary)[0]: (
+                "" if key in tool.drop_arguments else _redact_value(value, vault, vocabulary)
+            )
+            for key, value in raw.items()
         }
-        logged, _ = redact(json.dumps(logged_input, sort_keys=True, default=str), Vault(account_id, "activity"))
+        logged, _ = redact(
+            json.dumps(logged_input, sort_keys=True, default=str), vault, vocabulary=vocabulary
+        )
         entry = {"tool": tool_name, "arguments": logged}
         self.activity.append(account_id, entry)
         if self.store is not None:
@@ -381,10 +397,7 @@ class Assistant:
         try:
             outcome = capability.invoke(account_id, tool.name, raw)
         except Exception as exc:
-            text = str(exc).strip() or "that action failed"
-            if self.store is not None:
-                self.store.save_vault(vault)
-            return {"status": "done", "result": text}
+            outcome = str(exc).strip() or "that action failed"
         rendered, _ = render_result(
             outcome,
             capability.fields,
@@ -393,12 +406,14 @@ class Assistant:
             ner=self.ner_for(account_id),
             for_cloud=True,
         )
-        if isinstance(outcome, Result) and outcome.records is not None:
-            text = rendered
-        else:
-            text = rendered if isinstance(outcome, Result) else str(outcome)
-            redacted, _ = redact(text, vault, vocabulary=vocabulary)
-            text = redacted
+        # Scan decoded JSON values before escaping can hide a mapped string.
+        try:
+            structured = json.loads(rendered)
+        except json.JSONDecodeError:
+            structured = None
+        if isinstance(structured, (dict, list)):
+            rendered = json.dumps(_redact_value(structured, vault, vocabulary), sort_keys=True)
+        text, _ = redact(rendered, vault, vocabulary=vocabulary)
         if self.store is not None:
             self.store.save_vault(vault)
         if for_model or tool.effect is Effect.EXTERNAL:
@@ -418,15 +433,12 @@ class Assistant:
         self.schedules.update(self.store.load_schedules())
 
 
-_PLACEHOLDER_ONLY = re.compile(r"\[[A-Z]+_\d+\]")
+_PLACEHOLDER_ONLY = REFERENCE
 
 
 def _egress_needs_restore(arguments: dict[str, Any], vault: Vault) -> bool:
     """True when an egress argument still holds a placeholder the person must approve."""
-    for value in arguments.values():
-        if _arg_needs_restore(value, vault):
-            return True
-    return False
+    return _arg_needs_restore(arguments, vault)
 
 
 def _arg_needs_restore(value: Any, vault: Vault) -> bool:
@@ -437,29 +449,41 @@ def _arg_needs_restore(value: Any, vault: Vault) -> bool:
     if isinstance(value, list):
         return any(_arg_needs_restore(item, vault) for item in value)
     if isinstance(value, dict):
-        return any(_arg_needs_restore(item, vault) for item in value.values())
+        return any(
+            _arg_needs_restore(str(key), vault) or _arg_needs_restore(item, vault)
+            for key, item in value.items()
+        )
     return False
 
 
 def _restore_arg(value: Any, vault: Vault) -> Any:
     if isinstance(value, str):
-        return vault.restore(value)
+        return vault.restore(value, strict=True)
     if isinstance(value, list):
         return [_restore_arg(item, vault) for item in value]
     if isinstance(value, dict):
-        return {str(key): _restore_arg(item, vault) for key, item in value.items()}
+        restored: dict[str, Any] = {}
+        for key, item in value.items():
+            name = vault.restore(str(key), strict=True)
+            if name in restored:
+                raise ReferenceError("Action blocked: restored argument keys conflict.")
+            restored[name] = _restore_arg(item, vault)
+        return restored
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return vault.restore(str(value))
+    return vault.restore(str(value), strict=True)
 
 
-def _log_arg(value: Any) -> Any:
+def _redact_value(value: Any, vault: Vault, vocabulary: tuple[VocabularyTerm, ...]) -> Any:
     if isinstance(value, str):
-        return value
+        return redact(value, vault, vocabulary=vocabulary)[0]
     if isinstance(value, list):
-        return [_log_arg(item) for item in value]
+        return [_redact_value(item, vault, vocabulary) for item in value]
     if isinstance(value, dict):
-        return {str(key): _log_arg(item) for key, item in value.items()}
+        return {
+            redact(str(key), vault, vocabulary=vocabulary)[0]: _redact_value(item, vault, vocabulary)
+            for key, item in value.items()
+        }
     return value
 
 

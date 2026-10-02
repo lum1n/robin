@@ -42,6 +42,7 @@ def test_a_restart_keeps_one_accounts_thread_and_hides_it_from_the_other(tmp_pat
     assistant.set_vocabulary("ada", (VocabularyTerm("Jane Doe"),))
     assistant.add(Groceries(members={"ada"}, shared=[{"item": "milk", "loyalty": ""}], private={}))
     converse(assistant, Task("ada", "kitchen", "hello Jane Doe"), Scripted())
+    reference = assistant.vaults.get("ada", "kitchen").token("PERSON", "Jane Doe")
     assistant.invoke("ada", "kitchen", "lists_show", {"note": SECRET})
     store.close()
 
@@ -49,7 +50,8 @@ def test_a_restart_keeps_one_accounts_thread_and_hides_it_from_the_other(tmp_pat
     assert SECRET.encode() not in path.read_bytes()
 
     revived = Assistant(store=HouseholdStore(path, key))
-    assert revived.vaults.get("ada", "kitchen").restore("[PERSON_1]") == "Jane Doe"
+    assert revived.vaults.get("ada", "kitchen").restore(reference) == "Jane Doe"
+    assert revived.vaults.get("ada", "kitchen").token("PERSON", "Jane Doe") == reference
     assert revived.threads("ada") == ["kitchen"]
     assert revived.threads("bea") == []
     texts = [turn["text"] for turn in revived.turns("ada", "kitchen")]

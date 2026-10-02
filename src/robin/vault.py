@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from base64 import urlsafe_b64encode
 from dataclasses import dataclass, field
@@ -15,6 +16,18 @@ class VaultAccessError(PermissionError):
     pass
 
 
+class ReferenceError(ValueError):
+    pass
+
+
+REFERENCE = re.compile(r"\[([A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)*)_(?:[0-9a-f]{32}_)?[1-9]\d*\]")
+REFERENCE_CANDIDATE = re.compile(
+    r"\[(?:[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)*_|"
+    r"(?i:PERSON|EMAIL|PHONE|ADDRESS|ORG|TEXT)(?:[\s:_-]|(?=\]|$)))"
+    r"[^\]\r\n]*(?:\]|(?=$|[\r\n]))"
+)
+
+
 @dataclass
 class Vault:
     account_id: str
@@ -22,23 +35,57 @@ class Vault:
     _values: dict[str, str] = field(default_factory=dict)
     _tokens: dict[tuple[str, str], str] = field(default_factory=dict)
     _counts: dict[str, int] = field(default_factory=dict)
+    _scope: str = field(default_factory=lambda: secrets.token_hex(16))
+    _aliases: dict[str, str] = field(default_factory=dict)
 
     def token(self, label: str, value: str) -> str:
+        if re.fullmatch(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)*", label) is None:
+            raise ValueError("invalid reference type")
         key = (label, value)
         existing = self._tokens.get(key)
         if existing is not None:
             return existing
         self._counts[label] = self._counts.get(label, 0) + 1
-        placeholder = f"[{label}_{self._counts[label]}]"
+        placeholder = f"[{label}_{self._scope}_{self._counts[label]}]"
         self._tokens[key] = placeholder
         self._values[placeholder] = value
         return placeholder
 
-    def restore(self, text: str) -> str:
-        restored = text
-        for placeholder, value in sorted(self._values.items(), key=lambda item: len(item[0]), reverse=True):
-            restored = restored.replace(placeholder, value)
-        return restored
+    def canonicalize(self, text: str) -> str:
+        """Upgrade references from a locally loaded legacy vault without revealing values."""
+        return REFERENCE.sub(lambda match: self._aliases.get(match.group(), match.group()), text)
+
+    def has_reference(self, reference: str) -> bool:
+        return reference in self._values or reference in self._aliases
+
+    def restore(self, text: str, *, strict: bool = False) -> str:
+        if strict:
+            if re.search(r"\[(?:REDACTED|UNRESOLVED)(?:\]|$)", text, re.IGNORECASE):
+                raise ReferenceError("Action blocked: withheld data cannot be used as a tool argument.")
+            for match in REFERENCE_CANDIDATE.finditer(text):
+                if match.group() not in self._values:
+                    raise ReferenceError(
+                        "Action blocked: unknown, malformed, or foreign reference. "
+                        "Use the exact reference from this conversation; do not guess."
+                    )
+
+        def replace(match: re.Match[str]) -> str:
+            reference = self._aliases.get(match.group(), match.group()) if not strict else match.group()
+            return self._values.get(reference, match.group())
+
+        # Substitute only the original input, never references inside a restored value.
+        return REFERENCE.sub(replace, text)
+
+    def spans(self, text: str) -> list[tuple[int, int, str]]:
+        """Known values must remain protected even when a later detector misses them."""
+        spans: list[tuple[int, int, str]] = []
+        for reference, value in self._values.items():
+            if not value:
+                continue
+            label = REFERENCE.fullmatch(reference).group(1)
+            pattern = re.compile(r"(?<!\w)" + re.escape(value) + r"(?!\w)")
+            spans.extend((match.start(), match.end(), label) for match in pattern.finditer(text))
+        return spans
 
     def contains_value(self, value: str) -> bool:
         return value in self._values.values()
@@ -49,6 +96,8 @@ class Vault:
             "conversation_id": self.conversation_id,
             "values": dict(self._values),
             "counts": dict(self._counts),
+            "scope": self._scope,
+            "aliases": dict(self._aliases),
         }
 
     def encrypt(self, key: bytes) -> bytes:
@@ -62,24 +111,40 @@ class Vault:
             raise VaultAccessError("vault key rejected") from exc
         if payload["account_id"] != account_id or payload["conversation_id"] != conversation_id:
             raise VaultAccessError("vault belongs to another account or conversation")
-        vault = cls(account_id, conversation_id)
-        values = dict(payload["values"])
-        vault._values = values
-        vault._counts = {label: int(count) for label, count in payload["counts"].items()}
-        for placeholder, value in values.items():
-            label = placeholder[1 : placeholder.rfind("_")]
-            vault._tokens[(label, value)] = placeholder
-        return vault
+        return cls.from_dump(payload)
 
     @classmethod
     def from_dump(cls, payload: dict) -> Vault:
         vault = cls(str(payload["account_id"]), str(payload["conversation_id"]))
+        if "scope" in payload:
+            scope = str(payload["scope"])
+            if re.fullmatch(r"[0-9a-f]{32}", scope) is None:
+                raise VaultAccessError("invalid vault scope")
+            vault._scope = scope
         values = {str(key): str(value) for key, value in dict(payload["values"]).items()}
-        vault._values = values
         vault._counts = {str(label): int(count) for label, count in dict(payload["counts"]).items()}
+        vault._aliases = {str(key): str(value) for key, value in dict(payload.get("aliases", {})).items()}
         for placeholder, value in values.items():
-            label = placeholder[1 : placeholder.rfind("_")]
-            vault._tokens[(label, value)] = placeholder
+            match = REFERENCE.fullmatch(placeholder)
+            if match is None:
+                raise VaultAccessError("invalid vault reference")
+            label = match.group(1)
+            if re.fullmatch(r"\[" + re.escape(label) + r"_[1-9]\d*\]", placeholder):
+                reference = vault.token(label, value)
+                vault._aliases[placeholder] = reference
+            else:
+                if not placeholder.startswith(f"[{label}_{vault._scope}_"):
+                    raise VaultAccessError("reference belongs to another vault")
+                vault._values[placeholder] = value
+                vault._tokens[(label, value)] = placeholder
+                vault._counts[label] = max(vault._counts.get(label, 0), int(placeholder.rsplit("_", 1)[1][:-1]))
+        if any(
+            re.fullmatch(r"\[[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)*_[1-9]\d*\]", alias) is None
+            or reference not in vault._values
+            or REFERENCE.fullmatch(alias).group(1) != REFERENCE.fullmatch(reference).group(1)
+            for alias, reference in vault._aliases.items()
+        ):
+            raise VaultAccessError("invalid legacy vault reference")
         return vault
 
 

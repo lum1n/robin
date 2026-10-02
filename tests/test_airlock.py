@@ -32,9 +32,9 @@ def test_tokenize_round_trip_is_stable_inside_one_conversation() -> None:
     second, _ = redact("Jane Doe wrote again", vault, vocabulary=vocabulary)
     assert "Jane Doe" not in first
     assert "jane@example.com" not in first
-    assert "[PERSON_1]" in first
-    assert "[EMAIL_1]" in first
-    assert "[PERSON_1]" in second
+    assert vault.token("PERSON", "Jane Doe") in first
+    assert vault.token("EMAIL", "jane@example.com") in first
+    assert vault.token("PERSON", "Jane Doe") in second
     assert vault.restore(first) == "Jane Doe <jane@example.com> called"
 
 
@@ -43,17 +43,21 @@ def test_another_conversation_does_not_restore_the_same_placeholder() -> None:
     other = Vault("ada", "two")
     redact("Jane Doe", ada, vocabulary=(VocabularyTerm("Jane Doe"),))
     redact("Bob Berg", other, vocabulary=(VocabularyTerm("Bob Berg"),))
-    assert ada.restore("[PERSON_1]") == "Jane Doe"
-    assert other.restore("[PERSON_1]") == "Bob Berg"
+    jane = ada.token("PERSON", "Jane Doe")
+    bob = other.token("PERSON", "Bob Berg")
+    assert jane != bob
+    assert ada.restore(jane) == "Jane Doe"
+    assert other.restore(jane) == jane
+    assert other.restore(bob) == "Bob Berg"
 
 
 def test_encrypted_vault_rejects_another_account() -> None:
     vault = Vault("ada", "thread")
-    vault.token("PERSON", "Jane Doe")
+    reference = vault.token("PERSON", "Jane Doe")
     key = new_key()
     blob = vault.encrypt(key)
     opened = Vault.decrypt(blob, key, account_id="ada", conversation_id="thread")
-    assert opened.restore("[PERSON_1]") == "Jane Doe"
+    assert opened.restore(reference) == "Jane Doe"
     try:
         Vault.decrypt(blob, key, account_id="bea", conversation_id="thread")
     except VaultAccessError:

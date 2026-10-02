@@ -110,8 +110,10 @@ def test_threads_and_activity_stay_on_the_account_that_owns_them(tmp_path) -> No
 
 
 def test_cloud_opt_in_sends_placeholders_and_the_reply_restores_them(tmp_path) -> None:
-    model = Scripted([ModelTurn("hello [PERSON_1]")])
+    model = Scripted([])
     service, _screen, ada, _bea = _service(tmp_path, model, ner=StubNer())
+    reference = service.assistant.vaults.get("ada", "kitchen").token("PERSON", "Jane Doe")
+    model.turns.append(ModelTurn(f"hello {reference}"))
     status, payload = dispatch(
         service,
         "POST",
@@ -129,7 +131,7 @@ def test_cloud_opt_in_sends_placeholders_and_the_reply_restores_them(tmp_path) -
     assert payload["text"] == "hello Jane Doe"
     prompt = str(model.seen[0])
     assert "Jane Doe" not in prompt
-    assert "[PERSON_1]" in prompt
+    assert reference in prompt
 
 
 def test_a_session_connects_a_mailbox_and_a_restart_keeps_the_secret(tmp_path) -> None:
