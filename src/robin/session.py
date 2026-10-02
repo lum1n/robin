@@ -21,6 +21,7 @@ from robin.capability import (
     render_context,
     render_result,
 )
+from robin.context import ClientContext, merge_context
 from robin.ner import Ner, PublicTerms, UnavailableNer
 from robin.policy import Decision, Task, decide
 from robin.store import HouseholdStore
@@ -84,8 +85,27 @@ class Assistant:
         self._turn_lock = threading.Lock()
         self._turn_gen: dict[tuple[str, str], int] = {}
         self._turn_busy: dict[tuple[str, str], threading.Lock] = {}
+        # Last device context per account, in memory only (location is never written to the store).
+        self._client_context: dict[str, ClientContext] = {}
+        # Decrypted household names, cached so each redaction does not hit the broker.
+        self._household_terms: dict[str, tuple[VocabularyTerm, ...]] = {}
         if store is not None:
             self._restore_store()
+
+    def set_client_context(self, account_id: str, context: ClientContext) -> None:
+        with self._turn_lock:
+            self._client_context[account_id] = merge_context(self._client_context.get(account_id), context)
+
+    def _egress_approved(self, account_id: str) -> frozenset[str]:
+        """Coarse device place names may reach search providers; precise coordinates still need approval."""
+        context = self.client_context(account_id)
+        if context is None or context.location is None:
+            return frozenset()
+        place = context.location
+        return frozenset(value for value in (place.locality, place.region, place.country) if value)
+
+    def client_context(self, account_id: str) -> ClientContext | None:
+        return self._client_context.get(account_id)
 
     def begin_turn(self, account_id: str, conversation_id: str) -> int:
         """Bump the conversation generation so an older in-flight turn can stop."""
@@ -114,6 +134,43 @@ class Assistant:
         self.vocabulary[account_id] = terms
         if self.store is not None:
             self.store.save_vocabulary(account_id, terms)
+
+    def vocabulary_for(self, account_id: str) -> tuple[VocabularyTerm, ...]:
+        """Stored terms plus household names, so every mention maps to the same reference."""
+        terms = self._household_terms.get(account_id)
+        if terms is None:
+            from robin.household import member_terms
+
+            terms = member_terms(self.household(account_id))
+            self._household_terms[account_id] = terms
+        return (*terms, *self.vocabulary.get(account_id, ()))
+
+    def household(self, account_id: str) -> tuple:
+        from robin.household import HOUSEHOLD_SECRET, load_members
+
+        try:
+            return load_members(self.broker.reveal(account_id, HOUSEHOLD_SECRET))
+        except KeyError:
+            return ()
+
+    def set_household(self, account_id: str, members: tuple) -> None:
+        from robin.household import HOUSEHOLD_SECRET, dump_members, member_terms
+
+        self.broker.put(account_id, HOUSEHOLD_SECRET, dump_members(members))
+        self._household_terms[account_id] = member_terms(members)
+
+    def preferences(self, account_id: str):
+        from robin.household import PREFERENCES_SECRET, Preferences, load_preferences
+
+        try:
+            return load_preferences(self.broker.reveal(account_id, PREFERENCES_SECRET))
+        except KeyError:
+            return Preferences()
+
+    def set_preferences(self, account_id: str, preferences) -> None:
+        from robin.household import PREFERENCES_SECRET, dump_preferences
+
+        self.broker.put(account_id, PREFERENCES_SECRET, dump_preferences(preferences))
 
     def threads(self, account_id: str) -> list[str]:
         if self.store is None:
@@ -313,7 +370,7 @@ class Assistant:
     def decide(self, task: Task, *, record: bool = True) -> Decision:
         vault = self.vaults.get(task.account_id, task.conversation_id)
         ner = self.ner_for(task.account_id)
-        vocabulary = self.vocabulary.get(task.account_id, ())
+        vocabulary = self.vocabulary_for(task.account_id)
         context, context_report = render_context(
             self.registry.for_account(task.account_id),
             task.account_id,
@@ -359,7 +416,7 @@ class Assistant:
     ) -> dict[str, str]:
         capability, tool = self.registry.resolve(account_id, tool_name)
         vault = self.vaults.get(account_id, conversation_id)
-        vocabulary = self.vocabulary.get(account_id, ())
+        vocabulary = self.vocabulary_for(account_id)
         try:
             raw = _restore_arg(arguments, vault)
         except ReferenceError as exc:
@@ -368,7 +425,9 @@ class Assistant:
             if self.store is not None:
                 self.store.append_activity(account_id, entry)
             return {"status": "error", "result": str(exc)}
-        if tool.egress and not confirmed and _egress_needs_restore(arguments, vault):
+        if tool.egress and not confirmed and _egress_needs_restore(
+            arguments, vault, approved=self._egress_approved(account_id)
+        ):
             return {"status": "confirm", "tool": tool_name, "reason": "egress"}
         logged_input = {
             redact(key, vault, vocabulary=vocabulary)[0]: (
@@ -436,21 +495,27 @@ class Assistant:
 _PLACEHOLDER_ONLY = REFERENCE
 
 
-def _egress_needs_restore(arguments: dict[str, Any], vault: Vault) -> bool:
+def _egress_needs_restore(
+    arguments: dict[str, Any], vault: Vault, *, approved: frozenset[str] = frozenset()
+) -> bool:
     """True when an egress argument still holds a placeholder the person must approve."""
-    return _arg_needs_restore(arguments, vault)
+    return _arg_needs_restore(arguments, vault, approved)
 
 
-def _arg_needs_restore(value: Any, vault: Vault) -> bool:
+def _arg_needs_restore(value: Any, vault: Vault, approved: frozenset[str] = frozenset()) -> bool:
     if isinstance(value, str):
-        if "[" in value and "]" in value:
-            return vault.restore(value) != value
+        if "[" not in value or "]" not in value:
+            return False
+        for match in REFERENCE.finditer(vault.canonicalize(value)):
+            restored = vault.restore(match.group())
+            if restored != match.group() and restored not in approved:
+                return True
         return False
     if isinstance(value, list):
-        return any(_arg_needs_restore(item, vault) for item in value)
+        return any(_arg_needs_restore(item, vault, approved) for item in value)
     if isinstance(value, dict):
         return any(
-            _arg_needs_restore(str(key), vault) or _arg_needs_restore(item, vault)
+            _arg_needs_restore(str(key), vault, approved) or _arg_needs_restore(item, vault, approved)
             for key, item in value.items()
         )
     return False

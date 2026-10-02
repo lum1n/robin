@@ -11,6 +11,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from robin.auth import Auth, AuthError
+from robin.context import parse_context
 from robin.enroll import EnrollRejected, Enrollment
 from robin.loop import PendingMissing, converse, resume
 from robin.model import Model
@@ -75,6 +76,14 @@ def dispatch(
         return _post_profile(service, headers, body)
     if method == "GET" and path == "/v1/profile":
         return _get_profile(service, headers, query)
+    if method == "POST" and path == "/v1/household":
+        return _post_household(service, headers, body)
+    if method == "GET" and path == "/v1/household":
+        return _get_household(service, headers, query)
+    if method == "POST" and path == "/v1/preferences":
+        return _post_preferences(service, headers, body)
+    if method == "GET" and path == "/v1/preferences":
+        return _get_preferences(service, headers, query)
     if method == "GET" and path == "/v1/mcp":
         return _get_mcp(service, headers, query)
     if method == "POST" and path in _MCP_ACTIONS:
@@ -327,6 +336,9 @@ def _post_message(service: Service, headers: dict[str, str], body: dict[str, Any
     denied = _require(service, headers, account_id)
     if denied is not None:
         return denied
+    context = parse_context(body.get("context"))
+    if context is not None:
+        service.assistant.set_client_context(account_id, context)
     if body.get("confirm") is True:
         try:
             reply = resume(service.assistant, account_id, conversation_id, service.model)
@@ -576,6 +588,62 @@ def _get_profile(service: Service, headers: dict[str, str], query: dict[str, str
         return denied
     fields = service.assistant.get_profile(account_id)
     return 200, {"fields": fields, "present": filled_keys(fields)}
+
+
+def _post_household(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    from datetime import datetime
+
+    from robin.household import HouseholdError, member_dict, parse_members
+
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    try:
+        members = parse_members(body.get("members"), current_year=datetime.now().year)
+    except HouseholdError as exc:
+        return 400, {"error": str(exc)}
+    service.assistant.set_household(account_id, members)
+    return 200, {"members": [member_dict(member) for member in members]}
+
+
+def _get_household(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    from robin.household import member_dict
+
+    account_id = query.get("account_id")
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    return 200, {"members": [member_dict(member) for member in service.assistant.household(account_id)]}
+
+
+def _post_preferences(service: Service, headers: dict[str, str], body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    from robin.household import HouseholdError, parse_preferences, preferences_dict
+
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not account_id:
+        return 400, {"error": "account_id is required"}
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    try:
+        preferences = parse_preferences(body.get("preferences"))
+    except HouseholdError as exc:
+        return 400, {"error": str(exc)}
+    service.assistant.set_preferences(account_id, preferences)
+    return 200, preferences_dict(preferences)
+
+
+def _get_preferences(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    from robin.household import preferences_dict
+
+    account_id = query.get("account_id")
+    denied = _require(service, headers, account_id)
+    if denied is not None:
+        return denied
+    return 200, preferences_dict(service.assistant.preferences(account_id))
 
 
 def _get_mcp(service: Service, headers: dict[str, str], query: dict[str, str]) -> tuple[int, dict[str, Any]]:

@@ -78,6 +78,7 @@ class Web(Capability):
         FieldSpec("title", FieldClass.ORDINARY, free_text=True),
         FieldSpec("url", FieldClass.ORDINARY),
         FieldSpec("snippet", FieldClass.ORDINARY, free_text=True),
+        FieldSpec("date", FieldClass.ORDINARY),
     ]
 
     def __init__(
@@ -157,6 +158,7 @@ class Web(Capability):
                     "title": str(item.get("title") or ""),
                     "url": str(item.get("url") or item.get("link") or ""),
                     "snippet": str(item.get("content") or item.get("snippet") or "")[:400],
+                    **_dated(item.get("publishedDate") or item.get("date")),
                 }
             )
         return rows
@@ -172,6 +174,7 @@ class Web(Capability):
                     "title": str(item.get("title") or ""),
                     "url": str(item.get("url") or ""),
                     "snippet": str(item.get("description") or "")[:400],
+                    **_dated(item.get("page_age") or item.get("age")),
                 }
             )
         return rows[:8]
@@ -189,9 +192,16 @@ class Web(Capability):
                     "title": str(item.get("title") or ""),
                     "url": str(item.get("url") or ""),
                     "snippet": str(item.get("snippet") or "")[:400],
+                    **_dated(item.get("published")),
                 }
             )
         return rows[:8]
+
+
+def _dated(value: object) -> dict[str, str]:
+    """Publication date when the provider reports one, so stale results are recognisable."""
+    text = " ".join(str(value or "").split())[:40]
+    return {"date": text} if text and "[" not in text else {}
 
 
 def urllib_get(url: str, headers: dict[str, str] | None = None) -> str:

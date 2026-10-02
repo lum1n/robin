@@ -6,7 +6,7 @@ This is the guarantee. A neural pass can add spans. It cannot weaken these.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from robin.vault import REFERENCE, REFERENCE_CANDIDATE, Vault
@@ -79,6 +79,8 @@ class Entity:
     start: int
     end: int
     label: str
+    # Spelling to store in the vault, so case variants of a known term share one reference.
+    canonical: str = field(default="", compare=False)
 
     @property
     def disposition(self) -> Disposition:
@@ -191,7 +193,9 @@ def detect(text: str, vocabulary: tuple[VocabularyTerm, ...] = ()) -> tuple[Enti
         if not term.text:
             continue
         pattern = re.compile(r"(?<!\w)" + re.escape(term.text) + r"(?!\w)", re.IGNORECASE)
-        found.extend(Entity(match.start(), match.end(), term.label) for match in pattern.finditer(text))
+        found.extend(
+            Entity(match.start(), match.end(), term.label, term.text) for match in pattern.finditer(text)
+        )
     return tuple(_select(found))
 
 
@@ -232,7 +236,7 @@ def redact(
         if entity.disposition is Disposition.DROP:
             pieces.append(REDACTED)
         else:
-            pieces.append(vault.token(entity.label, value))
+            pieces.append(vault.token(entity.label, entity.canonical or value))
         cursor = entity.end
     pieces.append(text[cursor:])
     return vault.canonicalize("".join(pieces)), Report(

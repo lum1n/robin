@@ -11,12 +11,11 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from robin.airlock import Entity, redact, release
 from robin.capability import ActiveTurn, current_task
+from robin.context import context_lines
 from robin.learning import (
     BrowserTrace,
     draft_site_skill,
@@ -234,7 +233,7 @@ def _converse(
 ) -> Reply:
     decision = assistant.decide(task, record=messages is None)
     vault = assistant.vaults.get(task.account_id, task.conversation_id)
-    vocabulary = assistant.vocabulary.get(task.account_id, ())
+    vocabulary = assistant.vocabulary_for(task.account_id)
     ner = assistant.ner_for(task.account_id)
     trace = BrowserTrace(correction=looks_like_correction(task.text))
     if messages is None:
@@ -692,9 +691,17 @@ def _note_repeated_failure(
 
 
 def _system(assistant: Assistant, account_id: str, text: str = "", *, vault: Vault | None = None) -> str:
-    now = datetime.now().astimezone()
-    stamp = now.strftime("%Y-%m-%d %H:%M %Z")
-    lines = [SYSTEM, f"Current local time: {stamp}."]
+    preferences = assistant.preferences(account_id)
+    lines = [
+        SYSTEM,
+        *context_lines(
+            assistant.client_context(account_id),
+            vault,
+            home=assistant.get_profile(account_id),
+            style=preferences.style,
+        ),
+    ]
+    lines.extend(_personal_lines(assistant, account_id, vault, preferences))
     statuses = list(assistant.statuses(account_id))
     if not assistant.ner.available():
         statuses.append(
@@ -708,7 +715,7 @@ def _system(assistant: Assistant, account_id: str, text: str = "", *, vault: Vau
         # Lessons and chat share references for the same site.
         if vault is None:
             vault = assistant.vaults.get(account_id, "guidance")
-        vocabulary = assistant.vocabulary.get(account_id, ())
+        vocabulary = assistant.vocabulary_for(account_id)
         # Lessons are checked for secrets at save time; release with free_text=False so
         # missing NER does not turn the whole section into [UNRESOLVED].
         released = [
@@ -718,6 +725,26 @@ def _system(assistant: Assistant, account_id: str, text: str = "", *, vault: Vau
         if released:
             lines.extend(released)
     return "\n".join(lines)
+
+
+def _personal_lines(assistant: Assistant, account_id: str, vault: Vault | None, preferences) -> list[str]:
+    from datetime import datetime
+
+    from robin.household import household_line, sources_line
+
+    out: list[str] = []
+    household = household_line(assistant.household(account_id), vault, current_year=datetime.now().year)
+    if household:
+        out.append(household)
+    sources = sources_line(preferences)
+    if sources and vault is not None:
+        # Topics are typed by the person and may name someone; release them like any other text.
+        safe = _release(
+            sources, vault, assistant.vocabulary_for(account_id), assistant.ner_for(account_id), free_text=False
+        )
+        if safe and safe != "[UNRESOLVED]":
+            out.append(safe)
+    return out
 
 
 def _argument_problem(call: ToolCall, schema: dict[str, Any]) -> str:
@@ -1260,7 +1287,7 @@ def _confirm_text(assistant: Assistant, task: Task, call: ToolCall) -> str:
     if not any(str(value) for value in logged.values()):
         return base
     vault = assistant.vaults.get(task.account_id, task.conversation_id)
-    shown, _report = redact(json.dumps(logged, sort_keys=True), vault, vocabulary=assistant.vocabulary.get(task.account_id, ()))
+    shown, _report = redact(json.dumps(logged, sort_keys=True), vault, vocabulary=assistant.vocabulary_for(task.account_id))
     return f"{base} {vault.restore(shown)}"
 
 

@@ -8,6 +8,7 @@ license = "MIT"
 dependencies = [
     "cryptography>=44",
     "gliner>=0.2.22",
+    "holidays>=0.60",
     "mcp>=2.0",
     "patchright>=1.49",
     "playwright>=1.49",

@@ -29,9 +29,21 @@ public actor RobinClient {
         token = session.token
     }
 
-    public func send(conversationID: String, text: String, allowCloud: Bool = false) async throws -> Reply {
+    public func send(
+        conversationID: String,
+        text: String,
+        allowCloud: Bool = false,
+        context: DeviceContext? = nil
+    ) async throws -> Reply {
         let body = try encode(
-            MessageBody(accountID: accountID, conversationID: conversationID, text: text, confirm: nil, allowCloud: allowCloud)
+            MessageBody(
+                accountID: accountID,
+                conversationID: conversationID,
+                text: text,
+                confirm: nil,
+                allowCloud: allowCloud,
+                context: context
+            )
         )
         return try await postMessage(body)
     }
@@ -180,6 +192,48 @@ public actor RobinClient {
             token: try sessionToken()
         )
         return try JSONDecoder().decode(ProfileBody.self, from: accepted(raw, status: 200)).fields
+    }
+
+    public func household() async throws -> [HouseholdMember] {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/household", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(HouseholdBody.self, from: accepted(raw, status: 200)).members
+    }
+
+    public func saveHousehold(_ members: [HouseholdMember]) async throws -> [HouseholdMember] {
+        let body = try encode(HouseholdBody(accountID: accountID, members: members))
+        let raw = try await transport.call(
+            url: try url(path: "/v1/household"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(HouseholdBody.self, from: accepted(raw, status: 200)).members
+    }
+
+    public func preferences() async throws -> Preferences {
+        let raw = try await transport.call(
+            url: try url(path: "/v1/preferences", query: ["account_id": accountID]),
+            method: "GET",
+            body: nil,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(Preferences.self, from: accepted(raw, status: 200))
+    }
+
+    public func savePreferences(_ preferences: Preferences) async throws -> Preferences {
+        let body = try encode(PreferencesUpdate(accountID: accountID, preferences: preferences))
+        let raw = try await transport.call(
+            url: try url(path: "/v1/preferences"),
+            method: "POST",
+            body: body,
+            token: try sessionToken()
+        )
+        return try JSONDecoder().decode(Preferences.self, from: accepted(raw, status: 200))
     }
 
     public func threads() async throws -> [String] {
@@ -518,6 +572,7 @@ private struct MessageBody: Encodable {
     var text: String?
     var confirm: Bool?
     var allowCloud: Bool?
+    var context: DeviceContext? = nil
 
     enum CodingKeys: String, CodingKey {
         case accountID = "account_id"
@@ -525,6 +580,7 @@ private struct MessageBody: Encodable {
         case text
         case confirm
         case allowCloud = "allow_cloud"
+        case context
     }
 
     func encode(to encoder: Encoder) throws {
@@ -534,6 +590,7 @@ private struct MessageBody: Encodable {
         try container.encodeIfPresent(text, forKey: .text)
         try container.encodeIfPresent(confirm, forKey: .confirm)
         try container.encodeIfPresent(allowCloud, forKey: .allowCloud)
+        try container.encodeIfPresent(context, forKey: .context)
     }
 }
 

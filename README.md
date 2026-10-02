@@ -22,7 +22,7 @@ Pass a `HouseholdStore` when constructing `Assistant` and the house server keeps
 
 The private image is `deploy/Dockerfile`. It is based on exeuntu, installs this package and Chromium, and leaves the Robin unit disabled until the setup script starts it. Build it with `docker build -t nimul/robin:pinned -f deploy/Dockerfile .` and publish that tag. The create call pulls `nimul/robin:pinned` and does not carry registry credentials. The house server does not run this image.
 
-`clients/RobinKit` is what the Mac and iPhone shells share. `Shell` signs in to one instance, shows a reply, and stops on a confirmation until the person confirms. Leaving drops that session before another instance is opened. `RobinApp` is the SwiftUI screen for both. It builds on a Mac. It does not redact, and it does not call a model provider.
+`clients/RobinKit` is what the Mac and iPhone shells share. `Shell` signs in to one instance, shows a reply, and stops on a confirmation until the person confirms. Leaving drops that session before another instance is opened. `RobinApp` is the SwiftUI screen for both. It builds on a Mac. Each message sends the device time zone, locale, and, when the bundle declares `NSLocationWhenInUseUsageDescription`, a coarse location. The location reaches the model only as references (see `docs/privacy.md`). It does not redact, and it does not call a model provider.
 
 Details, including the threat model and private VMs, are in [docs/privacy.md](docs/privacy.md). Adding a capability is described in [docs/capabilities.md](docs/capabilities.md).
 

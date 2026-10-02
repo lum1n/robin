@@ -35,6 +35,8 @@ final class ShellModel: ObservableObject {
     @Published var profileCity = ""
     @Published var profilePostalCode = ""
     @Published var profileCountry = ""
+    @Published var household: [HouseholdMember] = []
+    @Published var preferences = Preferences()
     @Published var vaultPassphrase = ""
     @Published var vaultExport = ""
     @Published var failure: String?
@@ -44,6 +46,7 @@ final class ShellModel: ObservableObject {
     @Published private(set) var attention: [AttentionItem] = []
 
     private let shell: Shell
+    private let locator = DeviceLocator()
     private var pollMirror: Task<Void, Never>?
 
     init(shell: Shell = Shell()) {
@@ -68,6 +71,7 @@ final class ShellModel: ObservableObject {
             phase = await shell.phase
             await AttentionAlerts.requestPermission()
             await syncAttention(alertFresh: false)
+            locator.start()
             startMirroringPoll()
             #if os(iOS)
             AttentionAlerts.scheduleBackgroundRefresh()
@@ -83,8 +87,9 @@ final class ShellModel: ObservableObject {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !waiting else { return }
         draft = ""
+        let context = locator.context()
         await perform {
-            try await self.shell.send(conversationID: self.conversationID, text: text)
+            try await self.shell.send(conversationID: self.conversationID, text: text, context: context)
         }
     }
 
@@ -206,6 +211,24 @@ final class ShellModel: ObservableObject {
         }
     }
 
+    func saveHousehold() async {
+        let members = household.filter { !$0.givenName.trimmingCharacters(in: .whitespaces).isEmpty }
+        await perform {
+            self.household = try await self.shell.saveHousehold(members)
+        }
+    }
+
+    func savePreferences() async {
+        var wanted = preferences
+        wanted.sources = wanted.sources.filter {
+            !$0.topic.trimmingCharacters(in: .whitespaces).isEmpty
+                && !$0.host.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        await perform {
+            self.preferences = try await self.shell.savePreferences(wanted)
+        }
+    }
+
     func exportVault() async {
         let secret = vaultPassphrase
         vaultPassphrase = ""
@@ -255,6 +278,8 @@ final class ShellModel: ObservableObject {
         } catch {
             clearProfile()
         }
+        household = (try? await shell.household()) ?? []
+        preferences = (try? await shell.preferences()) ?? Preferences()
     }
 
     private func applyProfile(_ fields: [String: String]) {
@@ -277,6 +302,8 @@ final class ShellModel: ObservableObject {
         profileCity = ""
         profilePostalCode = ""
         profileCountry = ""
+        household = []
+        preferences = Preferences()
     }
 
     private func perform(_ work: () async throws -> Void) async {
@@ -543,6 +570,8 @@ private struct ConversationForm: View {
             Button("Save personal details") {
                 Task { await model.saveProfile() }
             }
+            HouseholdEditor(model: model)
+            PreferencesEditor(model: model)
             SecureField("Vault passphrase", text: $model.vaultPassphrase)
                 .robinField()
             TextField("Vault export", text: $model.vaultExport)
@@ -561,6 +590,71 @@ private struct ConversationForm: View {
             }
         }
         .navigationTitle(model.accountID)
+    }
+}
+
+/// Household members stay encrypted on the house; Robin's model only sees a reference, relation, and age band.
+private struct HouseholdEditor: View {
+    @ObservedObject var model: ShellModel
+
+    var body: some View {
+        Text("Household").font(.headline)
+        Text("Names and birth years never leave your house. Robin sees only a reference, the relation, and an age band.")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        ForEach($model.household) { $member in
+            Picker("Relation", selection: $member.relation) {
+                ForEach(HouseholdMember.relations, id: \.self) { Text($0.capitalized).tag($0) }
+            }
+            TextField("Given name", text: $member.givenName)
+                .robinField()
+            TextField("Family name (optional)", text: $member.familyName)
+                .robinField()
+            TextField("Birth year (optional)", text: birthYear($member))
+                .robinField()
+            Button("Remove", role: .destructive) {
+                model.household.removeAll { $0.id == member.id }
+            }
+        }
+        Button("Add household member") {
+            model.household.append(HouseholdMember(relation: "partner", givenName: ""))
+        }
+        Button("Save household") {
+            Task { await model.saveHousehold() }
+        }
+    }
+
+    private func birthYear(_ member: Binding<HouseholdMember>) -> Binding<String> {
+        Binding(
+            get: { member.wrappedValue.birthYear.map(String.init) ?? "" },
+            set: { member.wrappedValue.birthYear = Int($0.filter(\.isNumber)) }
+        )
+    }
+}
+
+private struct PreferencesEditor: View {
+    @ObservedObject var model: ShellModel
+
+    var body: some View {
+        Text("Replies and sources").font(.headline)
+        Picker("Reply style", selection: $model.preferences.style) {
+            ForEach(Preferences.styles, id: \.self) { Text($0.capitalized).tag($0) }
+        }
+        ForEach($model.preferences.sources) { $source in
+            TextField("Topic, e.g. football", text: $source.topic)
+                .robinField()
+            TextField("Site, e.g. nrk.no", text: $source.host)
+                .robinField()
+            Button("Remove", role: .destructive) {
+                model.preferences.sources.removeAll { $0.id == source.id }
+            }
+        }
+        Button("Add preferred source") {
+            model.preferences.sources.append(PreferredSource(topic: "", host: ""))
+        }
+        Button("Save preferences") {
+            Task { await model.savePreferences() }
+        }
     }
 }
 

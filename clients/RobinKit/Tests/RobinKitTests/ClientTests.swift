@@ -82,6 +82,82 @@ struct ClientTests {
         #expect(!sent.contains("chat/completions"))
     }
 
+    @Test func sendCarriesDeviceContextWithACoarseFix() async throws {
+        let transport = ScriptedTransport(responses: [
+            RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"status":"reply","text":"ok","route":"cloud","tool":null}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"status":"reply","text":"ok","route":"cloud","tool":null}"#.utf8)),
+        ])
+        let client = RobinClient(baseURL: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", transport: transport)
+        try await client.login(password: "pw")
+        let context = DeviceContext(
+            timezone: "Europe/Oslo",
+            locale: "nb_NO",
+            device: "iphone",
+            units: "metric",
+            currency: "NOK",
+            location: DeviceLocation(
+                locality: "Oslo",
+                country: "Norway",
+                latitude: 59.913868,
+                longitude: 10.752245,
+                countryCode: "NO"
+            )
+        )
+        _ = try await client.send(conversationID: "home", text: "football today", context: context)
+        _ = try await client.send(conversationID: "home", text: "no context")
+
+        let calls = await transport.calls
+        let body = try #require(JSONSerialization.jsonObject(with: calls[1].body ?? Data()) as? [String: Any])
+        let sent = try #require(body["context"] as? [String: Any])
+        #expect(sent["timezone"] as? String == "Europe/Oslo")
+        #expect(sent["device"] as? String == "iphone")
+        let location = try #require(sent["location"] as? [String: Any])
+        #expect(location["locality"] as? String == "Oslo")
+        #expect(location["latitude"] as? Double == 59.91)
+        #expect(location["longitude"] as? Double == 10.75)
+        #expect(location["region"] == nil)
+        #expect(location["country_code"] as? String == "NO")
+        #expect(sent["currency"] as? String == "NOK")
+        let bare = String(decoding: calls[2].body ?? Data(), as: UTF8.self)
+        #expect(!bare.contains("\"context\""))
+        #expect(DeviceContext.current().units == "metric" || DeviceContext.current().units == "imperial")
+    }
+
+    @Test func householdAndPreferencesRoundTripOnThisAccount() async throws {
+        let transport = ScriptedTransport(responses: [
+            RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"members":[{"relation":"child","given_name":"Ola","family_name":"","birth_year":2016}]}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"members":[{"relation":"partner","given_name":"Kari","family_name":"Nordmann","birth_year":null}]}"#.utf8)),
+            RobinRaw(status: 200, data: Data(#"{"style":"concise","sources":[{"topic":"football","host":"nrk.no"}]}"#.utf8)),
+        ])
+        let client = RobinClient(baseURL: URL(string: "http://127.0.0.1:8787")!, accountID: "ada", transport: transport)
+        try await client.login(password: "pw")
+        let loaded = try await client.household()
+        #expect(loaded.first?.givenName == "Ola" && loaded.first?.birthYear == 2016)
+        let saved = try await client.saveHousehold([HouseholdMember(relation: "partner", givenName: "Kari", familyName: "Nordmann")])
+        #expect(saved.first?.familyName == "Nordmann" && saved.first?.birthYear == nil)
+        let preferences = try await client.savePreferences(
+            Preferences(style: "concise", sources: [PreferredSource(topic: "football", host: "nrk.no")])
+        )
+        #expect(preferences.sources.first?.host == "nrk.no")
+
+        let calls = await transport.calls
+        #expect(calls[1].url.absoluteString == "http://127.0.0.1:8787/v1/household?account_id=ada")
+        let household = try #require(JSONSerialization.jsonObject(with: calls[2].body ?? Data()) as? [String: Any])
+        #expect(household["account_id"] as? String == "ada")
+        let member = try #require((household["members"] as? [[String: Any]])?.first)
+        #expect(member["given_name"] as? String == "Kari")
+        #expect(member["family_name"] as? String == "Nordmann")
+        #expect(member["birth_year"] == nil && member["id"] == nil)
+        let body = try #require(JSONSerialization.jsonObject(with: calls[3].body ?? Data()) as? [String: Any])
+        let sent = try #require(body["preferences"] as? [String: Any])
+        #expect(sent["style"] as? String == "concise")
+        let source = try #require((sent["sources"] as? [[String: Any]])?.first)
+        #expect(source["topic"] as? String == "football" && source["id"] == nil)
+        #expect(calls[3].token == "sess-1")
+    }
+
     @Test func confirmAndThreadsStayOnThisAccount() async throws {
         let transport = ScriptedTransport(responses: [
             RobinRaw(status: 200, data: Data(#"{"token":"sess-1"}"#.utf8)),

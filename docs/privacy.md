@@ -24,6 +24,24 @@ The Mac and iPhone apps are shells. Each person signs in and messages their assi
 
 Apps talk only to the instance they are using. Connector credentials and model API keys live on that instance, scoped to the account that connected them.
 
+## Device context
+
+Each message can carry a `context` object from the device. It contains the time zone, locale, device kind (`iphone`, `ipad`, or `mac`), units, and an optional `location` with `locality`, `region`, `country`, `latitude`, and `longitude`. The server validates every field and drops values it cannot parse. Coordinates are rounded to 2 decimals, about 1 km. The latest context is kept in memory for each account and is not written to the store. A message with no location keeps the last known place. Scheduled turns use that last context, or the server clock when there is none.
+
+The model sees the date, weekday, ISO week, local time, and UTC offset. It does not see the time zone name. Every location value becomes an `ADDRESS` reference in the conversation vault, which is encrypted at rest like any other reference. When the model copies a place reference into a tool argument, it is filled in locally, and the same values coming back in results are redacted again. City, region, and country references can go to an egress tool such as web search without a confirmation, because that is how "weather here" works. The search provider then sees the real city. Coordinates still need the person's confirmation before they leave the machine.
+
+The context can also carry `currency` (ISO 4217) and `location.country_code` (ISO 3166 alpha-2). Currency, locale, and units are sent to the model in plain form, so they can reveal the home country. The country code is used only locally, to look up public holidays. The model sees "weekday", "weekend", or "public holiday today", and the date of the next holiday within a week, but not the holiday's name, because the name would reveal the country. Sunrise and sunset are computed locally from the coordinates, and the model sees only "daylight/dark now" plus an approximate number of hours to the next change. Over time this hints at latitude. Whether the person is at home is decided locally by comparing the device place with the saved profile city and country. The model sees only "in their home city", "away from their home city", "in their home country", or "abroad". The profile address and city are never sent.
+
+## Household members
+
+`GET`/`POST /v1/household` stores up to 12 members (relation, given name, optional family name, optional birth year) for one account. The list is encrypted in the broker under that account, is excluded from the overview and is not part of the vault export (conversation vaults in a passphrase-encrypted export can still contain names that were used in those conversations), cannot be written through `/v1/secrets`, and is not readable by another account's session. Every name becomes a `PERSON` vocabulary term, so it is replaced by a reference in prompts, user messages, tool results, and browser observations, and restored only inside local tool arguments. Different capitalizations of the same name share one reference. The model sees lines such as `child [PERSON_…], age 6-12`. The birth year never leaves the machine; only an age band (under 6, 6-12, 13-17, adult) is sent. A member name that is also a common word, such as "May", is redacted wherever that word appears. This is reversible, but the model sees a reference instead of the word.
+
+## Preferences
+
+`GET`/`POST /v1/preferences` stores a reply style (`auto`, `concise`, `detailed`) and up to 12 preferred sources (topic and host) for one account, encrypted in the broker. Topics pass through the airlock before reaching the model. Hosts are sent plainly so the model can search or open them.
+
+The apps ask for location only "when in use", and only if the app bundle declares `NSLocationWhenInUseUsageDescription`. A SwiftPM build has no Info.plist, so it sends the time zone and locale without a location until it is packaged with that key.
+
 ## Accounts
 
 Records a capability marks private, plus vocabulary, vault, cloud opt-in, and the activity log, belong to one account. A task's model context contains that account's data plus shared resources the account is a member of. Each model call is a new request. Robin sends the recent turns of that conversation with it, so the thread continues. An open page contributes an excerpt. The prompt stays within about 6,000 characters, which fits a 4096-token local context together with the tool list and the reply. Another conversation is left out. On the cloud route those turns are redacted the same way as the current message.

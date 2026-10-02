@@ -78,6 +78,22 @@ public actor Shell {
         try await signedIn().saveProfile(fields)
     }
 
+    public func household() async throws -> [HouseholdMember] {
+        try await signedIn().household()
+    }
+
+    public func saveHousehold(_ members: [HouseholdMember]) async throws -> [HouseholdMember] {
+        try await signedIn().saveHousehold(members)
+    }
+
+    public func preferences() async throws -> Preferences {
+        try await signedIn().preferences()
+    }
+
+    public func savePreferences(_ preferences: Preferences) async throws -> Preferences {
+        try await signedIn().savePreferences(preferences)
+    }
+
     /// Read-only assistant snapshot for the signed-in account.
     public func overview() async throws -> AssistantOverview {
         try await signedIn().overview()
@@ -103,10 +119,10 @@ public actor Shell {
         try await signedIn().deleteThread(conversationID: conversationID)
     }
 
-    public func send(conversationID: String, text: String) async throws {
+    public func send(conversationID: String, text: String, context: DeviceContext? = nil) async throws {
         let current = try signedIn()
         do {
-            let reply = try await current.send(conversationID: conversationID, text: text)
+            let reply = try await current.send(conversationID: conversationID, text: text, context: context)
             try await show(reply, on: current)
         } catch {
             guard isDroppedWhileWaiting(error) else { throw error }
