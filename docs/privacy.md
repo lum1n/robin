@@ -26,7 +26,7 @@ Apps talk only to the instance they are using. Connector credentials and model A
 
 ## Device context
 
-Each message can carry a `context` object from the device. It contains the time zone, locale, device kind (`iphone`, `ipad`, or `mac`), units, and an optional `location` with `locality`, `region`, `country`, `latitude`, and `longitude`. The server validates every field and drops values it cannot parse. Coordinates are rounded to 2 decimals, about 1 km. The latest context is kept in memory for each account and is not written to the store. A message with no location keeps the last known place. Scheduled turns use that last context, or the server clock when there is none.
+Each message can carry a `context` object from the device. It contains the time zone, locale, device kind (`iphone`, `ipad`, or `mac`), units, and an optional `location` with `locality`, `region`, `country`, `latitude`, and `longitude`. The server validates every field and drops values it cannot parse. Coordinates are rounded to 2 decimals, about 1 km. The latest context is kept in memory for each account and is not written to the store. A message with no location keeps the last known place. When no place is known at all, the model is told not to guess. If the profile has a home city, the model gets it as a reference and must say it assumed home. Scheduled turns use that last context, or the server clock when there is none.
 
 The model sees the date, weekday, ISO week, local time, and UTC offset. It does not see the time zone name. Every location value becomes an `ADDRESS` reference in the conversation vault, which is encrypted at rest like any other reference. When the model copies a place reference into a tool argument, it is filled in locally, and the same values coming back in results are redacted again. City, region, and country references can go to an egress tool such as web search without a confirmation, because that is how "weather here" works. The search provider then sees the real city. Coordinates still need the person's confirmation before they leave the machine.
 
@@ -40,7 +40,7 @@ The context can also carry `currency` (ISO 4217) and `location.country_code` (IS
 
 `GET`/`POST /v1/preferences` stores a reply style (`auto`, `concise`, `detailed`) and up to 12 preferred sources (topic and host) for one account, encrypted in the broker. Topics pass through the airlock before reaching the model. Hosts are sent plainly so the model can search or open them.
 
-The apps ask for location only "when in use", and only if the app bundle declares `NSLocationWhenInUseUsageDescription`. A SwiftPM build has no Info.plist, so it sends the time zone and locale without a location until it is packaged with that key.
+The apps ask for location only "when in use", and only if the app bundle declares `NSLocationWhenInUseUsageDescription`. A SwiftPM build has no Info.plist, so it sends the time zone and locale without a location until it is packaged with that key. When permission is granted, sending waits up to 2 seconds for the first fix, so the first message after launch carries a place.
 
 ## Accounts
 

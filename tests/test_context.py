@@ -54,6 +54,16 @@ def test_without_device_context_the_server_clock_is_used_and_location_is_unknown
     assert "Location: unknown" in lines
 
 
+def test_unknown_location_forbids_guessing_and_offers_home_city_only_as_a_reference() -> None:
+    vault = Vault("ada", "home")
+    bare = "\n".join(context_lines(None, vault, now=NOW))
+    assert "Never assume where the person is" in bare and "ask first" in bare
+    lines = "\n".join(context_lines(None, vault, now=NOW, home={"city": "Tønsberg"}))
+    assert "Tønsberg" not in lines
+    home = re.search(r"home city is (\[ADDRESS_[0-9a-f]{32}_\d+\])", lines).group(1)
+    assert vault.restore(home, strict=True) == "Tønsberg"
+
+
 def test_malformed_context_fields_are_dropped() -> None:
     assert parse_context("Europe/Oslo") is None
     assert parse_context({"timezone": "Not/AZone", "device": "toaster", "units": "furlongs"}) is None

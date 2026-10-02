@@ -43,6 +43,24 @@ final class DeviceLocator: NSObject, CLLocationManagerDelegate {
         return DeviceContext.current(device: Self.device, location: latest)
     }
 
+    /// Like `context()`, but briefly waits for a first fix and its place name so the first turn after launch has one.
+    func context(waitingUpTo seconds: Double) async -> DeviceContext {
+        start()
+        let deadline = Date().addingTimeInterval(seconds)
+        while isAuthorized, latest?.locality == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return DeviceContext.current(device: Self.device, location: latest)
+    }
+
+    private var isAuthorized: Bool {
+        guard Self.canAsk else { return false }
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse: return true
+        default: return false
+        }
+    }
+
     private static var device: String {
         #if os(iOS)
         if ProcessInfo.processInfo.isiOSAppOnMac { return "mac" }

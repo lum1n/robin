@@ -87,7 +87,7 @@ final class ShellModel: ObservableObject {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !waiting else { return }
         draft = ""
-        let context = locator.context()
+        let context = await locator.context(waitingUpTo: 2)
         await perform {
             try await self.shell.send(conversationID: self.conversationID, text: text, context: context)
         }

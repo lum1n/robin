@@ -142,7 +142,7 @@ def context_lines(
             "(e.g. web_search 'weather <city reference> <date>'). Never guess, ask for, or reveal the real place."
         )
     else:
-        lines.append("- Location: unknown. Ask the person for a place only when the task needs one.")
+        lines.append(_unknown_location_line(home or {}, vault))
     whereabouts = _whereabouts(location, home or {})
     if whereabouts:
         lines.append(f"- The person is {whereabouts}.")
@@ -150,6 +150,20 @@ def context_lines(
     if reply:
         lines.append(reply)
     return lines
+
+
+def _unknown_location_line(home: dict[str, str], vault: Vault | None) -> str:
+    line = (
+        "- Location: unknown (the device shared none). Never assume where the person is — not from their "
+        "language, time zone, earlier replies, or your training data."
+    )
+    city = (home.get("city") or "").strip()
+    if city and vault is not None:
+        return (
+            f"{line} Their saved home city is {vault.token('ADDRESS', city)}; for tasks that depend on where they "
+            "are now (next departure, nearby, weather here), use it and say you assumed home, or ask."
+        )
+    return f"{line} For tasks that depend on where they are now (next departure, nearby, weather here), ask first."
 
 
 def _country_code(context: ClientContext | None) -> str:
