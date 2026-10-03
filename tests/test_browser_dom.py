@@ -214,7 +214,7 @@ def test_ambiguous_controls_options_and_obstruction_do_not_choose_first(page):
     snapshot, _ = operator.read()
     with pytest.raises(RuntimeError, match="missing or ambiguous"):
         operator.select_option("Sort", "Price", ref=ref(snapshot, "Sort"))
-    with pytest.raises(RuntimeError, match="could not be clicked"):
+    with pytest.raises(RuntimeError, match="intercepts pointer"):
         operator.click("Apply", ref=ref(snapshot, "Apply"))
     assert page.evaluate("window.clicked") is None
 

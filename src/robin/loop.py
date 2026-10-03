@@ -1476,7 +1476,7 @@ def _recover_listing_text(assistant: Assistant, task: Task, call: ToolCall, lead
                 task.account_id,
                 task.conversation_id,
                 "browser_read",
-                {"region": "main"},
+                {},
                 for_model=True,
             ).get("result")
             or ""
