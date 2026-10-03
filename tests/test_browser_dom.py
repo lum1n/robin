@@ -193,8 +193,11 @@ def test_delayed_same_length_results_and_busy_timeout(page):
     snapshot, _ = operator.read()
     assert "Applied 2027" in snapshot
     page.locator("p").evaluate("(node) => node.setAttribute('aria-busy','true')")
-    with pytest.raises(RuntimeError, match="still loading"):
-        operator.settle(timeout_ms=500)
+    status = operator.settle(timeout_ms=500)
+    assert status.get("still_updating") is True
+    snapshot, _ = operator.read()
+    assert "Still updating" in snapshot
+    assert "2027" in snapshot
 
 
 def test_ambiguous_controls_options_and_obstruction_do_not_choose_first(page):
@@ -384,3 +387,66 @@ def test_recovery_resets_stagnation_only_after_observed_control_change(page):
     assert len(calls) == 3
     assert page.locator("input").is_checked()
     assert "not verified" in reply.text
+
+
+def test_listing_cards_appear_as_content_lines(page):
+    page.set_content(
+        '<main><h1>Dairy</h1>'
+        '<a href="/milk"><div><span>Helmelk 1L</span><span>18 kr</span></div></a>'
+        '<a href="/bread"><div><span>Kneipp</span><span>22 kr</span></div></a>'
+        '</main>'
+    )
+    snapshot, _ = PlaywrightPage(page).read()
+    content = snapshot.split("Content:", 1)[1]
+    assert "Helmelk 1L" in content and "18 kr" in content
+    assert "Kneipp" in content
+
+
+def test_cross_origin_frame_emits_unread_control(page):
+    page.set_content(
+        '<main><h1>Times</h1>'
+        '<iframe title="Timetable" src="https://widget.entur.example/"></iframe>'
+        '</main>'
+    )
+    snapshot, _ = PlaywrightPage(page).read()
+    assert 'frame "Timetable"' in snapshot or 'frame "widget.entur.example"' in snapshot
+    assert "unread" in snapshot
+    assert "text not readable" in snapshot
+    from robin.capabilities.browser import _bot_wall_note
+    assert _bot_wall_note(snapshot) == ""
+
+
+def test_filter_budget_keeps_main_listing_links(page):
+    filters = "".join(f'<label>Filter {i}<input type="checkbox"></label>' for i in range(90))
+    products = "".join(f'<a href="/p{i}">Helmelk {i}L 18 kr</a><br>' for i in range(12))
+    page.set_content(f'<aside>{filters}</aside><main><h1>Shop</h1>{products}</main>')
+    snapshot, _ = PlaywrightPage(page).read()
+    assert "Helmelk 1L" in snapshot
+    assert '[1]' in snapshot
+
+
+def test_non_blocking_dialog_keeps_main_content(page):
+    page.set_content(
+        '<main><h1>Shop</h1><a href="/milk"><div>Helmelk 1L 18 kr</div></a></main>'
+        '<div role="dialog" aria-label="Get the app" style="position:fixed;right:8px;bottom:8px;'
+        'width:160px;height:80px;background:white">'
+        '<p>Get the app</p><button>Close</button></div>'
+    )
+    snapshot, _ = PlaywrightPage(page).read()
+    assert "Helmelk 1L" in snapshot.split("Content:", 1)[1]
+    assert "Dismissible dialog" in snapshot or "Get the app" in snapshot
+
+
+def test_overlay_click_reports_blocker_and_keeps_ref(page):
+    page.set_content(
+        '<button id="buy">Legg i handlekurv</button>'
+        '<div id="wall" style="position:fixed;inset:0;z-index:10;background:white">Cookie</div>'
+    )
+    operator = PlaywrightPage(page)
+    snapshot, _ = operator.read()
+    target = ref(snapshot, "Legg i handlekurv")
+    with pytest.raises(RuntimeError, match="intercepts pointer") as raised:
+        operator.click("Legg i handlekurv", ref=target)
+    assert f"[{target}]" in str(raised.value)
+    assert "still current" in str(raised.value)
+    assert page.evaluate("window.clicked") is None

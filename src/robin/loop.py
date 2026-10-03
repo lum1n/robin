@@ -80,6 +80,11 @@ _MODEL_CHARS = 60_000
 _TOOL_RESULT_CHARS = 12_000
 _HISTORY_TURNS = 16
 _TURN_CHARS = 1200
+_CHAIN_AFTER = {
+    "browser_type": frozenset({"browser_press"}),
+    "browser_type_focused": frozenset({"browser_press"}),
+    "browser_scroll": frozenset({"browser_read", "browser_find"}),
+}
 
 
 class PendingMissing(LookupError):
@@ -310,6 +315,8 @@ def _converse(
         nudges: list[dict[str, Any]] = []
 
         browser_acted = False
+        chain_head = ""
+        chain_used = False
         # Read-only (and other non-confirm) calls in this batch finish before the first confirm.
         for index, call in enumerate(_order_batch(assistant, task, calls)):
             if _superseded():
@@ -321,23 +328,31 @@ def _converse(
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": problem})
                 continue
             repeat_key = json.dumps({"name": call.name, "arguments": call.arguments}, sort_keys=True, default=str)
-            if repeats.get(repeat_key, 0) >= 4 and call.name.startswith("browser_"):
-                return Reply("reply", "The browser made no progress after repeated actions. "
-                             "I could not verify the requested filters or results.", decision.route)
             browser_action = call.name.startswith("browser_") and call.name not in {"browser_read", "browser_find"}
-            if browser_acted and browser_action:
+            chained = (
+                browser_acted
+                and not chain_used
+                and call.name in _CHAIN_AFTER.get(chain_head, ())
+            )
+            if repeats.get(repeat_key, 0) >= 2 and call.name.startswith("browser_"):
+                outcome = _recover_listing_text(
+                    assistant, task, call,
+                    "Action blocked: repeated operation made no progress. "
+                    "Newly revealed listing text follows. "
+                    "Use a different current control; do not retry these arguments.",
+                )
+            elif browser_acted and browser_action and not chained:
                 outcome = {"status": "error", "result": (
                     "Action blocked: inspect the preceding browser result before another action. "
                     "Request this action in the next turn using its current Interactive refs."
                 )}
-            elif repeats.get(repeat_key, 0) >= 2 and call.name.startswith("browser_"):
-                outcome = {"status": "error", "result": (
-                    "Action blocked: repeated operation made no progress. "
-                    "Use browser_find, scoped browser_read, or a different current control; "
-                    "the requested filters/results have not been verified."
-                )}
             else:
-                browser_acted = browser_acted or browser_action
+                if chained:
+                    chain_used = True
+                if browser_action:
+                    browser_acted = True
+                    if not chain_head:
+                        chain_head = call.name
                 outcome = assistant.invoke(
                     task.account_id, task.conversation_id, call.name, call.arguments, for_model=True,
                 )
@@ -398,7 +413,8 @@ def _converse(
             action_lead = result.split("\nURL:", 1)[0] if not result.startswith("URL:") else ""
             if any(line.startswith(("changed: url ", "changed: popup opened",
                                     "changed: page closed", "changed: dialog open",
-                                    "changed: control state changed"))
+                                    "changed: control state changed",
+                                    "changed: scroll position"))
                    for line in action_lead.splitlines()):
                 repeats.clear()
             if len(result) > _TOOL_RESULT_CHARS:
@@ -718,6 +734,8 @@ def _note_repeated_failure(
     """Detect identical failing tool calls so the model stops retrying the same dead end."""
     line = (result or "").strip().splitlines()[0].strip() if result else ""
     lead = result.split("\nURL:", 1)[0] if not result.startswith("URL:") else ""
+    if _is_overlay_miss(result):
+        return result, False
     failed = bool(line) and (
         "no observable change" in lead
         or line.startswith("Action blocked: repeated operation")
@@ -1444,26 +1462,45 @@ def _menu_spam(body: str) -> bool:
     return any(word in lower for word in ("clinic", "klinikk", "home visit", "hjemme", "video", "option", "appointment", "bestill"))
 
 
+def _is_overlay_miss(result: str) -> bool:
+    lower = (result or "").lower()
+    return "intercepts pointer" in lower or ("covered by" in lower and "overlay" in lower)
+
+
+def _recover_listing_text(assistant: Assistant, task: Task, call: ToolCall, lead: str) -> dict[str, str]:
+    """After a blocked repeat, return newly revealed main-region text instead of ending the turn."""
+    recovered = ""
+    try:
+        recovered = str(
+            assistant.invoke(
+                task.account_id,
+                task.conversation_id,
+                "browser_read",
+                {"region": "main"},
+                for_model=True,
+            ).get("result")
+            or ""
+        )
+    except Exception:
+        recovered = ""
+    return {"status": "error", "result": f"{lead}\n{recovered}".strip()}
+
+
 def _bot_block_spam(body: str) -> bool:
-    """True when a past reply reported a real WAF/captcha/automation block (keep that fact)."""
+    """True when a past reply reported a real captcha/challenge wall (keep that fact)."""
     lower = body.lower()
     return any(
         phrase in lower
         for phrase in (
             "bot/captcha",
             "captcha wall",
-            "blocking automated",
-            "blocked automated",
-            "blocks automation",
-            "blocked automation",
-            "security polic",
-            "security policies",
-            "has been blocked",
-            "access to the website has been blocked",
-            "access to the website has been denied",
-            "waf",
-            "are you a human or a robot",
+            "a captcha or security check",
             "verify you are human",
+            "are you a human or a robot",
+            "px/captcha",
+            "checking your browser",
+            "cf-challenge",
+            "human verification",
         )
     )
 

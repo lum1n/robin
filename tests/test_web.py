@@ -48,8 +48,13 @@ def test_access_spam_collapses_prior_refusals() -> None:
         "Access to the LOT website has been blocked due to security policies, so "
         "I'm unable to retrieve flight information directly from there."
     )
-    assert _bot_block_spam(blocked)
-    assert not _access_spam(blocked)
+    assert not _bot_block_spam(blocked)
+    captcha = (
+        "A captcha or security check is blocking the page. "
+        "Open the live view, solve it, then tap Done so Robin can continue."
+    )
+    assert _bot_block_spam(captcha)
+    assert not _access_spam(captcha)
 
 
 def test_find_site_returns_homepage_of_top_result() -> None:

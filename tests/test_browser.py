@@ -1374,8 +1374,10 @@ def test_ref_click_does_not_bypass_an_obstruction() -> None:
     page = Blocked()
     import pytest
 
-    with pytest.raises(RuntimeError, match="could not be clicked"):
+    with pytest.raises(RuntimeError, match="intercepts pointer") as raised:
         PlaywrightPage(page).click("Bil", role="link", ref="22")
+    assert "[22]" in str(raised.value)
+    assert "still current" in str(raised.value)
     assert page.forced is False
     assert page.js is False
 
@@ -1508,9 +1510,15 @@ def test_bot_wall_note_flags_captcha_and_empty_iframe() -> None:
 
     empty = (
         "URL: https://flybillet.no/\nTitle: flybillet.no\n\nInteractive:\n\n"
-        "[1] button \"iframe\" (main, focused)\n\nContent:\n(empty)"
+        "[1] frame \"widget.entur.no\" (main, unread)\n\n"
+        "Content:\nembedded frame from widget.entur.no — text not readable"
     )
-    assert "no usable content" in _bot_wall_note(empty)
+    assert _bot_wall_note(empty) == ""
+    oops = (
+        "URL: https://shop.example/\n\nInteractive:\n[1] button \"Retry\"\n\n"
+        "Content:\nSomething went wrong loading reviews"
+    )
+    assert _bot_wall_note(oops) == ""
 
     ok = "URL: https://example.com/\nTitle: Hi\n\nInteractive:\n[1] link \"Home\"\n\nContent:\nHello"
     assert _bot_wall_note(ok) == ""
@@ -1566,3 +1574,194 @@ def test_session_marks_placeholder_site_as_named(tmp_path) -> None:
     token = vault.token("ORG", "Some Shop")
     assistant.invoke("ada", "t", "browser_open", {"url": token}, confirmed=True)
     assert seen == {"url": "Some Shop", "named_site": True}
+
+
+def test_format_snapshot_reserves_main_listing_links() -> None:
+    from robin.capabilities.browser import _format_snapshot, _window_interactive
+
+    filters = [
+        {"ref": str(i), "role": "checkbox", "name": f"Filter {i}", "region": "page", "states": [], "value": "", "order": i}
+        for i in range(1, 91)
+    ]
+    listings = [
+        {
+            "ref": str(200 + i),
+            "role": "link",
+            "name": f"Helmelk {i}L",
+            "region": "main",
+            "states": [],
+            "value": "",
+            "order": 200 + i,
+        }
+        for i in range(1, 16)
+    ]
+    ordered = _window_interactive(filters + listings)
+    names = [item["name"] for item in ordered[:80]]
+    assert any(name.startswith("Helmelk") for name in names)
+    formatted = _format_snapshot({
+        "url": "https://shop.test/",
+        "interactive": filters + listings,
+        "content": "Helmelk 1L 18 kr",
+    })
+    assert "Helmelk 1L" in formatted
+    assert "Controls omitted:" in formatted
+
+
+def test_find_matches_listing_content_and_returns_nearest_ref() -> None:
+    class ListingPage:
+        url = "https://shop.test/"
+        frames = ()
+        main_frame = None
+
+        def evaluate(self, script: str) -> dict:
+            return {
+                "url": self.url,
+                "title": "Shop",
+                "interactive": [
+                    {"ref": "3", "role": "checkbox", "name": "Organic", "region": "page", "states": [], "value": ""},
+                    {"ref": "12", "role": "link", "name": "Milk", "region": "main", "states": [], "value": "", "order": 12},
+                ],
+                "listings": [{"text": "Helmelk 1L 18 kr", "ref": "12", "region": "main"}],
+                "content": "Helmelk 1L 18 kr",
+                "moreBelow": False,
+                "secrets": [],
+            }
+
+        def locator(self, selector: str):
+            return Node()
+
+    snapshot, _ = PlaywrightPage(ListingPage()).read(query="18 kr")
+    assert '[12] link "Milk"' in snapshot
+    assert "Helmelk 1L 18 kr" in snapshot.split("Content:", 1)[1]
+
+
+def test_unread_cross_origin_frame_is_not_a_bot_wall() -> None:
+    from robin.capabilities.browser import _bot_wall_note, _format_snapshot
+
+    formatted = _format_snapshot({
+        "url": "https://entur.test/",
+        "interactive": [
+            {"ref": "4", "role": "frame", "name": "widget.entur.no", "region": "main", "states": ["unread"], "value": "widget.entur.no"},
+        ],
+        "content": "embedded frame from widget.entur.no — text not readable",
+    })
+    assert '[4] frame "widget.entur.no"' in formatted
+    assert "unread" in formatted
+    assert "text not readable" in formatted
+    assert _bot_wall_note(formatted) == ""
+
+
+def test_dismissible_dialog_does_not_replace_main_content() -> None:
+    from robin.capabilities.browser import _format_snapshot
+
+    formatted = _format_snapshot({
+        "url": "https://shop.test/",
+        "interactive": [
+            {"ref": "1", "role": "button", "name": "Get the app", "region": "dialog", "states": [], "value": ""},
+            {"ref": "8", "role": "link", "name": "Helmelk 1L", "region": "main", "states": [], "value": ""},
+        ],
+        "content": "Helmelk 1L 18 kr",
+        "dismissible_dialogs": [{"name": "Get the app", "ref": "1"}],
+    })
+    assert "Dismissible dialog: Get the app" in formatted
+    assert "Content is from main" in formatted
+    assert "Helmelk 1L 18 kr" in formatted.split("Content:", 1)[1]
+
+
+def test_stable_fingerprint_ignores_clocks_and_ads() -> None:
+    from robin.capabilities.browser import _stable_fingerprint
+
+    quiet = {
+        "content": "Next train Oslo S\n14:32\nAdvertisement\nHelmelk 1L",
+        "interactive": [
+            {"role": "status", "name": "14:32", "states": [], "value": ""},
+            {"role": "link", "name": "Oslo S", "states": [], "value": ""},
+        ],
+    }
+    ticking = {
+        "content": "Next train Oslo S\n14:33\nAdvertisement\nHelmelk 1L",
+        "interactive": [
+            {"role": "status", "name": "14:33", "states": [], "value": ""},
+            {"role": "link", "name": "Oslo S", "states": [], "value": ""},
+        ],
+    }
+    assert _stable_fingerprint("https://vy.test/", 0, quiet) == _stable_fingerprint("https://vy.test/", 0, ticking)
+
+
+def test_clear_gate_accepts_jeg_forstar() -> None:
+    import re
+
+    class Frame:
+        def __init__(self, labels: list[str]) -> None:
+            self.labels = labels
+            self.clicked: list[str] = []
+
+        def get_by_role(self, role: str, name: str = ""):
+            pattern = name.pattern if hasattr(name, "pattern") else str(name)
+            rows = [label for label in self.labels if re.search(pattern, label, re.I)]
+            return _GateNode(self, rows)
+
+    class Page(Frame):
+        def __init__(self) -> None:
+            super().__init__(["Jeg forstår"])
+            self.frames = [self]
+            self.main_frame = None
+
+        def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+    class _GateNode:
+        def __init__(self, owner: Frame, rows: list[str]) -> None:
+            self.owner = owner
+            self.rows = rows
+
+        def count(self) -> int:
+            return len(self.rows)
+
+        @property
+        def first(self):
+            return self
+
+        def click(self, timeout: int | None = None) -> None:
+            self.owner.clicked.append(self.rows[0])
+
+    page = Page()
+    PlaywrightPage(page).clear_gate()
+    assert page.clicked == ["Jeg forstår"]
+
+
+def test_settle_timeout_is_still_updating_not_an_error() -> None:
+    class Busy:
+        url = "https://vy.test/"
+        frames = ()
+        main_frame = None
+
+        def wait_for_load_state(self, state: str, timeout: int | None = None) -> None:
+            return None
+
+        def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        def evaluate(self, script: str):
+            if "aria-busy" in script:
+                return True
+            return {
+                "url": self.url,
+                "title": "Board",
+                "interactive": [],
+                "content": "Oslo S 14:32",
+                "moreBelow": False,
+                "secrets": [],
+            }
+
+        def locator(self, selector: str):
+            node = Node()
+            node.values = []
+            return node
+
+    operator = PlaywrightPage(Busy())
+    status = operator.settle(timeout_ms=200)
+    assert status.get("still_updating") is True
+    snapshot, _ = operator.read()
+    assert "Still updating" in snapshot
+    assert "Oslo S" in snapshot
