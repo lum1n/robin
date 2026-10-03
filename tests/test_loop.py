@@ -1006,8 +1006,8 @@ def test_follow_up_sees_prior_tool_trace_without_secrets(tmp_path) -> None:
             ModelTurn(
                 "",
                 (
-                    ToolCall("transit_trip", {"from": "home", "to": "work"}),
-                    ToolCall("lists_add", {"list": "groceries", "item": SECRET}),
+                    ToolCall("transit_trip", {"from": "home", "to": "work"}, id="bus"),
+                    ToolCall("lists_add", {"list": "groceries", "item": SECRET}, id="list"),
                 ),
             ),
             ModelTurn("The bus is soon and the list is updated."),
@@ -1018,7 +1018,19 @@ def test_follow_up_sees_prior_tool_trace_without_secrets(tmp_path) -> None:
         Task("ada", "t", "check the bus and add milk to the list for Jane Doe", allow_cloud=True),
         first,
     )
-    second = Scripted([ModelTurn("I will do the same for the other child.")])
+    second = Scripted(
+        [
+            ModelTurn("I will do the same for the other child."),
+            ModelTurn(
+                "",
+                (
+                    ToolCall("transit_trip", {"from": "home", "to": "work"}, id="bus2"),
+                    ToolCall("lists_add", {"list": "groceries", "item": "milk"}, id="list2"),
+                ),
+            ),
+            ModelTurn("Done for the other child."),
+        ]
+    )
     converse(
         assistant,
         Task("ada", "t", "do the same for the other kid", allow_cloud=True),
@@ -1076,11 +1088,16 @@ def test_tool_and_history_text_stay_usable_when_ner_is_cold(tmp_path) -> None:
         ]
     )
     converse(assistant, Task("ada", "t", "look at mail", allow_cloud=True), model)
-    prompt = "\n".join(_user_text(messages) for messages, _tools in model.seen)
-    assert "soccer" in prompt
-    assert "Jane Doe" not in prompt
-    assert "jane@example.com" not in prompt
-    assert UNRESOLVED not in prompt
+    history = "\n".join(
+        str(message.get("content") or "")
+        for messages, _tools in model.seen
+        for message in messages
+        if message.get("role") in {"user", "tool"}
+    )
+    assert "soccer" in history
+    assert "Jane Doe" not in history
+    assert "jane@example.com" not in history
+    assert UNRESOLVED not in history
     tool_text = "\n".join(
         str(message.get("content") or "")
         for messages, _tools in model.seen

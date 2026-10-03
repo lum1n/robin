@@ -245,6 +245,7 @@ def _converse(
     used_families: set[str] = set()
     task_text = str(prior_trace.get("task") or task.text) if continues else task.text
     assistant._task_progress = {"task": task_text, "wanted": wanted, "used": used_families}
+    nudged = False
     if seed_calls:
         finished_ids = {str(item.get("id")) for item in seed_calls}
         for item in batch:
@@ -257,7 +258,16 @@ def _converse(
         if continues and prior_trace.get("task"):
             open_task = _release(str(prior_trace["task"]), vault, vocabulary, ner, free_text=True)
         messages = [
-            {"role": "system", "content": _system(assistant, task.account_id, task.text, vault=vault)},
+            {
+                "role": "system",
+                "content": _system(
+                    assistant,
+                    task.account_id,
+                    task.text,
+                    vault=vault,
+                    trace=_trace_history(assistant, task),
+                ),
+            },
             {"role": "user", "content": _user_message(spoken, history, open_task=open_task)},
         ]
         _trim_messages(messages)
@@ -298,10 +308,11 @@ def _converse(
                 remaining = (wanted - used_families) if len(wanted) >= 2 else set()
                 if (
                     remaining
+                    and not nudged
                     and not _needs_person(turn.message)
                     and not _explicit_finish(turn.message)
                 ):
-                    messages.append({"role": "assistant", "content": turn.message or ""})
+                    nudged = True
                     messages.append(
                         {
                             "role": "user",
@@ -405,6 +416,7 @@ def _converse(
                 return _after_turn(assistant, task, model, reply, trace)
             result = _release_result(outcome["result"], vault, vocabulary, ner)
             used_families.add(_tool_family(call.name))
+            nudged = False
             _record_step(assistant, task.account_id, task.conversation_id, call.name, call.arguments, result)
             action_lead = result.split("\nURL:", 1)[0] if not result.startswith("URL:") else ""
             if any(line.startswith(("changed: url ", "changed: popup opened",
@@ -743,7 +755,14 @@ def _note_repeated_failure(
     return f"{result}\n{notice}", count >= 3
 
 
-def _system(assistant: Assistant, account_id: str, text: str = "", *, vault: Vault | None = None) -> str:
+def _system(
+    assistant: Assistant,
+    account_id: str,
+    text: str = "",
+    *,
+    vault: Vault | None = None,
+    trace: str = "",
+) -> str:
     preferences = assistant.preferences(account_id)
     lines = [
         SYSTEM,
@@ -778,6 +797,8 @@ def _system(assistant: Assistant, account_id: str, text: str = "", *, vault: Vau
         released = [line for line in released if line and line != "[UNRESOLVED]"]
         if released:
             lines.extend(released)
+    if trace:
+        lines.append(trace)
     return "\n".join(lines)
 
 
@@ -1406,9 +1427,6 @@ def _history(assistant: Assistant, task: Task, vault, vocabulary, ner) -> str:
             if who == "robin" and _news_spam(body):
                 body = "earlier reply listed news headlines — ignore unless the person asks for news"
             lines.append(f"{who}: {body}")
-    trail = _trace_history(assistant, task)
-    if trail:
-        lines.append(trail)
     return "\n".join(lines)
 
 
