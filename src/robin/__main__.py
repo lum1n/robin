@@ -48,6 +48,14 @@ def main(argv: list[str] | None = None) -> int:
     tick_cmd.add_argument("--store", required=True)
     tick_cmd.add_argument("--key", required=True)
     tick_cmd.add_argument("--model", default="http://127.0.0.1:8080")
+    tick_cmd.add_argument(
+        "--model-provider",
+        choices=("openai", "nearai"),
+        default="openai",
+        help="openai: OpenAI-compatible URL. nearai: NEAR AI Cloud TEE models + privacy filter.",
+    )
+    tick_cmd.add_argument("--model-name", default="local")
+    tick_cmd.add_argument("--model-url", default="")
 
     boot_cmd = sub.add_parser("boot")
     boot_cmd.add_argument("--token", default="/etc/robin/enroll.token")
@@ -60,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     boot_cmd.add_argument("--port", type=int, default=8787)
     boot_cmd.add_argument("--model-url", default="http://127.0.0.1:8080")
     boot_cmd.add_argument("--model-name", default="local")
+    boot_cmd.add_argument(
+        "--model-provider",
+        choices=("openai", "nearai"),
+        default="openai",
+        help="openai: OpenAI-compatible URL. nearai: NEAR AI Cloud TEE models + privacy filter.",
+    )
     boot_cmd.add_argument("--mcp-config", default="/etc/robin/mcp.json")
     boot_cmd.add_argument(
         "--ner-model",
@@ -144,7 +158,6 @@ def _exe_token(args: argparse.Namespace) -> int:
 
 def _tick(args: argparse.Namespace) -> int:
     from robin.capabilities.install import install
-    from robin.model import ChatModel
     from robin.schedule import tick
     from robin.store import HouseholdStore
 
@@ -156,9 +169,44 @@ def _tick(args: argparse.Namespace) -> int:
     store = HouseholdStore(store_path, key_path.read_bytes().strip())
     assistant = Assistant(store=store)
     install(assistant)
-    replies = tick(assistant, ChatModel(base_url=args.model))
+    model_url = args.model_url or args.model
+    replies = tick(
+        assistant,
+        _build_model(
+            provider=args.model_provider,
+            model_url=model_url,
+            model_name=args.model_name,
+            api_key=os.environ.get("ROBIN_MODEL_KEY", ""),
+        ),
+    )
     print(json.dumps({"checked": len(replies), "confirm": sum(reply.status == "confirm" for reply in replies)}))
     return 0
+
+
+def _build_model(*, provider: str, model_url: str, model_name: str, api_key: str):
+    """Build the configured Model. nearai requires a key and only accepts TEE chat models."""
+    from robin.model import (
+        NEARAI_BASE,
+        NEARAI_DEFAULT_MODEL,
+        ChatModel,
+        NearAiModel,
+        TeeModelError,
+    )
+
+    if provider == "nearai":
+        if not api_key.strip():
+            raise SystemExit("nearai model provider requires ROBIN_MODEL_KEY")
+        url = model_url if model_url and model_url != "http://127.0.0.1:8080" else NEARAI_BASE
+        name = model_name if model_name and model_name != "local" else NEARAI_DEFAULT_MODEL
+        model = NearAiModel(url, model=name, api_key=api_key)
+        try:
+            model.ensure_tee()
+        except TeeModelError as exc:
+            raise SystemExit(str(exc)) from None
+        except Exception as exc:
+            raise SystemExit(f"Robin could not verify that the model runs in a TEE: {exc}") from None
+        return model
+    return ChatModel(model_url, model=model_name, api_key=api_key)
 
 
 def _start_clock(assistant: Assistant, model) -> None:
@@ -197,7 +245,6 @@ def _boot(args: argparse.Namespace) -> int:
     from robin.capabilities.install import install
     from robin.enroll import Enrollment, enroll_on_boot, urllib_enroll_post
     from robin.http import Service, serve
-    from robin.model import ChatModel
     from robin.ner import DEFAULT_MODEL, GlinerNer, NORWEGIAN_MODEL
     from robin.provision import urllib_exe_post
     from robin.store import HouseholdStore
@@ -230,7 +277,14 @@ def _boot(args: argparse.Namespace) -> int:
         print("robin: WARNING local NER failed to load — free-text cloud egress stays blocked", flush=True)
     else:
         print("robin: loading local NER in the background", flush=True)
-    model = ChatModel(args.model_url, model=args.model_name, api_key=os.environ.get("ROBIN_MODEL_KEY", ""))
+    model = _build_model(
+        provider=args.model_provider,
+        model_url=args.model_url,
+        model_name=args.model_name,
+        api_key=os.environ.get("ROBIN_MODEL_KEY", ""),
+    )
+    if args.model_provider == "nearai":
+        print(f"robin: near.ai TEE model {getattr(model, 'model', args.model_name)}", flush=True)
     _start_clock(assistant, model)
     serve(
         Service(

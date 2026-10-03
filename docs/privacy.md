@@ -86,6 +86,12 @@ The model is remote. There is no local generator. Every string sent to it is the
 
 `converse` sends that redacted view. Fetched text is released again before it is appended. A reply is restored for the person, and a secret in that reply is dropped. An external tool returns a confirmation and does not run. A tool the account cannot see is refused. The person can still be shown a page or an inbox that the model was not allowed to read.
 
+### NEAR AI Cloud (TEE)
+
+`--model-provider nearai` points Robin at NEAR AI Cloud (`https://cloud-api.near.ai`). `ROBIN_MODEL_KEY` is required. The default chat model is `z-ai/glm-5.3-flash` (fast TEE). Chat waits at most 60s with no HTTP retry; privacy classify waits at most 20s. Robin checks the public catalog and only accepts models with `verifiable` and `attestationSupported` set; the privacy-filter classification model is not a chat model and is refused for completion. Proxied Incognito models (OpenAI, Anthropic, Gemini, and similar) are refused. The second privacy pass is off by default; set `ROBIN_NEARAI_PRIVACY=1` to turn it on while keeping TEE chat.
+
+When `ROBIN_NEARAI_PRIVACY=1`, after the local airlock and before `/v1/chat/completions`, Robin classifies new **user / assistant / tool** strings with NEAR AI `/v1/privacy/classify` (`openai/privacy-filter`, TEE-hosted), batches them, and caches results across tool steps. **System** messages are not sent to the privacy filter. Strings that are already only Robin placeholders, framing (`Person:`), or `[REDACTED]`/`[UNRESOLVED]` are skipped. Spans are applied locally as `[REDACTED]`. If classify fails, the turn fails closed. Off by default so TEE chat is not blocked by that extra round trip. A cloud model is still never the primary detector: the deterministic floor and local NER run on the instance first.
+
 ## What is critical
 
 Three classes:
@@ -101,9 +107,10 @@ Ordinary text, such as a grocery item name, is still scanned. A secret typed int
 All of this runs on the instance.
 
 1. **Deterministic floor.** Email, phone, fødselsnummer (mod-11), organisasjonsnummer, kontonummer, IBAN, card numbers (Luhn), secrets by prefix and entropy, and a per-account vocabulary of names and places.
-2. **Local NER.** [GLiNER](https://huggingface.co/urchade/gliner_multi_pii-v1) for names, addresses, and organizations in mixed Norwegian and English. Weights stay on disk. The detector ships with Robin; if it fails to load, free-text cloud egress stays blocked. A cloud model is never the detector.
+2. **Local NER.** [GLiNER](https://huggingface.co/urchade/gliner_multi_pii-v1) for names, addresses, and organizations in mixed Norwegian and English. Weights stay on disk. The detector ships with Robin; if it fails to load, free-text cloud egress stays blocked. A cloud model is never the primary detector.
 3. **Vault.** In memory for one account's conversation. Encrypted with Fernet when a session is saved. The map is never appended to a cloud request and never opened for a different account.
-4. **Restore.** Cloud replies and tool arguments are restored only inside the core. Dropped values stay dropped.
+4. **NEAR AI privacy filter (optional, `ROBIN_NEARAI_PRIVACY=1`).** A second TEE-hosted classify pass on user/assistant/tool airlock text; spans are applied locally. Fail closed. Off by default.
+5. **Restore.** Cloud replies and tool arguments are restored only inside the core. Dropped values stay dropped.
 
 A Norwegian GLiNER checkpoint can plug into the same `Ner` interface later. Checksums still decide fødselsnummer and account numbers.
 

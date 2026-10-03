@@ -122,7 +122,13 @@ def test_tick_checks_enabled_accounts_and_prints_no_secret(tmp_path: Path, capsy
     class Quiet:
         prompts: list[str] = []
 
-        def __init__(self, base_url: str = "http://127.0.0.1:8080", transport=None, model: str = "local") -> None:
+        def __init__(
+            self,
+            base_url: str = "http://127.0.0.1:8080",
+            transport=None,
+            model: str = "local",
+            api_key: str = "",
+        ) -> None:
             return None
 
         def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
