@@ -354,9 +354,9 @@ def test_mail_read_reply_and_archive_use_stable_uids() -> None:
         "mailbox",
         mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD),
     )
-    older = _letter("Old Sender", "keep this body", message_id="stable-old@test")
-    newer = _letter("New Sender", "brand new", message_id="stable-new@test")
-    extra = _letter("Latest", "arrived later", message_id="stable-latest@test")
+    older = _letter("old@example.com", "keep this body", message_id="stable-old@test")
+    newer = _letter("new@example.com", "brand new", message_id="stable-new@test")
+    extra = _letter("latest@example.com", "arrived later", message_id="stable-latest@test")
 
     class UidBox:
         def __init__(self) -> None:
@@ -398,7 +398,7 @@ def test_mail_read_reply_and_archive_use_stable_uids() -> None:
     mailbox = ImapMailbox(broker, open_imap=box.open_imap, open_smtp=box.open_smtp)
     listed = mailbox.messages("ada")
     assert [row["id"] for row in listed] == ["10042", "10099"]
-    assert listed[0]["sender"] == "Old Sender"
+    assert listed[0]["sender"] == "old@example.com"
     box.messages.append(("10110", extra))
     window = mailbox.messages("ada")
     assert [row["id"] for row in window] == ["10042", "10099", "10110"][-mailbox.limit :]
@@ -406,11 +406,11 @@ def test_mail_read_reply_and_archive_use_stable_uids() -> None:
     assert read is not None
     assert read["id"] == "10042"
     assert "keep this body" in read["body"]
-    assert read["sender"] == "Old Sender"
+    assert read["sender"] == "old@example.com"
     mail = Mail(mailbox)
     reply = mail.invoke("ada", "mail_reply", {"id": "10042", "body": "thanks"})
     assert reply == "sent"
-    assert box.sent[0]["To"] == "Old Sender"
+    assert box.sent[0]["To"] == "old@example.com"
     assert "Re:" in box.sent[0]["Subject"]
     marked = mail.invoke("ada", "mail_mark", {"id": "10042", "action": "archive"})
     assert marked == "marked archive"

@@ -53,9 +53,9 @@ SYSTEM = (
     "Connect Home Assistant or an MCP server in chat with home_connect / mcp_setup_start — "
     "for remote MCPs that use OAuth (for example Sentry), pass auth=oauth then mcp_setup_oauth or mcp_setup_test. "
     "Robin will ask for secrets through a secure form. "
-    "Household lists, jobs, and remembered facts in this prompt are already available — "
+    "Lists, jobs, and remembered facts in this prompt are already available — "
     "do not wait to call a recall tool before using them. "
-    "For multi-step household questions (dinner from the calendar and the fridge list), "
+    "For multi-step questions (dinner from the calendar and the fridge list), "
     "plan the steps and use list, calendar, and memory tools together. "
     "calendar_* tools are only this account's own calendar, not a third-party booking site. "
     "For reminders ('remind me …', 'an hour before …'), use jobs_add with at or in_minutes; "
@@ -782,7 +782,7 @@ def _system(
         ]
         released = [line for line in released if line and line != "[UNRESOLVED]"]
         if released:
-            lines.append("Household (already on this account; use these before guessing):")
+            lines.append("On this account (use these before guessing):")
             lines.extend(released)
     guidance = assistant.registry.guidance(account_id, text)
     if guidance:

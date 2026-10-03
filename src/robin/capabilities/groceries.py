@@ -130,7 +130,7 @@ class Lists(Capability):
             item = (row.get("item") or "").strip()
             if item:
                 grouped.setdefault(name, []).append(item)
-        lines = ["Household lists:"]
+        lines = ["Lists:"]
         for name, items in grouped.items():
             shown = items[:20]
             extra = f" (+{len(items) - 20} more)" if len(items) > 20 else ""

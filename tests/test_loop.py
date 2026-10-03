@@ -844,7 +844,7 @@ def test_household_context_reaches_the_model_before_tools() -> None:
     model = Scripted([ModelTurn("Pasta works.")])
     converse(assistant, Task("ada", "home", "what can we cook from the fridge for vegetarians"), model)
     prompt = model.seen[0][0][0]["content"]
-    assert "Household (already on this account" in prompt
+    assert "On this account (use these before guessing)" in prompt
     assert "oat milk" in prompt
     assert "take out the trash" in prompt
     assert "The household is vegetarian" in prompt
