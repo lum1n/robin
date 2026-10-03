@@ -731,8 +731,12 @@ def _personal_lines(assistant: Assistant, account_id: str, vault: Vault | None, 
     from datetime import datetime
 
     from robin.household import household_line, sources_line
+    from robin.profile import profile_line
 
     out: list[str] = []
+    profile = profile_line(assistant.get_profile(account_id), vault)
+    if profile:
+        out.append(profile)
     household = household_line(assistant.household(account_id), vault, current_year=datetime.now().year)
     if household:
         out.append(household)

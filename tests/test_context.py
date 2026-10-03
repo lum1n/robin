@@ -2,6 +2,7 @@ import json
 import re
 from datetime import datetime, timezone
 
+from robin.capabilities.transit import Transit
 from robin.capabilities.web import Web
 from robin.context import ClientContext, context_lines, merge_context, parse_context
 from robin.http import Service, dispatch
@@ -164,3 +165,108 @@ def test_the_device_location_drives_tools_but_never_reaches_the_model(tmp_path) 
     outcome = assistant.invoke("ada", "home", "web_search", {"query": f"weather {coordinates}"})
     assert outcome["status"] == "confirm" and outcome.get("reason") == "egress"
     assert "Location: unknown" in _system(assistant, "bea", vault=assistant.vaults.get("bea", "home"))
+
+
+def test_unknown_location_offers_saved_address_when_city_is_missing() -> None:
+    vault = Vault("ada", "home")
+    lines = "\n".join(
+        context_lines(None, vault, now=NOW, home={"address": "Kirkegata 4, 7013 Trondheim"})
+    )
+    assert "Kirkegata" not in lines
+    home = re.search(r"saved address is (\[ADDRESS_[0-9a-f]{32}_\d+\])", lines).group(1)
+    assert vault.restore(home, strict=True) == "Kirkegata 4, 7013 Trondheim"
+
+
+def test_next_train_uses_shared_location_as_origin(tmp_path) -> None:
+    here = {
+        "timezone": "Europe/Oslo",
+        "locale": "nb_NO",
+        "device": "iphone",
+        "location": {
+            "locality": "Trondheim",
+            "country": "Norway",
+            "latitude": 63.4305,
+            "longitude": 10.395,
+        },
+    }
+    origins: list[str] = []
+    trip = {
+        "data": {
+            "trip": {
+                "tripPatterns": [
+                    {
+                        "duration": 24000,
+                        "expectedStartTime": "2026-05-14T19:32:00+02:00",
+                        "expectedEndTime": "2026-05-15T02:12:00+02:00",
+                        "legs": [
+                            {
+                                "mode": "rail",
+                                "expectedStartTime": "2026-05-14T19:32:00+02:00",
+                                "expectedEndTime": "2026-05-15T02:12:00+02:00",
+                                "fromPlace": {"name": "Trondheim S"},
+                                "toPlace": {"name": "Oslo S"},
+                                "line": {"publicCode": "F6"},
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+    def geocode(text: str):
+        origins.append(text)
+        if text == "Trondheim":
+            return {"coordinates": {"latitude": 63.43, "longitude": 10.40}, "name": "Trondheim", "country": "NOR"}
+        if text == "Oslo S":
+            return {"place": "NSR:StopPlace:59872", "name": "Oslo S", "country": "NOR"}
+        return None
+
+    class Model:
+        def __init__(self) -> None:
+            self.seen: list[list[dict]] = []
+
+        def complete(self, *, messages: list[dict], tools: list[dict]) -> ModelTurn:
+            self.seen.append([dict(message) for message in messages])
+            if len(self.seen) == 1:
+                return ModelTurn("", (ToolCall("transit_trip", {"to": "Oslo S", "mode": "rail"}),))
+            return ModelTurn("The next train leaves this evening.")
+
+    model = Model()
+    assistant = Assistant(ner=StubNer(), store=HouseholdStore(tmp_path / "house.sqlite", new_key()))
+    assistant.add(
+        Transit(
+            post=lambda query, variables: trip,
+            geocode=geocode,
+            world_geocode=lambda text: None,
+            locate=lambda account_id: (
+                context.location
+                if (context := assistant.client_context(account_id)) is not None
+                else None
+            ),
+        )
+    )
+    service = Service(assistant, model)
+    service.auth.register("ada", "ada-session-password")
+    headers = {"authorization": f"Bearer {service.auth.login('ada', 'ada-session-password')}"}
+
+    status, payload = dispatch(
+        service,
+        "POST",
+        "/v1/messages",
+        body={
+            "account_id": "ada",
+            "conversation_id": "home",
+            "text": "next train to Oslo",
+            "allow_cloud": True,
+            "context": here,
+        },
+        headers=headers,
+    )
+
+    assert status == 200, payload
+    assert origins == ["Trondheim", "Oslo S"]
+    seen = json.dumps(model.seen)
+    for raw in ("Trondheim", "63.43", "10.40", "10.39"):
+        assert raw not in seen
+    assert "train" in payload["text"].lower()

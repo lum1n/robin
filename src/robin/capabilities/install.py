@@ -86,7 +86,16 @@ def install(assistant: Assistant, *, mcp_config: str = "") -> None:
     browser.find_site = web.find_site
     assistant.add(web)
     assistant.add(Weather())
-    assistant.add(Transit())
+    assistant.add(
+        Transit(
+            locate=lambda account_id: (
+                context.location
+                if (context := assistant.client_context(account_id)) is not None
+                else None
+            ),
+            profile=assistant.get_profile,
+        )
+    )
     assistant.add(Home(broker=assistant.broker, store=assistant.store))
     assistant.add(Bills(mail=mail, broker=assistant.broker, store=assistant.store))
     household, admins = load_household_mcp(mcp_config) if mcp_config else ([], set())

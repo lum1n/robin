@@ -89,6 +89,8 @@ class Assistant:
         self._client_context: dict[str, ClientContext] = {}
         # Decrypted household names, cached so each redaction does not hit the broker.
         self._household_terms: dict[str, tuple[VocabularyTerm, ...]] = {}
+        # Saved profile values, cached as vocabulary so an address keeps one reference.
+        self._profile_terms: dict[str, tuple[VocabularyTerm, ...]] = {}
         if store is not None:
             self._restore_store()
 
@@ -136,14 +138,20 @@ class Assistant:
             self.store.save_vocabulary(account_id, terms)
 
     def vocabulary_for(self, account_id: str) -> tuple[VocabularyTerm, ...]:
-        """Stored terms plus household names, so every mention maps to the same reference."""
+        """Stored terms plus household names and profile values, so every mention maps to the same reference."""
         terms = self._household_terms.get(account_id)
         if terms is None:
             from robin.household import member_terms
 
             terms = member_terms(self.household(account_id))
             self._household_terms[account_id] = terms
-        return (*terms, *self.vocabulary.get(account_id, ()))
+        profile = self._profile_terms.get(account_id)
+        if profile is None:
+            from robin.profile import profile_terms
+
+            profile = profile_terms(self.get_profile(account_id))
+            self._profile_terms[account_id] = profile
+        return (*terms, *profile, *self.vocabulary.get(account_id, ()))
 
     def household(self, account_id: str) -> tuple:
         from robin.household import HOUSEHOLD_SECRET, load_members
@@ -277,10 +285,11 @@ class Assistant:
         return parse_profile(raw)
 
     def set_profile(self, account_id: str, updates: dict) -> dict[str, str]:
-        from robin.profile import PROFILE_SECRET, dump_profile, merge_profile
+        from robin.profile import PROFILE_SECRET, dump_profile, merge_profile, profile_terms
 
         merged = merge_profile(self.get_profile(account_id), updates)
         self.broker.put(account_id, PROFILE_SECRET, dump_profile(merged))
+        self._profile_terms[account_id] = profile_terms(merged)
         return merged
 
     def profile_presence(self, account_id: str) -> list[str]:
