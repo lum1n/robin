@@ -1,15 +1,24 @@
+import json
+import re
+
+from robin.loop import converse
+from robin.model import ModelTurn
+from robin.ner import UnavailableNer
+from robin.policy import Task
 from robin.profile import (
     dump_profile,
     filled_keys,
     merge_profile,
     normalize_field,
     parse_profile,
+    profile_line,
+    profile_terms,
     profile_value,
     secret_values,
 )
 from robin.session import Assistant
 from robin.store import HouseholdStore
-from robin.vault import new_key
+from robin.vault import Vault, new_key
 
 
 def test_profile_round_trips_through_the_broker(tmp_path) -> None:
@@ -92,3 +101,44 @@ def test_http_profile_stays_on_the_account(tmp_path) -> None:
     assert loaded[1]["fields"]["given_name"] == "Ada"
     bea_view = dispatch(service, "GET", "/v1/profile", query={"account_id": "ada"}, headers=bea)
     assert bea_view[0] == 401
+
+
+def test_stored_address_is_answered_to_the_person() -> None:
+    class AvailableNer(UnavailableNer):
+        def available(self) -> bool:
+            return True
+
+    class Scripted:
+        def __init__(self) -> None:
+            self.seen: list[list[dict]] = []
+
+        def complete(self, *, messages, tools):
+            self.seen.append([dict(message) for message in messages])
+            prompt = messages[0]["content"]
+            match = re.search(r"address (\[ADDRESS_[0-9a-f]{32}_\d+\])", prompt)
+            assert match, prompt
+            return ModelTurn(f"Your address is {match.group(1)}.")
+
+    address = "Kirkegata 4, 7013 Trondheim"
+    assistant = Assistant(ner=AvailableNer())
+    assistant.set_profile("ada", {"address": address, "city": "Trondheim"})
+    model = Scripted()
+    reply = converse(assistant, Task("ada", "home", "what is my address?", allow_cloud=True), model)
+    assert address in reply.text
+    assert "that detail" not in reply.text.lower()
+    seen = json.dumps(model.seen)
+    assert address not in seen
+    assert "Kirkegata" not in seen
+    assert "[ADDRESS_" in seen
+
+
+def test_profile_line_tokenizes_and_terms_share_one_address() -> None:
+    fields = {"address": "Kirkegata 4, 7013 Trondheim", "city": "Trondheim"}
+    vault = Vault("ada", "home")
+    line = profile_line(fields, vault)
+    assert "Kirkegata" not in line
+    address = re.search(r"address (\[ADDRESS_[0-9a-f]{32}_\d+\])", line).group(1)
+    assert vault.restore(address, strict=True) == "Kirkegata 4, 7013 Trondheim"
+    terms = profile_terms(fields)
+    assert [term.label for term in terms] == ["ADDRESS", "ADDRESS"]
+    assert terms[0].text == "Kirkegata 4, 7013 Trondheim"

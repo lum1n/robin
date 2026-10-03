@@ -1,9 +1,17 @@
-"""Per-account personal details for form fill. Values never go to the model."""
+"""Per-account personal details for form fill and for answering the person.
+
+Raw values never go to the model. They become conversation-scoped references in the
+prompt and are restored only in the person-facing reply and inside local tool arguments.
+Secrets, national IDs, and payment data do not belong in this profile.
+"""
 
 from __future__ import annotations
 
 import json
 from typing import Any
+
+from robin.airlock import VocabularyTerm
+from robin.vault import Vault
 
 PROFILE_SECRET = "profile"
 
@@ -131,3 +139,64 @@ def filled_keys(fields: dict[str, str]) -> list[str]:
 def secret_values(fields: dict[str, str]) -> list[str]:
     found = [value.strip() for value in fields.values() if isinstance(value, str) and value.strip()]
     return sorted(set(found), key=len, reverse=True)
+
+
+_FIELD_LABELS = {
+    "given_name": "PERSON",
+    "family_name": "PERSON",
+    "full_name": "PERSON",
+    "email": "EMAIL",
+    "phone": "PHONE",
+    "address": "ADDRESS",
+    "city": "ADDRESS",
+    "postal_code": "ADDRESS",
+    "country": "ADDRESS",
+}
+
+_FIELD_TITLES = {
+    "given_name": "given name",
+    "family_name": "family name",
+    "full_name": "name",
+    "email": "email",
+    "phone": "phone",
+    "address": "address",
+    "city": "city",
+    "postal_code": "postal code",
+    "country": "country",
+}
+
+
+def profile_terms(fields: dict[str, str]) -> tuple[VocabularyTerm, ...]:
+    """Longest values first, so a full address is one reference rather than its city alone."""
+    found: list[VocabularyTerm] = []
+    seen: set[str] = set()
+    for key in PROFILE_FIELDS:
+        value = (fields.get(key) or "").strip()
+        folded = value.casefold()
+        if not value or folded in seen:
+            continue
+        seen.add(folded)
+        found.append(VocabularyTerm(value, _FIELD_LABELS[key]))
+    found.sort(key=lambda term: len(term.text), reverse=True)
+    return tuple(found)
+
+
+def profile_line(fields: dict[str, str], vault: Vault | None) -> str:
+    """Prompt line with typed references so the person can hear their own details."""
+    if vault is None:
+        return ""
+    parts: list[str] = []
+    for key in PROFILE_FIELDS:
+        value = (fields.get(key) or "").strip()
+        if not value:
+            continue
+        parts.append(f"{_FIELD_TITLES[key]} {vault.token(_FIELD_LABELS[key], value)}")
+    if not parts:
+        return ""
+    return (
+        "- Saved profile: "
+        + "; ".join(parts)
+        + ". When they ask for their own address or these details, copy the matching reference "
+        "into the reply (it is shown to them). For website forms, use browser_fill_profile. "
+        "Never invent these values."
+    )

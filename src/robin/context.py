@@ -1,9 +1,9 @@
 """Situational context a device sends with a turn: clock, time zone, device, location.
 
 Time is not sensitive and reaches the model as plain text. Location never does: every place
-value becomes a conversation-scoped reference, restored locally only inside tool arguments.
-Facts derived from location (public holidays, daylight, home or away) are computed locally and
-rendered without place names.
+value becomes a conversation-scoped reference, restored locally inside tool arguments and in
+the person-facing reply. Facts derived from location (public holidays, daylight, home or away)
+are computed locally and rendered without place names.
 """
 
 from __future__ import annotations
@@ -139,7 +139,10 @@ def context_lines(
     if place:
         lines.append(
             f"- Location: {place}. These references are filled in locally when copied into tool arguments "
-            "(e.g. web_search 'weather <city reference> <date>'). Never guess, ask for, or reveal the real place."
+            "(e.g. transit_trip from=<city or coordinate reference>, web_search 'weather <city reference> <date>'). "
+            "When they ask where they are, copy the city or coordinate reference into the reply; it is shown to them. "
+            "Never guess a different place. For next departure or nearby, omit from or use these references — "
+            "do not invent a city."
         )
     else:
         lines.append(_unknown_location_line(home or {}, vault))
@@ -158,9 +161,15 @@ def _unknown_location_line(home: dict[str, str], vault: Vault | None) -> str:
         "language, time zone, earlier replies, or your training data."
     )
     city = (home.get("city") or "").strip()
+    address = (home.get("address") or "").strip()
     if city and vault is not None:
         return (
             f"{line} Their saved home city is {vault.token('ADDRESS', city)}; for tasks that depend on where they "
+            "are now (next departure, nearby, weather here), use it and say you assumed home, or ask."
+        )
+    if address and vault is not None:
+        return (
+            f"{line} Their saved address is {vault.token('ADDRESS', address)}; for tasks that depend on where they "
             "are now (next departure, nearby, weather here), use it and say you assumed home, or ask."
         )
     return f"{line} For tasks that depend on where they are now (next departure, nearby, weather here), ask first."

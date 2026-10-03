@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
@@ -11,6 +12,8 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from robin.capability import Capability, Effect, FieldClass, FieldSpec, Result, Tool
+
+_COORDINATE = re.compile(r"^(-?\d{1,3}(?:\.\d+)?),(-?\d{1,3}(?:\.\d+)?)$")
 
 _CLIENT_NAME = "robin-household"
 _MODES = ("rail", "bus", "tram", "metro", "water", "coach", "air")
@@ -52,9 +55,11 @@ class Transit(Capability):
         Tool(
             name="transit_trip",
             description=(
-                "Plan a public transit trip and get the next departures, in Norway or abroad. from and to may be "
-                "stop names, addresses, or the aliases home and work. when is an optional ISO datetime "
-                "(defaults to now). mode limits the trip to one kind of transport, e.g. rail for trains."
+                "Plan a public transit trip and get the next departures, in Norway or abroad. "
+                "Omit from, or pass here, to use the person's current device location. "
+                "from and to may also be stop names, addresses, or the aliases home and work. "
+                "when is an optional ISO datetime (defaults to now). mode limits the trip to one "
+                "kind of transport, e.g. rail for trains."
             ),
             parameters={
                 "type": "object",
@@ -64,7 +69,7 @@ class Transit(Capability):
                     "when": {"type": "string"},
                     "mode": {"type": "string", "enum": list(_MODES)},
                 },
-                "required": ["from", "to"],
+                "required": ["to"],
             },
             effect=Effect.READ,
             egress=True,
@@ -86,6 +91,8 @@ class Transit(Capability):
         geocode: Any = None,
         world_geocode: Any = None,
         world_plan: Any = None,
+        locate: Any = None,
+        profile: Any = None,
     ) -> None:
         self.home = home or os.environ.get("ROBIN_HOME", "")
         self.work = work or os.environ.get("ROBIN_WORK", "")
@@ -93,6 +100,8 @@ class Transit(Capability):
         self._geocode = geocode or entur_geocode
         self._world_geocode = world_geocode or transitous_geocode
         self._world_plan = world_plan or transitous_plan
+        self._locate = locate
+        self._profile = profile
 
     def status(self, account_id: str) -> str:
         return "transit: Entur (Norway), Transitous (elsewhere)"
@@ -100,16 +109,18 @@ class Transit(Capability):
     def invoke(self, account_id: str, tool_name: str, arguments: dict[str, Any]) -> str | Result:
         if tool_name != "transit_trip":
             raise NotImplementedError(tool_name)
-        origin = self._alias(str(arguments.get("from", "")))
-        destination = self._alias(str(arguments.get("to", "")))
-        if not origin or not destination:
-            return "Both from and to are required."
+        origin = self._origin(account_id, str(arguments.get("from", "")))
+        destination = self._alias(account_id, str(arguments.get("to", "")))
+        if not destination:
+            return "A destination is required."
+        if not origin:
+            return "Could not tell where the person is. Name a starting place or share a location."
         when = str(arguments.get("when", "")).strip() or None
         mode = str(arguments.get("mode", "")).strip().casefold()
         if mode not in _MODES:
             mode = ""
-        source = self._geocode(origin)
-        target = self._geocode(destination)
+        source = _entur_point(origin) or self._geocode(origin)
+        target = _entur_point(destination) or self._geocode(destination)
         if source and target and "NOR" in (source.get("country", "NOR"), target.get("country", "NOR")):
             answer = self._entur_trip(source, target, when, mode)
             if answer is not None:
@@ -157,10 +168,10 @@ class Transit(Capability):
 
     def _world_trip(self, origin: str, destination: str, when: str | None, mode: str) -> str | Result:
         try:
-            source = self._world_geocode(origin)
+            source = _world_point(origin) or self._world_geocode(origin)
             if source is None:
                 return f"Could not find a place called {origin}."
-            target = self._world_geocode(destination)
+            target = _world_point(destination) or self._world_geocode(destination)
             if target is None:
                 return f"Could not find a place called {destination}."
             payload = self._world_plan(source, target, when, _WORLD_MODES.get(mode))
@@ -193,10 +204,44 @@ class Transit(Capability):
             return f"No trips found from {source['name']} to {target['name']}."
         return Result(text=f"Trips {source['name']} to {target['name']}:", records=rows)
 
-    def _alias(self, value: str) -> str:
+    def _origin(self, account_id: str, value: str) -> str:
         key = value.strip().casefold()
-        if key == "home" and self.home:
+        if key in {"", "here", "current", "now"}:
+            return self._here(account_id) or self._home(account_id)
+        if key == "home":
+            return self._home(account_id)
+        return self._alias(account_id, value)
+
+    def _here(self, account_id: str) -> str:
+        location = self._locate(account_id) if self._locate else None
+        if location is None:
+            return ""
+        locality = str(getattr(location, "locality", "") or "").strip()
+        if locality:
+            return locality
+        region = str(getattr(location, "region", "") or "").strip()
+        if region:
+            return region
+        latitude = getattr(location, "latitude", None)
+        longitude = getattr(location, "longitude", None)
+        if latitude is not None and longitude is not None:
+            return f"{latitude},{longitude}"
+        return ""
+
+    def _home(self, account_id: str) -> str:
+        if self.home:
             return self.home
+        fields = self._profile(account_id) if self._profile else {}
+        address = str((fields or {}).get("address") or "").strip()
+        city = str((fields or {}).get("city") or "").strip()
+        if address and city and city.casefold() not in address.casefold():
+            return f"{address}, {city}"
+        return address or city
+
+    def _alias(self, account_id: str, value: str) -> str:
+        key = value.strip().casefold()
+        if key == "home":
+            return self._home(account_id)
         if key == "work" and self.work:
             return self.work
         return value.strip()
@@ -223,6 +268,38 @@ def _clock(value: Any, tz: str | None = None) -> str:
 def _stamp(value: Any, tz: str | None = None) -> str:
     moment = _parse(value, tz)
     return moment.strftime("%Y-%m-%d %H:%M") if moment else ""
+
+
+def parse_coordinates(text: str) -> tuple[float, float] | None:
+    """Accept 'lat,lon' from the device context vault; refuse out-of-range values."""
+    match = _COORDINATE.fullmatch(text.strip().replace(" ", ""))
+    if match is None:
+        return None
+    latitude = float(match.group(1))
+    longitude = float(match.group(2))
+    if abs(latitude) > 90 or abs(longitude) > 180:
+        return None
+    return latitude, longitude
+
+
+def _entur_point(text: str) -> dict[str, Any] | None:
+    parsed = parse_coordinates(text)
+    if parsed is None:
+        return None
+    latitude, longitude = parsed
+    return {
+        "coordinates": {"latitude": latitude, "longitude": longitude},
+        "name": text.strip(),
+        "country": "NOR",
+    }
+
+
+def _world_point(text: str) -> dict[str, Any] | None:
+    parsed = parse_coordinates(text)
+    if parsed is None:
+        return None
+    latitude, longitude = parsed
+    return {"lat": latitude, "lon": longitude, "name": text.strip()}
 
 
 def _entur_location(location: dict[str, Any]) -> dict[str, Any]:

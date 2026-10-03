@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from robin.capabilities.transit import Transit, pick_location, pick_world_location
+from robin.capabilities.transit import Transit, parse_coordinates, pick_location, pick_world_location
 from robin.capability import Result
+from robin.context import DeviceLocation
 
 _PLACES = {
     "Sørumsand": {"place": "NSR:StopPlace:58864", "name": "Sørumsand stasjon", "country": "NOR"},
@@ -186,6 +187,46 @@ def test_transitous_network_failure_is_reported() -> None:
 
     transit = Transit(post=lambda q, v: {}, geocode=lambda t: None, world_geocode=broken)
     assert transit.invoke("a", "transit_trip", {"from": "Paris", "to": "Lyon"}) == "Transit lookup failed: offline"
+
+
+def test_omitted_from_uses_shared_device_location() -> None:
+    calls: list[dict[str, Any]] = []
+    here = DeviceLocation(locality="Trondheim", latitude=63.43, longitude=10.39)
+
+    def geocode(text: str) -> dict[str, Any] | None:
+        if text == "Trondheim":
+            return {"coordinates": {"latitude": 63.43, "longitude": 10.39}, "name": "Trondheim", "country": "NOR"}
+        return _PLACES.get(text)
+
+    transit = Transit(
+        post=lambda query, variables: calls.append(variables) or _TRIP,
+        geocode=geocode,
+        world_geocode=_WORLD.get,
+        locate=lambda account_id: here if account_id == "ada" else None,
+    )
+    result = transit.invoke("ada", "transit_trip", {"to": "Oslo S", "mode": "rail"})
+    assert isinstance(result, Result)
+    assert calls[0]["from"] == {"coordinates": {"latitude": 63.43, "longitude": 10.39}, "name": "Trondheim"}
+    assert calls[0]["to"]["place"] == "NSR:StopPlace:59872"
+
+
+def test_coordinate_origin_skips_geocode() -> None:
+    calls: list[dict[str, Any]] = []
+
+    def geocode(text: str) -> dict[str, Any] | None:
+        if text == "Oslo S":
+            return _PLACES[text]
+        raise AssertionError(f"should not geocode {text}")
+
+    transit = Transit(post=lambda query, variables: calls.append(variables) or _TRIP, geocode=geocode)
+    transit.invoke("ada", "transit_trip", {"from": "63.43, 10.39", "to": "Oslo S"})
+    assert calls[0]["from"] == {"coordinates": {"latitude": 63.43, "longitude": 10.39}, "name": "63.43, 10.39"}
+
+
+def test_parse_coordinates_rejects_junk() -> None:
+    assert parse_coordinates("63.43,10.39") == (63.43, 10.39)
+    assert parse_coordinates("91,10") is None
+    assert parse_coordinates("Oslo") is None
 
 
 def test_pick_world_location_uses_top_hit() -> None:
