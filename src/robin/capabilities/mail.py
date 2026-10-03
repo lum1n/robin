@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import imaplib
 import json
 import smtplib
@@ -33,8 +34,8 @@ class SecretStore(Protocol):
 
 class _Imap(Protocol):
     def login(self, user: str, password: str) -> None: ...
-    def fetch_recent(self, limit: int) -> list[bytes]: ...
-    def search(self, criteria: str, limit: int) -> list[bytes]: ...
+    def fetch_recent(self, limit: int) -> list[bytes] | list[tuple[str, bytes]]: ...
+    def search(self, criteria: str, limit: int) -> list[bytes] | list[tuple[str, bytes]]: ...
     def fetch_one(self, uid: str) -> bytes | None: ...
     def store_flags(self, uid: str, action: str) -> None: ...
     def logout(self) -> None: ...
@@ -61,24 +62,26 @@ class ImaplibClient:
         self._imap.login(user, password)
 
     def fetch_recent(self, limit: int) -> list[bytes]:
-        return self.search("ALL", limit)
+        return [raw for _uid, raw in self.search("ALL", limit)]
 
-    def search(self, criteria: str, limit: int) -> list[bytes]:
+    def search(self, criteria: str, limit: int) -> list[tuple[str, bytes]]:
         self._imap.select("INBOX", readonly=True)
-        _status, data = self._imap.search(None, criteria)
+        _status, data = self._imap.uid("SEARCH", None, criteria)
         blob = data[0] if data and data[0] else b""
         if isinstance(blob, str):
             blob = blob.encode()
-        numbers = blob.split()
-        found: list[bytes] = []
-        for number in numbers[-limit:]:
-            _status, fetched = self._imap.fetch(number, "(BODY.PEEK[])")
-            found.append(_body(fetched))
+        uids = blob.split()
+        found: list[tuple[str, bytes]] = []
+        for uid in uids[-limit:]:
+            label = uid.decode() if isinstance(uid, (bytes, bytearray)) else str(uid)
+            _status, fetched = self._imap.uid("FETCH", uid, "(BODY.PEEK[])")
+            found.append((label, _body(fetched)))
         return found
 
     def fetch_one(self, uid: str) -> bytes | None:
         self._imap.select("INBOX", readonly=True)
-        _status, fetched = self._imap.fetch(uid.encode() if isinstance(uid, str) else uid, "(BODY.PEEK[])")
+        token = uid.encode() if isinstance(uid, str) else uid
+        _status, fetched = self._imap.uid("FETCH", token, "(BODY.PEEK[])")
         try:
             return _body(fetched)
         except RuntimeError:
@@ -86,14 +89,15 @@ class ImaplibClient:
 
     def store_flags(self, uid: str, action: str) -> None:
         self._imap.select("INBOX", readonly=False)
+        token = uid.encode() if isinstance(uid, str) else uid
         if action == "read":
-            self._imap.store(uid, "+FLAGS", "\\Seen")
+            self._imap.uid("STORE", token, "+FLAGS", "\\Seen")
         elif action == "archive":
             try:
-                self._imap.copy(uid, "Archive")
+                self._imap.uid("COPY", token, "Archive")
             except Exception:
                 pass
-            self._imap.store(uid, "+FLAGS", "\\Deleted")
+            self._imap.uid("STORE", token, "+FLAGS", "\\Deleted")
             self._imap.expunge()
 
     def logout(self) -> None:
@@ -156,17 +160,33 @@ class ImapMailbox:
                 raw_messages = client.search(criteria, self.limit)
             else:
                 raw_messages = client.fetch_recent(self.limit)
+            rows = [_row_from_found(item, index) for index, item in enumerate(raw_messages, start=1)]
         finally:
             client.logout()
-        rows = [_message(raw, index) for index, raw in enumerate(raw_messages, start=1)]
         _ = folder
         return rows
 
     def read(self, account_id: str, message_id: str) -> dict[str, str] | None:
-        rows = self.messages(account_id)
-        for row in rows:
-            if row.get("id") == message_id:
-                return row
+        creds = self._credentials(account_id)
+        if creds is None:
+            return None
+        client: _Imap = self._open_imap(creds["imap_host"])
+        try:
+            _login(client, creds)
+            if hasattr(client, "fetch_one"):
+                raw = client.fetch_one(message_id)
+                if raw:
+                    return _message(raw, message_id)
+            if hasattr(client, "search"):
+                found = client.search("ALL", self.limit)
+            else:
+                found = client.fetch_recent(self.limit)
+            for index, item in enumerate(found, start=1):
+                row = _row_from_found(item, index)
+                if row.get("id") == message_id:
+                    return row
+        finally:
+            client.logout()
         return None
 
     def draft(self, account_id: str, to: str, subject: str, body: str) -> str:
@@ -473,12 +493,27 @@ def _mail_failure(exc: Exception, host: str = "") -> str:
     return "The mailbox did not answer."
 
 
-def _message(raw: bytes, index: int = 1) -> dict[str, str]:
+def _row_from_found(item: bytes | tuple[str, bytes], index: int) -> dict[str, str]:
+    if isinstance(item, tuple) and len(item) == 2:
+        uid, raw = item
+        return _message(raw, str(uid))
+    return _message(item, _stable_mail_id(item, index))
+
+
+def _stable_mail_id(raw: bytes, fallback: int) -> str:
+    parsed = message_from_bytes(raw, policy=default)
+    mid = str(parsed.get("message-id") or "").strip().strip("<>")
+    if mid:
+        return mid
+    return hashlib.sha1(raw).hexdigest()[:12]
+
+
+def _message(raw: bytes, message_id: str | int = 1) -> dict[str, str]:
     parsed = message_from_bytes(raw, policy=default)
     name, address = parseaddr(str(parsed.get("from") or ""))
     subject = str(parsed.get("subject") or "")
     return {
-        "id": str(index),
+        "id": str(message_id),
         "sender": name or address,
         "subject": subject,
         "body": _text(parsed),

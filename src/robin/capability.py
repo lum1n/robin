@@ -10,7 +10,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from robin.airlock import REDACTED, UNRESOLVED, Entity, Report, VocabularyTerm, redact
+from robin.airlock import REDACTED, Entity, Report, VocabularyTerm, redact
 from robin.ner import Ner, UnavailableNer
 from robin.vault import REFERENCE, Vault
 
@@ -156,6 +156,10 @@ class Capability:
         """Short lines for the system prompt about this account's learned preferences."""
         return []
 
+    def brief(self, account_id: str, text: str = "") -> list[str]:
+        """Household state for the system prompt before the first model call (lists, jobs, memory)."""
+        return []
+
     def public_terms(self, account_id: str) -> list[str]:
         """Names this account set up (for example MCP servers) that NER must not mask."""
         return []
@@ -253,6 +257,12 @@ class Registry:
         lines: list[str] = []
         for capability in self.for_account(account_id):
             lines.extend(capability.guidance(account_id, text))
+        return lines
+
+    def brief(self, account_id: str, text: str = "") -> list[str]:
+        lines: list[str] = []
+        for capability in self.for_account(account_id):
+            lines.extend(capability.brief(account_id, text))
         return lines
 
     def public_terms(self, account_id: str) -> list[str]:
@@ -400,8 +410,6 @@ def _render_field(
     ):
         redacted = vault.token(spec.label, value)
         report = Report(entities=(Entity(0, len(value), spec.label),), unresolved=False)
-    if for_cloud and spec.free_text and report.unresolved:
-        return UNRESOLVED, report
     if for_cloud:
         return redacted, report
     return vault.restore(redacted), report

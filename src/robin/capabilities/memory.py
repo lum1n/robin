@@ -28,6 +28,53 @@ def _site_named(site: str, haystack: str) -> bool:
     return len(stem) >= 3 and re.search(r"(?<!\w)" + re.escape(stem) + r"(?!\w)", haystack) is not None
 
 
+_STOP = {
+    "the",
+    "and",
+    "for",
+    "from",
+    "with",
+    "that",
+    "this",
+    "you",
+    "are",
+    "can",
+    "what",
+    "how",
+    "our",
+    "has",
+}
+
+
+def _tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]{3,}", text.casefold()) if token not in _STOP}
+
+
+def _overlap(left: set[str], right: set[str]) -> int:
+    score = 3 * len(left & right)
+    for word in left:
+        if len(word) < 4:
+            continue
+        if any(len(other) >= 4 and (word.startswith(other) or other.startswith(word)) for other in right):
+            score += 2
+    return score
+
+
+def _relevance(row: dict[str, Any], haystack: str) -> int:
+    """Word and tag overlap with the current request; hit count is a later tie-break."""
+    if not haystack:
+        return 0
+    score = _overlap(_tokens(haystack), _tokens(str(row.get("text") or "")))
+    for tag in row.get("tags") or []:
+        folded = str(tag).casefold()
+        if folded and folded in haystack:
+            score += 4
+        stem = folded.split(".", 1)[0]
+        if len(stem) >= 3 and re.search(r"(?<!\w)" + re.escape(stem) + r"(?!\w)", haystack):
+            score += 2
+    return score
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -189,7 +236,11 @@ class Memory(Capability):
                 continue
             ranked.append(row)
         ranked.sort(
-            key=lambda row: (int(row.get("hits") or 0), str(row.get("created") or "")),
+            key=lambda row: (
+                _relevance(row, haystack),
+                int(row.get("hits") or 0),
+                str(row.get("created") or ""),
+            ),
             reverse=True,
         )
         chosen: list[dict[str, Any]] = []

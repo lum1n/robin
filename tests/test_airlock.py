@@ -1,4 +1,4 @@
-from robin.airlock import VocabularyTerm, fodselsnummer_ok, redact
+from robin.airlock import UNRESOLVED, VocabularyTerm, fodselsnummer_ok, redact, release
 from robin.vault import Vault, VaultAccessError, new_key
 
 FODSELSNUMMER = "01010000110"
@@ -63,3 +63,29 @@ def test_encrypted_vault_rejects_another_account() -> None:
     except VaultAccessError:
         return
     raise AssertionError("other account opened the vault")
+
+
+def test_release_keeps_usable_text_when_ner_is_unavailable() -> None:
+    vault = Vault("ada", "thread")
+    vocabulary = (VocabularyTerm("Jane Doe", "PERSON"),)
+    text = "Jane Doe wrote jane@example.com about soccer practice. Next bus is at 08:10."
+    out = release(text, vault, vocabulary=vocabulary, free_text=True, ner_available=False)
+    assert out != UNRESOLVED
+    assert "Jane Doe" not in out
+    assert "jane@example.com" not in out
+    assert "soccer practice" in out
+    assert "08:10" in out
+    assert vault.token("PERSON", "Jane Doe") in out
+    assert vault.token("EMAIL", "jane@example.com") in out
+
+
+def test_release_still_drops_secrets_when_ner_is_unavailable() -> None:
+    vault = Vault("ada", "thread")
+    text = f"key {SECRET} id {FODSELSNUMMER} card {CARD} then buy milk"
+    out = release(text, vault, free_text=True, ner_available=False)
+    assert SECRET not in out
+    assert FODSELSNUMMER not in out
+    assert CARD not in out
+    assert "[REDACTED]" in out
+    assert "buy milk" in out
+    assert out != UNRESOLVED

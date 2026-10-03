@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from robin.airlock import UNRESOLVED, VocabularyTerm, redact
+from robin.airlock import VocabularyTerm, redact
 from robin.capability import (
     Capability,
     DueWork,
@@ -81,6 +81,7 @@ class Assistant:
         self.vocabulary: dict[str, tuple[VocabularyTerm, ...]] = {}
         self.store = store
         self._pending: dict[tuple[str, str], dict] = {}
+        self._traces: dict[tuple[str, str], dict] = {}
         self.schedules: dict[str, bool] = {}
         self._turn_lock = threading.Lock()
         self._turn_gen: dict[tuple[str, str], int] = {}
@@ -186,9 +187,70 @@ class Assistant:
         return self.store.threads(account_id)
 
     def delete_thread(self, account_id: str, conversation_id: str) -> bool:
+        self._traces.pop((account_id, conversation_id), None)
         if self.store is None:
             return False
         return self.store.delete_thread(account_id, conversation_id)
+
+    def thread_trace(self, account_id: str, conversation_id: str) -> dict:
+        record = self._traces.get((account_id, conversation_id))
+        if record is None and self.store is not None:
+            record = self.store.load_trace(account_id, conversation_id)
+            if record is not None:
+                self._traces[(account_id, conversation_id)] = record
+        return dict(record) if record else {}
+
+    def remember_step(
+        self,
+        account_id: str,
+        conversation_id: str,
+        *,
+        tool: str,
+        arguments: str,
+        result: str,
+        url: str = "",
+    ) -> None:
+        """Append one compact, already-redacted tool step to this thread's trail."""
+        key = (account_id, conversation_id)
+        record = dict(self.thread_trace(account_id, conversation_id))
+        steps = [dict(item) for item in record.get("steps") or [] if isinstance(item, dict)]
+        step = {
+            "tool": tool,
+            "arguments": arguments,
+            "result": result,
+            "url": url,
+        }
+        steps.append(step)
+        record["steps"] = steps[-24:]
+        if url:
+            record["url"] = url
+        elif "url" not in record:
+            record["url"] = ""
+        self._traces[key] = record
+        if self.store is not None:
+            self.store.save_trace(account_id, conversation_id, record)
+
+    def set_thread_task(
+        self,
+        account_id: str,
+        conversation_id: str,
+        *,
+        task: str,
+        open_task: bool,
+        remaining: list[str] | None = None,
+    ) -> None:
+        key = (account_id, conversation_id)
+        record = dict(self.thread_trace(account_id, conversation_id))
+        record["task"] = task
+        record["open"] = open_task
+        record["remaining"] = list(remaining or [])
+        if "steps" not in record:
+            record["steps"] = []
+        if "url" not in record:
+            record["url"] = ""
+        self._traces[key] = record
+        if self.store is not None:
+            self.store.save_trace(account_id, conversation_id, record)
 
     def turns(self, account_id: str, conversation_id: str) -> list[dict[str, str]]:
         if self.store is None:
@@ -396,7 +458,7 @@ class Assistant:
             ner_available=ner.available(),
             extra=ner.detect(task.text) if ner.available() else (),
         )
-        outgoing = UNRESOLVED if task.free_text and message_report.unresolved else message
+        outgoing = message
         redacted = json.dumps({"message": outgoing, "context": context}, sort_keys=True)
         local_context, _ = render_context(
             self.registry.for_account(task.account_id),
@@ -434,9 +496,7 @@ class Assistant:
             if self.store is not None:
                 self.store.append_activity(account_id, entry)
             return {"status": "error", "result": str(exc)}
-        if tool.egress and not confirmed and _egress_needs_restore(
-            arguments, vault, approved=self._egress_approved(account_id)
-        ):
+        if not confirmed and self.confirm_reason(account_id, conversation_id, tool_name, arguments) == "egress":
             return {"status": "confirm", "tool": tool_name, "reason": "egress"}
         logged_input = {
             redact(key, vault, vocabulary=vocabulary)[0]: (
@@ -454,13 +514,7 @@ class Assistant:
         if tool_name == "browser_open" and _PLACEHOLDER_ONLY.fullmatch(str(arguments.get("url", "")).strip()):
             # The person named this site (NER tagged it); the browser may resolve a bare name to its website.
             raw["named_site"] = True
-        if (tool.effect is Effect.EXTERNAL or tool.confirm) and not confirmed:
-            return {"status": "confirm", "tool": tool_name}
-        if (
-            tool_name in {"lesson_save", "lesson_update", "memory_remember"}
-            and not confirmed
-            and _lesson_needs_confirm()
-        ):
+        if not confirmed and self.confirm_reason(account_id, conversation_id, tool_name, arguments):
             return {"status": "confirm", "tool": tool_name}
         try:
             outcome = capability.invoke(account_id, tool.name, raw)
@@ -488,6 +542,29 @@ class Assistant:
             return {"status": "done", "result": text}
         return {"status": "done", "result": vault.restore(text)}
 
+    def confirm_reason(
+        self,
+        account_id: str,
+        conversation_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        """Why this call waits for the person, or empty when it can run now."""
+        try:
+            _capability, tool = self.registry.resolve(account_id, tool_name)
+        except KeyError:
+            return ""
+        vault = self.vaults.get(account_id, conversation_id)
+        if tool.egress and _egress_needs_restore(
+            arguments, vault, approved=self._egress_approved(account_id)
+        ):
+            return "egress"
+        if tool.effect is Effect.EXTERNAL or tool.confirm:
+            return "external"
+        if tool_name in {"lesson_save", "lesson_update", "memory_remember"} and _lesson_needs_confirm():
+            return "lesson"
+        return ""
+
     def _restore_store(self) -> None:
         assert self.store is not None
         self.vocabulary.update(self.store.load_vocabulary())
@@ -496,6 +573,8 @@ class Assistant:
                 self.activity.append(account_id, entry)
         for vault in self.store.load_vaults():
             self.vaults.put(vault)
+        for account_id, conversation_id, record in self.store.load_traces():
+            self._traces[(account_id, conversation_id)] = record
         for account_id, name, value in self.store.load_secrets():
             self.broker._secrets[(account_id, name)] = value
         self.schedules.update(self.store.load_schedules())

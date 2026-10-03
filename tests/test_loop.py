@@ -2,6 +2,7 @@ from urllib.error import URLError
 from urllib.request import Request
 
 from robin.airlock import VocabularyTerm
+from robin.capability import Capability, Effect, Tool
 from robin.capabilities.groceries import Lists
 from robin.capabilities.screen import Screen
 from robin.model import ChatModel, ModelTurn, ToolCall
@@ -242,8 +243,9 @@ def test_new_browser_metadata_is_private_even_with_parentheses() -> None:
     assert reference in safe and person in safe
     withheld = _release_snapshot(snapshot, vault, (), UnavailableNer())
     assert email not in withheld and "Jane Doe" not in withheld
-    assert "withheld:" in withheld
-    assert "No matching listings" not in withheld
+    assert "withheld:" not in withheld
+    assert "No matching listings" in withheld
+    assert reference in withheld and person in withheld
 
 
 def test_browser_budget_preserves_content_and_complete_references() -> None:
@@ -562,16 +564,13 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     assert "identity questions" in SYSTEM.lower()
     assert "browser tools" in SYSTEM
     assert "own calendar" in SYSTEM or "third-party" in SYSTEM
-    assert "never ask the person to reply with 1, 2, or 3" in SYSTEM.lower()
-    assert "never invent a numbered menu" in SYSTEM.lower()
-    assert "page choices" in SYSTEM.lower() or "browser_click them" in SYSTEM.lower()
-    assert "do not invent contact details" in SYSTEM.lower() or "never invent contact details" in SYSTEM.lower()
-    assert "browser_fill_profile" in SYSTEM
-    assert "disabled" in SYSTEM.lower()
-    assert "interactive are available" in SYSTEM.lower() or "listed under interactive" in SYSTEM.lower()
-    assert "never say a button is missing" in SYSTEM.lower()
+    assert "confirm before sending" in SYSTEM.lower()
+    assert "list, calendar, and memory" in SYSTEM.lower()
+    assert "already available" in SYSTEM.lower()
     assert "lack access" in SYSTEM.lower()
     assert "web_search fails" in SYSTEM.lower()
+    assert "clinic" not in SYSTEM.lower()
+    assert "Send bestilling" not in SYSTEM
     assistant = Assistant(ner=StubNer())
     assistant.add(Browser(owner="ada", page=_LoopPage()))
     assistant.add(Calendar(_NoCal()))
@@ -580,6 +579,8 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     tools = {tool["name"]: tool["description"] for tool in assistant.tools("ada")}
     assert "browser_open" in tools
     assert "website" in tools["browser_open"].lower() or "booking" in tools["browser_open"].lower()
+    assert "clinic" in tools["browser_open"].lower() or "clinic" in tools["browser_click"].lower()
+    assert "never invent a numbered menu" in tools["browser_click"].lower()
     assert "browser_fill_profile" in tools
     assert "never appears" in tools["browser_fill_profile"].lower() or "never appear" in tools["browser_fill_profile"].lower()
     assert "browser_fill_profile" in tools["browser_type"].lower()
@@ -595,7 +596,8 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     cold = Assistant(ner=UnavailableNer())
     cold_prompt = _system(cold, "ada")
     assert "ner: unavailable" in cold_prompt
-    assert "[UNRESOLVED]" in cold_prompt
+    assert "regex and household vocabulary" in cold_prompt
+    assert "free-text tool results are [UNRESOLVED]" not in cold_prompt
 
 
 class _LoopPage:
@@ -802,6 +804,95 @@ def _tool_pairs_ok(messages: list[dict]) -> bool:
     )
 
 
+def test_household_context_reaches_the_model_before_tools() -> None:
+    from datetime import datetime
+
+    from robin.capabilities.jobs import Jobs
+    from robin.capabilities.memory import Memory
+    from robin.loop import _system
+
+    lists = Lists(members={"ada"}, shared=[{"item": "oat milk", "list": "groceries", "loyalty": ""}], private={})
+    jobs = Jobs(clock=lambda: datetime(2026, 9, 23, 18, 0))
+    memory = Memory(facts={"ada": []})
+    memory.invoke("ada", "lesson_save", {"text": "The household is vegetarian", "kind": "fact"})
+    memory.invoke("ada", "lesson_save", {"text": "Prefer short replies", "kind": "preference"})
+    for row in memory._facts["ada"]:
+        if "short" in row["text"]:
+            row["hits"] = 99
+    assistant = Assistant(ner=StubNer())
+    assistant.add(lists)
+    assistant.add(jobs)
+    assistant.add(memory)
+    converse(
+        assistant,
+        Task("ada", "home", "remind me to take out the trash every evening"),
+        Scripted(
+            [
+                ModelTurn(
+                    "",
+                    (
+                        ToolCall(
+                            "jobs_add",
+                            {"instruction": "take out the trash", "hour": 18, "minute": 0, "days": "every day"},
+                        ),
+                    ),
+                ),
+                ModelTurn("Saved."),
+            ]
+        ),
+    )
+    model = Scripted([ModelTurn("Pasta works.")])
+    converse(assistant, Task("ada", "home", "what can we cook from the fridge for vegetarians"), model)
+    prompt = model.seen[0][0][0]["content"]
+    assert "On this account (use these before guessing)" in prompt
+    assert "oat milk" in prompt
+    assert "take out the trash" in prompt
+    assert "The household is vegetarian" in prompt
+    selected = memory.select("ada", "what can we cook from the fridge for vegetarians")
+    assert selected[0]["text"] == "The household is vegetarian"
+    stored = jobs._jobs["ada"][0]
+    assert stored["conversation_id"] == "home"
+    due = jobs.due(datetime(2026, 9, 24, 18, 0))
+    assert due and due[0].conversation_id == "home"
+    job_prompt = _system(assistant, "ada", "take out the trash", vault=assistant.vaults.get("ada", "home"))
+    assert "oat milk" in job_prompt
+
+
+def test_confirm_does_not_abort_readonly_calls_in_the_same_batch() -> None:
+    from robin.loop import resume
+
+    screen = Screen(owner="ada", text="desk", password="")
+    lists = Lists(members={"ada"}, shared=[{"item": "milk", "list": "groceries", "loyalty": ""}], private={})
+    assistant = Assistant(ner=StubNer())
+    assistant.add(screen)
+    assistant.add(lists)
+    model = Scripted(
+        [
+            ModelTurn(
+                "",
+                (
+                    ToolCall("lists_show", {"list": "groceries"}, id="a"),
+                    ToolCall("screen_submit", {}, id="b"),
+                    ToolCall("lists_show", {"list": "groceries"}, id="c"),
+                ),
+            ),
+            ModelTurn("Done."),
+        ]
+    )
+    held = converse(assistant, Task("ada", "t", "check dinner and send the invite"), model)
+    assert held.status == "confirm"
+    assert held.tool == "screen_submit"
+    assert held.task_text == "check dinner and send the invite"
+    pending = assistant._pending[("ada", "t")]
+    assert pending["text"] == "check dinner and send the invite"
+    done_ids = {item["id"] for item in pending["done_calls"]}
+    assert done_ids == {"a", "c"}
+    assert screen.submitted is False
+    reply = resume(assistant, "ada", "t", model)
+    assert reply.text == "Done."
+    assert screen.submitted is True
+
+
 def test_confirming_one_of_several_calls_runs_the_rest() -> None:
     from robin.loop import resume
 
@@ -894,3 +985,212 @@ def test_calendar_tools_hidden_until_connected() -> None:
     assert not [tool for tool in assistant.tools("ada") if tool["name"].startswith("calendar_")]
     cal.linked = True
     assert "calendar_add" in {tool["name"] for tool in assistant.tools("ada")}
+
+
+class _Trip(Capability):
+    id = "transit"
+    tools = [
+        Tool(
+            name="transit_trip",
+            description="Plan a public transit trip.",
+            parameters={
+                "type": "object",
+                "properties": {"from": {"type": "string"}, "to": {"type": "string"}},
+                "required": ["from", "to"],
+            },
+            effect=Effect.READ,
+        )
+    ]
+    fields = []
+
+    def invoke(self, account_id: str, tool_name: str, arguments: dict) -> str:
+        return f"Next bus for Jane Doe in 5 minutes from {arguments.get('from')}"
+
+
+class _Inbox(Capability):
+    id = "post"
+    tools = [
+        Tool(
+            name="mail_list",
+            description="List recent messages.",
+            parameters={"type": "object", "properties": {}},
+            effect=Effect.READ,
+        )
+    ]
+    fields = []
+
+    def invoke(self, account_id: str, tool_name: str, arguments: dict) -> str:
+        return "Inbox: one note about soccer practice from jane@example.com"
+
+
+def test_multi_step_request_keeps_going_after_first_prose() -> None:
+    lists = Lists(members={"ada"}, shared=[], private={})
+    assistant = Assistant(ner=StubNer())
+    assistant.set_vocabulary("ada", (VocabularyTerm("Jane Doe"),))
+    assistant.add(_Trip())
+    assistant.add(lists)
+    assistant.add(_Inbox())
+    model = Scripted(
+        [
+            ModelTurn("", (ToolCall("transit_trip", {"from": "home", "to": "work"}),)),
+            ModelTurn("The next bus is in 5 minutes."),
+            ModelTurn("", (ToolCall("lists_add", {"list": "groceries", "item": "milk"}),)),
+            ModelTurn("", (ToolCall("mail_list", {}),)),
+            ModelTurn("Bus in 5 minutes, milk is on the list, and the inbox has one note."),
+        ]
+    )
+    reply = converse(
+        assistant,
+        Task("ada", "t", "check the bus, add milk to the list, and look at mail"),
+        model,
+    )
+    assert "milk" in reply.text.lower() or "inbox" in reply.text.lower()
+    assert len(model.seen) >= 4
+    nudged = any(
+        "not finished" in str(message.get("content") or "").lower()
+        for messages, _tools in model.seen
+        for message in messages
+        if message.get("role") == "user"
+    )
+    assert nudged
+    invoked = [entry["tool"] for entry in assistant.activity.read("ada")]
+    assert "transit_trip" in invoked
+    assert "lists_add" in invoked
+    assert "mail_list" in invoked
+
+
+def test_step_limit_reports_unfinished_multi_step_work() -> None:
+    lists = Lists(members={"ada"}, shared=[], private={})
+    assistant = Assistant(ner=StubNer())
+    assistant.add(_Trip())
+    assistant.add(lists)
+    assistant.add(_Inbox())
+    model = Scripted(
+        [
+            ModelTurn("", (ToolCall("transit_trip", {"from": "home", "to": "work"}),)),
+            ModelTurn("Everything is done for the house."),
+        ]
+    )
+    reply = converse(
+        assistant,
+        Task("ada", "t", "check the bus, add milk to the list, and look at mail"),
+        model,
+        max_steps=1,
+    )
+    assert "unfinished" in reply.text.lower()
+    assert "list" in reply.text.lower() or "mail" in reply.text.lower()
+    assert len(model.seen) == 1
+    assert "everything is done" not in reply.text.lower()
+
+
+def test_follow_up_sees_prior_tool_trace_without_secrets(tmp_path) -> None:
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    assistant = Assistant(ner=StubNer(), store=store)
+    assistant.set_vocabulary("ada", (VocabularyTerm("Jane Doe"),))
+    assistant.add(_Trip())
+    assistant.add(Lists(members={"ada"}, shared=[], private={}))
+    first = Scripted(
+        [
+            ModelTurn(
+                "",
+                (
+                    ToolCall("transit_trip", {"from": "home", "to": "work"}, id="bus"),
+                    ToolCall("lists_add", {"list": "groceries", "item": SECRET}, id="list"),
+                ),
+            ),
+            ModelTurn("The bus is soon and the list is updated."),
+        ]
+    )
+    converse(
+        assistant,
+        Task("ada", "t", "check the bus and add milk to the list for Jane Doe", allow_cloud=True),
+        first,
+    )
+    second = Scripted(
+        [
+            ModelTurn("I will do the same for the other child."),
+            ModelTurn(
+                "",
+                (
+                    ToolCall("transit_trip", {"from": "home", "to": "work"}, id="bus2"),
+                    ToolCall("lists_add", {"list": "groceries", "item": "milk"}, id="list2"),
+                ),
+            ),
+            ModelTurn("Done for the other child."),
+        ]
+    )
+    converse(
+        assistant,
+        Task("ada", "t", "do the same for the other kid", allow_cloud=True),
+        second,
+    )
+    prompt = _user_text(second.seen[0][0])
+    assert "Prior tools:" in prompt
+    assert "transit_trip" in prompt
+    assert "lists_add" in prompt
+    assert "Jane Doe" not in prompt
+    assert SECRET not in prompt
+    assert "Open task:" in prompt
+    assert "sk-" not in prompt
+
+
+def test_tool_and_history_text_stay_usable_when_ner_is_cold(tmp_path) -> None:
+    from robin.airlock import UNRESOLVED
+    from robin.loop import _release, _release_snapshot
+    from robin.vault import Vault
+
+    vault = Vault("ada", "t")
+    vocabulary = (VocabularyTerm("Jane Doe"),)
+    ner = UnavailableNer()
+    text = "Jane Doe wrote jane@example.com about soccer practice. Next bus is at 08:10."
+    released = _release(text, vault, vocabulary, ner, free_text=True)
+    assert released != UNRESOLVED
+    assert "Jane Doe" not in released
+    assert "jane@example.com" not in released
+    assert "soccer practice" in released
+    assert "08:10" in released
+    assert vault.token("PERSON", "Jane Doe") in released
+
+    snapshot = (
+        "URL: https://mail.test/\nTitle: Inbox\n\nInteractive:\n"
+        '[1] button "Save" (main)\n\n'
+        "Content:\nJane Doe wrote about soccer.\nNo matching listings"
+    )
+    page = _release_snapshot(snapshot, vault, vocabulary, ner)
+    assert "withheld:" not in page
+    assert "soccer" in page
+    assert "No matching listings" in page
+    assert "Jane Doe" not in page
+    assert '[1] button "Save"' in page
+
+    store = HouseholdStore(tmp_path / "house.sqlite", new_key())
+    assistant = Assistant(ner=UnavailableNer(), store=store)
+    assistant.set_vocabulary("ada", (VocabularyTerm("Jane Doe"),))
+    assistant.add(_Inbox())
+    store.append_turn("ada", "t", "user", "hello Jane Doe about soccer")
+    store.append_turn("ada", "t", "assistant", "Jane Doe has soccer at 08:10")
+    model = Scripted(
+        [
+            ModelTurn("", (ToolCall("mail_list", {}),)),
+            ModelTurn("There is a soccer note."),
+        ]
+    )
+    converse(assistant, Task("ada", "t", "look at mail", allow_cloud=True), model)
+    history = "\n".join(
+        str(message.get("content") or "")
+        for messages, _tools in model.seen
+        for message in messages
+        if message.get("role") in {"user", "tool"}
+    )
+    assert "soccer" in history
+    assert "Jane Doe" not in history
+    assert "jane@example.com" not in history
+    assert UNRESOLVED not in history
+    tool_text = "\n".join(
+        str(message.get("content") or "")
+        for messages, _tools in model.seen
+        for message in messages
+        if message.get("role") == "tool"
+    )
+    assert "soccer" in tool_text
+    assert UNRESOLVED not in tool_text

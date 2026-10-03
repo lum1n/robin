@@ -11,12 +11,7 @@ def test_a_shared_add_waits_and_a_private_item_stays_with_its_owner() -> None:
     groceries = Groceries(members={"ada"})
     assistant = Assistant()
     assistant.add(groceries)
-    held = assistant.invoke("ada", "pantry", "lists_add_shared", {"list": "groceries", "item": "milk"})
-    assert held["status"] == "confirm"
-    assert groceries.records("ada") == []
-    done = assistant.invoke(
-        "ada", "pantry", "lists_add_shared", {"list": "groceries", "item": "milk"}, confirmed=True
-    )
+    done = assistant.invoke("ada", "pantry", "lists_add_shared", {"list": "groceries", "item": "milk"})
     assert done["status"] == "done"
     private = assistant.invoke("ada", "pantry", "lists_add", {"list": "groceries", "item": PRIVATE_ITEM})
     assert private["status"] == "done"
