@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from robin.airlock import UNRESOLVED, VocabularyTerm, redact
+from robin.airlock import VocabularyTerm, redact
 from robin.capability import (
     Capability,
     DueWork,
@@ -81,6 +81,7 @@ class Assistant:
         self.vocabulary: dict[str, tuple[VocabularyTerm, ...]] = {}
         self.store = store
         self._pending: dict[tuple[str, str], dict] = {}
+        self._traces: dict[tuple[str, str], dict] = {}
         self.schedules: dict[str, bool] = {}
         self._turn_lock = threading.Lock()
         self._turn_gen: dict[tuple[str, str], int] = {}
@@ -178,9 +179,70 @@ class Assistant:
         return self.store.threads(account_id)
 
     def delete_thread(self, account_id: str, conversation_id: str) -> bool:
+        self._traces.pop((account_id, conversation_id), None)
         if self.store is None:
             return False
         return self.store.delete_thread(account_id, conversation_id)
+
+    def thread_trace(self, account_id: str, conversation_id: str) -> dict:
+        record = self._traces.get((account_id, conversation_id))
+        if record is None and self.store is not None:
+            record = self.store.load_trace(account_id, conversation_id)
+            if record is not None:
+                self._traces[(account_id, conversation_id)] = record
+        return dict(record) if record else {}
+
+    def remember_step(
+        self,
+        account_id: str,
+        conversation_id: str,
+        *,
+        tool: str,
+        arguments: str,
+        result: str,
+        url: str = "",
+    ) -> None:
+        """Append one compact, already-redacted tool step to this thread's trail."""
+        key = (account_id, conversation_id)
+        record = dict(self.thread_trace(account_id, conversation_id))
+        steps = [dict(item) for item in record.get("steps") or [] if isinstance(item, dict)]
+        step = {
+            "tool": tool,
+            "arguments": arguments,
+            "result": result,
+            "url": url,
+        }
+        steps.append(step)
+        record["steps"] = steps[-24:]
+        if url:
+            record["url"] = url
+        elif "url" not in record:
+            record["url"] = ""
+        self._traces[key] = record
+        if self.store is not None:
+            self.store.save_trace(account_id, conversation_id, record)
+
+    def set_thread_task(
+        self,
+        account_id: str,
+        conversation_id: str,
+        *,
+        task: str,
+        open_task: bool,
+        remaining: list[str] | None = None,
+    ) -> None:
+        key = (account_id, conversation_id)
+        record = dict(self.thread_trace(account_id, conversation_id))
+        record["task"] = task
+        record["open"] = open_task
+        record["remaining"] = list(remaining or [])
+        if "steps" not in record:
+            record["steps"] = []
+        if "url" not in record:
+            record["url"] = ""
+        self._traces[key] = record
+        if self.store is not None:
+            self.store.save_trace(account_id, conversation_id, record)
 
     def turns(self, account_id: str, conversation_id: str) -> list[dict[str, str]]:
         if self.store is None:
@@ -387,7 +449,7 @@ class Assistant:
             ner_available=ner.available(),
             extra=ner.detect(task.text) if ner.available() else (),
         )
-        outgoing = UNRESOLVED if task.free_text and message_report.unresolved else message
+        outgoing = message
         redacted = json.dumps({"message": outgoing, "context": context}, sort_keys=True)
         local_context, _ = render_context(
             self.registry.for_account(task.account_id),
@@ -487,6 +549,8 @@ class Assistant:
                 self.activity.append(account_id, entry)
         for vault in self.store.load_vaults():
             self.vaults.put(vault)
+        for account_id, conversation_id, record in self.store.load_traces():
+            self._traces[(account_id, conversation_id)] = record
         for account_id, name, value in self.store.load_secrets():
             self.broker._secrets[(account_id, name)] = value
         self.schedules.update(self.store.load_schedules())

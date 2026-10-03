@@ -89,8 +89,10 @@ SYSTEM = (
     "If conversation history already says a host blocked Robin's automated browser, do not browser_open that "
     "same host again — say it is still blocked from this machine and offer web_search or another site. "
     "When the Person line names a site with an ORG reference, pass that exact reference to browser_open — do not invent another host. "
-    "The latest Person line is the current task. Conversation history is context only — "
-    "do not resume an earlier website, news, or booking task unless the person asks again. "
+    "The latest Person line is the current task. If it continues an open task "
+    "(continue, same for, the other), keep that task and its prior tools. "
+    "Conversation history is context only — do not resume an earlier website, news, or "
+    "booking task when the person changed the subject. "
     "Only call tools the latest Person line needs; never repeat a search, lookup, or action "
     "from earlier turns unless the person asks for it again. "
     "Greetings and identity questions (who are you, what is Robin) need a short plain-text "
@@ -164,6 +166,7 @@ def converse(assistant: Assistant, task: Task, model: Model, *, max_steps: int =
             return Reply("reply", "That turn was replaced by a newer message.", Route.LOCAL)
         assistant.remember(task.account_id, task.conversation_id, reply.status, reply.text)
         assistant.persist_vault(task.account_id, task.conversation_id)
+        _persist_open_task(assistant, task, reply)
         timing = clock.line()
         print(f"robin timing: {timing}", file=sys.stderr, flush=True)
         return replace(reply, timing=timing)
@@ -236,12 +239,26 @@ def _converse(
     vocabulary = assistant.vocabulary_for(task.account_id)
     ner = assistant.ner_for(task.account_id)
     trace = BrowserTrace(correction=looks_like_correction(task.text))
+    prior_trace = assistant.thread_trace(task.account_id, task.conversation_id)
+    continues = _continues_open_task(task.text, prior_trace)
+    wanted = _wanted_families(task.text, prior_trace, continues)
+    used_families: set[str] = set()
+    task_text = str(prior_trace.get("task") or task.text) if continues else task.text
+    assistant._task_progress = {"task": task_text, "wanted": wanted, "used": used_families}
+    if seed_calls:
+        finished_ids = {str(item.get("id")) for item in seed_calls}
+        for item in batch:
+            if item.id in finished_ids:
+                used_families.add(_tool_family(item.name))
     if messages is None:
         spoken = _release(task.text, vault, vocabulary, ner, free_text=task.free_text)
         history = _history(assistant, task, vault, vocabulary, ner)
+        open_task = ""
+        if continues and prior_trace.get("task"):
+            open_task = _release(str(prior_trace["task"]), vault, vocabulary, ner, free_text=True)
         messages = [
             {"role": "system", "content": _system(assistant, task.account_id, task.text, vault=vault)},
-            {"role": "user", "content": _user_message(spoken, history)},
+            {"role": "user", "content": _user_message(spoken, history, open_task=open_task)},
         ]
         _trim_messages(messages)
 
@@ -278,6 +295,26 @@ def _converse(
             if _superseded():
                 return Reply("reply", "That turn was replaced by a newer message.", decision.route)
             if not turn.tool_calls:
+                remaining = (wanted - used_families) if len(wanted) >= 2 else set()
+                if (
+                    remaining
+                    and not _needs_person(turn.message)
+                    and not _explicit_finish(turn.message)
+                ):
+                    messages.append({"role": "assistant", "content": turn.message or ""})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The person's request is not finished. Still to do: "
+                                f"{_family_labels(remaining)}. Keep using tools. "
+                                "Do not give a final answer until those are done, you need the person, "
+                                "or you explicitly finish."
+                            ),
+                        }
+                    )
+                    _trim_messages(messages)
+                    continue
                 reply = _reply_text(turn.message, vault, vocabulary, decision.route)
                 return _after_turn(assistant, task, model, reply, trace)
             messages.append(_assistant_message(turn.message, turn.tool_calls))
@@ -367,6 +404,8 @@ def _converse(
                 )
                 return _after_turn(assistant, task, model, reply, trace)
             result = _release_result(outcome["result"], vault, vocabulary, ner)
+            used_families.add(_tool_family(call.name))
+            _record_step(assistant, task.account_id, task.conversation_id, call.name, call.arguments, result)
             action_lead = result.split("\nURL:", 1)[0] if not result.startswith("URL:") else ""
             if any(line.startswith(("changed: url ", "changed: popup opened",
                                     "changed: page closed", "changed: dialog open",
@@ -424,6 +463,20 @@ def _converse(
     if _superseded():
         return Reply("reply", "That turn was replaced by a newer message.", decision.route)
     trace.hit_max_steps = True
+    remaining = (wanted - used_families) if wanted else set()
+    if remaining:
+        return _after_turn(
+            assistant,
+            task,
+            model,
+            Reply(
+                "reply",
+                "I reached the step limit before finishing. Still unfinished: "
+                f"{_family_labels(remaining)}.",
+                decision.route,
+            ),
+            trace,
+        )
     messages.append(
         {
             "role": "user",
@@ -705,7 +758,8 @@ def _system(assistant: Assistant, account_id: str, text: str = "", *, vault: Vau
     statuses = list(assistant.statuses(account_id))
     if not assistant.ner.available():
         statuses.append(
-            "ner: unavailable — prior conversation turns and free-text tool results are [UNRESOLVED]"
+            "ner: unavailable — using regex and household vocabulary; "
+            "names not in that vocabulary wait until detection loads before a cloud route"
         )
     if statuses:
         lines.append("Connectors:")
@@ -764,10 +818,12 @@ def _argument_problem(call: ToolCall, schema: dict[str, Any]) -> str:
     return f"Not run: missing required argument(s) {', '.join(missing)}. Call {call.name} again with them filled in."
 
 
-def _user_message(spoken: str, history: str) -> str:
+def _user_message(spoken: str, history: str, *, open_task: str = "") -> str:
     parts: list[str] = []
     if history:
         parts.append("Conversation:\n" + history)
+    if open_task:
+        parts.append(f"Open task: {open_task}")
     parts.append(f"Person: {spoken}" if spoken else "Person:")
     return "\n".join(parts)
 
@@ -1008,10 +1064,6 @@ def _release_content_section(lines: list[str], vault, vocabulary, ner) -> list[s
     body_lines = lines[1:] if header else lines
     if not body_lines:
         return list(lines)
-    if not ner.available():
-        return [header, "(withheld: local privacy detection unavailable)"] if header else [
-            "(withheld: local privacy detection unavailable)"
-        ]
     safe = _release("\n".join(body_lines), vault, vocabulary, ner, free_text=True)
     if not safe or safe == "[UNRESOLVED]":
         from robin.airlock import UNRESOLVED
@@ -1023,8 +1075,6 @@ def _release_content_section(lines: list[str], vault, vocabulary, ner) -> list[s
 
 
 def _release_download_section(lines: list[str], vault, vocabulary, ner) -> list[str]:
-    if not ner.available():
-        return list(lines)
     indexes = [i for i, line in enumerate(lines) if line.strip().startswith("- ")]
     if not indexes:
         return list(lines)
@@ -1044,15 +1094,8 @@ def _release_download_section(lines: list[str], vault, vocabulary, ner) -> list[
 def _release_labels(names: list[str], vault, vocabulary, ner) -> list[str]:
     if not names:
         return []
-    if not ner.available():
-        return [
-            name.replace('"', "'")
-            if (not name or name == "unnamed" or name.startswith("unnamed, near "))
-            else "label"
-            for name in names
-        ]
     blob = "\n".join(names)
-    entities = ner.detect(blob)
+    entities = ner.detect(blob) if ner.available() else ()
     starts: list[int] = []
     cursor = 0
     for name in names:
@@ -1075,7 +1118,7 @@ def _release_labels(names: list[str], vault, vocabulary, ner) -> list[str]:
             vault,
             vocabulary=vocabulary,
             free_text=True,
-            ner_available=True,
+            ner_available=ner.available(),
             extra=local,
         )
         if not safe or safe == "[UNRESOLVED]":
@@ -1133,39 +1176,239 @@ def _control_label_for(original: str, entities: tuple) -> str:
 
 
 _SITE_OFFER = re.compile(r"\s*I can remember how I did this on \S+ for next time\.")
+_TRACE_RESULT_CHARS = 160
+_TRACE_ARG_CHARS = 200
+_WORK_FAMILIES = (
+    ("transit", re.compile(r"\b(bus|buss|train|tog|tram|trikk|metro|ferry|transit|departure|avganger)\b", re.I)),
+    ("lists", re.compile(r"\b(list|lists|grocery|groceries|handleliste|todo)\b", re.I)),
+    ("mail", re.compile(r"\b(mail|inbox|e-?post|mailbox|email)\b", re.I)),
+    ("calendar", re.compile(r"\b(calendar|kalender|appointment)\b", re.I)),
+    ("weather", re.compile(r"\b(weather|forecast|været)\b", re.I)),
+    ("files", re.compile(r"\b(files?|documents?|filer)\b", re.I)),
+    ("photos", re.compile(r"\b(photos?|pictures?|bilder)\b", re.I)),
+    ("bills", re.compile(r"\b(bills?|invoice|regning)\b", re.I)),
+    ("jobs", re.compile(r"\b(remind(?:er| me)?|påminn)\b", re.I)),
+)
+_FAMILY_LABELS = {
+    "transit": "the bus/transit check",
+    "lists": "the list",
+    "mail": "mail",
+    "calendar": "the calendar",
+    "weather": "the weather",
+    "files": "files",
+    "photos": "photos",
+    "bills": "bills",
+    "jobs": "the reminder",
+}
+_CONTINUE = re.compile(
+    r"(?i)\b("
+    r"continue|keep going|go on|carry on|finish (it|that)|"
+    r"same for|the other|other (kid|child|one)|do the same|"
+    r"fortsett|samme for|den andre"
+    r")\b"
+)
+_GREETING = re.compile(
+    r"(?i)^(hi|hello|hey|thanks|thank you|who are you|what(?:'|’)s robin|what is robin|"
+    r"hei|takk|hvem er du)\b"
+)
+_ASK_PERSON = re.compile(
+    r"(?i)(\?$|should I|do you want|would you like|which (one|site)|what would you|"
+    r"can you confirm|skal jeg|vil du|hvilken)"
+)
+_EXPLICIT_FINISH = re.compile(
+    r"(?i)\b(that(?:'|’)s (all|everything|it)|all (done|set)|I(?:'|’)m done|"
+    r"nothing else|finished(?: here)?|det var alt|ferdig)\b"
+)
+_TOOL_FAMILY = re.compile(r"^([a-z]+)_")
+
+
+def _work_families(text: str) -> set[str]:
+    return {name for name, pattern in _WORK_FAMILIES if pattern.search(text or "")}
+
+
+def _tool_family(name: str) -> str:
+    match = _TOOL_FAMILY.match(name or "")
+    return match.group(1) if match else (name or "")
+
+
+def _family_labels(families: set[str]) -> str:
+    labels = [_FAMILY_LABELS.get(name, name) for name in sorted(families)]
+    if not labels:
+        return "the rest of the request"
+    if len(labels) == 1:
+        return labels[0]
+    return ", ".join(labels[:-1]) + ", and " + labels[-1]
+
+
+def _wanted_families(text: str, prior: dict, continues: bool) -> set[str]:
+    if continues and prior.get("open") and prior.get("remaining"):
+        return {str(item) for item in prior["remaining"] if item}
+    wanted = _work_families(text)
+    if continues:
+        wanted |= _work_families(str(prior.get("task") or ""))
+    return wanted
+
+
+def _continues_open_task(text: str, prior: dict) -> bool:
+    if not prior or not (prior.get("open") or prior.get("steps")):
+        return False
+    spoken = (text or "").strip()
+    if not spoken or _GREETING.search(spoken):
+        return False
+    if _CONTINUE.search(spoken):
+        return True
+    if not prior.get("open"):
+        return False
+    new = _work_families(spoken)
+    old = _work_families(str(prior.get("task") or ""))
+    if new and old and new.isdisjoint(old):
+        return False
+    return len(spoken.split()) <= 16
+
+
+def _needs_person(message: str) -> bool:
+    text = (message or "").strip()
+    return bool(text) and bool(_ASK_PERSON.search(text))
+
+
+def _explicit_finish(message: str) -> bool:
+    return bool(_EXPLICIT_FINISH.search(message or ""))
+
+
+def _trace_url(result: str) -> str:
+    for line in (result or "").splitlines():
+        if line.startswith("URL:"):
+            return line[4:].strip()
+    return ""
+
+
+def _trace_result_line(result: str) -> str:
+    text = (result or "").strip()
+    if not text:
+        return ""
+    url = ""
+    title = ""
+    for line in text.splitlines():
+        if line.startswith("URL:") and not url:
+            url = line[4:].strip()
+        elif line.startswith("Title:") and not title:
+            title = line[6:].strip()
+    if url or title:
+        return " | ".join(part for part in (url, title) if part)[:_TRACE_RESULT_CHARS]
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if first in {"Interactive:", "Content:"}:
+        return "page snapshot"
+    return first[:_TRACE_RESULT_CHARS]
+
+
+def _record_step(
+    assistant: Assistant,
+    account_id: str,
+    conversation_id: str,
+    name: str,
+    arguments: dict,
+    result: str,
+) -> None:
+    vault = assistant.vaults.get(account_id, conversation_id)
+    vocabulary = assistant.vocabulary_for(account_id)
+    args_text = ""
+    if arguments:
+        redacted, _ = redact(
+            json.dumps(dict(arguments), sort_keys=True, default=str),
+            vault,
+            vocabulary=vocabulary,
+        )
+        args_text = redacted[:_TRACE_ARG_CHARS]
+    assistant.remember_step(
+        account_id,
+        conversation_id,
+        tool=name,
+        arguments=args_text,
+        result=_trace_result_line(result),
+        url=_trace_url(result),
+    )
+
+
+def _persist_open_task(assistant: Assistant, task: Task, reply: Reply) -> None:
+    progress = getattr(assistant, "_task_progress", None) or {}
+    task_text = str(progress.get("task") or task.text)
+    wanted = set(progress.get("wanted") or ())
+    used = set(progress.get("used") or ())
+    remaining = (wanted - used) if wanted else set()
+    text = reply.text or ""
+    if reply.status in {"confirm", "input", "handoff"}:
+        open_task = True
+    elif reply.status == "reply" and remaining and (
+        "step limit" in text.lower() or _needs_person(text)
+    ):
+        open_task = True
+    else:
+        open_task = False
+        remaining = set()
+    assistant.set_thread_task(
+        task.account_id,
+        task.conversation_id,
+        task=task_text,
+        open_task=open_task,
+        remaining=sorted(remaining),
+    )
+
+
+def _trace_history(assistant: Assistant, task: Task) -> str:
+    record = assistant.thread_trace(task.account_id, task.conversation_id)
+    steps = [item for item in record.get("steps") or [] if isinstance(item, dict)]
+    if not steps:
+        return ""
+    lines = ["Prior tools:"]
+    for step in steps[-12:]:
+        name = str(step.get("tool") or "")
+        args = str(step.get("arguments") or "")
+        result = str(step.get("result") or "")
+        line = f"- {name}"
+        if args:
+            line += f" {args}"
+        if result:
+            line += f" → {result}"
+        lines.append(line[:300])
+    url = str(record.get("url") or "")
+    if url:
+        lines.append(f"URL: {url}")
+    return "\n".join(lines)
 
 
 def _history(assistant: Assistant, task: Task, vault, vocabulary, ner) -> str:
     """Recent turns of this conversation, after the airlock. Another conversation stays out."""
-    if assistant.store is None:
-        return ""
-    turns = assistant.turns(task.account_id, task.conversation_id)
-    if turns and turns[-1]["role"] == "user" and turns[-1]["text"] == task.text:
-        turns = turns[:-1]
     lines: list[str] = []
-    for turn in turns[-_HISTORY_TURNS:]:
-        if turn["role"] == "confirm":
-            # A new message cancels an unconfirmed action; its JSON arguments read like pending work.
-            continue
-        text = _SITE_OFFER.sub("", " ".join(turn["text"].split())).strip()
-        body = _release(text, vault, vocabulary, ner, free_text=True)
-        if len(body) > _TURN_CHARS:
-            body = body[:_TURN_CHARS]
-        if not body:
-            continue
-        who = "person" if turn["role"] == "user" else "robin"
-        if who == "robin" and _menu_spam(body):
-            body = "earlier reply listed booking choices instead of clicking — ignore that list"
-        if who == "robin" and _bot_block_spam(body):
-            body = (
-                "earlier attempt: that host blocked Robin's automated browser — "
-                "do not retry the same host; use web_search or ask for another site"
-            )
-        elif who == "robin" and _access_spam(body):
-            body = "earlier reply wrongly said a website was unreachable — ignore that"
-        if who == "robin" and _news_spam(body):
-            body = "earlier reply listed news headlines — ignore unless the person asks for news"
-        lines.append(f"{who}: {body}")
+    if assistant.store is not None:
+        turns = assistant.turns(task.account_id, task.conversation_id)
+        if turns and turns[-1]["role"] == "user" and turns[-1]["text"] == task.text:
+            turns = turns[:-1]
+        for turn in turns[-_HISTORY_TURNS:]:
+            if turn["role"] == "confirm":
+                # A new message cancels an unconfirmed action; its JSON arguments read like pending work.
+                continue
+            text = _SITE_OFFER.sub("", " ".join(turn["text"].split())).strip()
+            body = _release(text, vault, vocabulary, ner, free_text=True)
+            if len(body) > _TURN_CHARS:
+                body = body[:_TURN_CHARS]
+            if not body:
+                continue
+            who = "person" if turn["role"] == "user" else "robin"
+            if who == "robin" and _menu_spam(body):
+                body = "earlier reply listed booking choices instead of clicking — ignore that list"
+            if who == "robin" and _bot_block_spam(body):
+                body = (
+                    "earlier attempt: that host blocked Robin's automated browser — "
+                    "do not retry the same host; use web_search or ask for another site"
+                )
+            elif who == "robin" and _access_spam(body):
+                body = "earlier reply wrongly said a website was unreachable — ignore that"
+            if who == "robin" and _news_spam(body):
+                body = "earlier reply listed news headlines — ignore unless the person asks for news"
+            lines.append(f"{who}: {body}")
+    trail = _trace_history(assistant, task)
+    if trail:
+        lines.append(trail)
     return "\n".join(lines)
 
 
@@ -1327,6 +1570,19 @@ def resume(
         reply = Reply("reply", outcome["result"], route, tool=pending["tool"])
         assistant.remember(account_id, conversation_id, reply.status, reply.text)
         assistant.persist_vault(account_id, conversation_id)
+        _record_step(
+            assistant,
+            account_id,
+            conversation_id,
+            pending["tool"],
+            pending.get("arguments") or {},
+            str(outcome.get("result") or ""),
+        )
+        _persist_open_task(
+            assistant,
+            Task(account_id=account_id, conversation_id=conversation_id, text=str(pending.get("text") or "")),
+            reply,
+        )
         return reply
     task = Task(
         account_id=account_id,
@@ -1355,6 +1611,14 @@ def resume(
     after = ids.index(call_id) + 1 if call_id in ids else len(batch)
     queued = tuple(item for item in batch[after:] if item.id not in finished)
     messages.append(_assistant_message("", batch))
+    _record_step(
+        assistant,
+        account_id,
+        conversation_id,
+        pending["tool"],
+        pending.get("arguments") or {},
+        str(outcome.get("result") or ""),
+    )
     try:
         reply = _converse(
             assistant,
@@ -1381,4 +1645,5 @@ def resume(
         )
     assistant.remember(account_id, conversation_id, reply.status, reply.text)
     assistant.persist_vault(account_id, conversation_id)
+    _persist_open_task(assistant, task, reply)
     return reply

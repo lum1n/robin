@@ -268,9 +268,8 @@ def _boot(args: argparse.Namespace) -> int:
     if not ner._installed:
         print(
             "robin: WARNING local NER packages are missing — reinstall robin "
-            "(gliner is a core dependency). Without NER, conversation history and "
-            "free-text tool results stay [UNRESOLVED] and browser controls become "
-            "unusable labels.",
+            "(gliner is a core dependency). Without NER, Robin still applies regex "
+            "and household vocabulary; a cloud route waits until detection loads.",
             flush=True,
         )
     elif ner._failed:

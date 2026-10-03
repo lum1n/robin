@@ -75,6 +75,16 @@ class HouseholdStore:
             )
             """
         )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS traces (
+                account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                body BLOB NOT NULL,
+                PRIMARY KEY (account_id, conversation_id)
+            )
+            """
+        )
         self._db.execute("CREATE TABLE IF NOT EXISTS instances (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS passwords (account_id TEXT PRIMARY KEY, body BLOB NOT NULL)")
         self._db.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, body BLOB NOT NULL)")
@@ -165,6 +175,7 @@ class HouseholdStore:
             (account_id, conversation_id),
         )
         self.clear_pending(account_id, conversation_id)
+        self.clear_trace(account_id, conversation_id)
         self._db.execute(
             "DELETE FROM threads WHERE account_id = ? AND conversation_id = ?",
             (account_id, conversation_id),
@@ -601,6 +612,43 @@ class HouseholdStore:
     def clear_pending(self, account_id: str, conversation_id: str) -> None:
         self._db.execute(
             "DELETE FROM pending WHERE account_id = ? AND conversation_id = ?",
+            (account_id, conversation_id),
+        )
+        self._db.commit()
+
+    def save_trace(self, account_id: str, conversation_id: str, record: dict) -> None:
+        self.ensure_thread(account_id, conversation_id)
+        self._db.execute(
+            """
+            INSERT INTO traces (account_id, conversation_id, body) VALUES (?, ?, ?)
+            ON CONFLICT (account_id, conversation_id) DO UPDATE SET body = excluded.body
+            """,
+            (account_id, conversation_id, self._seal(json.dumps(record, sort_keys=True))),
+        )
+        self._db.commit()
+
+    def load_trace(self, account_id: str, conversation_id: str) -> dict | None:
+        row = self._db.execute(
+            "SELECT body FROM traces WHERE account_id = ? AND conversation_id = ?",
+            (account_id, conversation_id),
+        ).fetchone()
+        if row is None:
+            return None
+        loaded = json.loads(self._open(row[0]))
+        return loaded if isinstance(loaded, dict) else None
+
+    def load_traces(self) -> list[tuple[str, str, dict]]:
+        rows = self._db.execute("SELECT account_id, conversation_id, body FROM traces").fetchall()
+        found: list[tuple[str, str, dict]] = []
+        for account_id, conversation_id, body in rows:
+            loaded = json.loads(self._open(body))
+            if isinstance(loaded, dict):
+                found.append((account_id, conversation_id, loaded))
+        return found
+
+    def clear_trace(self, account_id: str, conversation_id: str) -> None:
+        self._db.execute(
+            "DELETE FROM traces WHERE account_id = ? AND conversation_id = ?",
             (account_id, conversation_id),
         )
         self._db.commit()

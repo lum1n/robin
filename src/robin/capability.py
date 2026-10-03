@@ -10,7 +10,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from robin.airlock import REDACTED, UNRESOLVED, Entity, Report, VocabularyTerm, redact
+from robin.airlock import REDACTED, Entity, Report, VocabularyTerm, redact
 from robin.ner import Ner, UnavailableNer
 from robin.vault import REFERENCE, Vault
 
@@ -400,8 +400,6 @@ def _render_field(
     ):
         redacted = vault.token(spec.label, value)
         report = Report(entities=(Entity(0, len(value), spec.label),), unresolved=False)
-    if for_cloud and spec.free_text and report.unresolved:
-        return UNRESOLVED, report
     if for_cloud:
         return redacted, report
     return vault.restore(redacted), report

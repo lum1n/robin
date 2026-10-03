@@ -253,10 +253,16 @@ def release(
     ner_available: bool = False,
     extra: tuple[Entity, ...] = (),
 ) -> str:
-    """The only form of a string that may be sent to a model."""
+    """The only form of a string that may be sent to a model.
+
+    Regex, household vocabulary, and any extra spans always run. A cold or
+    missing neural detector does not replace the whole string; it only leaves
+    `report.unresolved` set so a cloud route can wait. Secrets, national IDs,
+    and payment data are still dropped.
+    """
     if not text:
         return ""
-    redacted, report = redact(
+    redacted, _report = redact(
         text,
         vault,
         vocabulary=vocabulary,
@@ -264,8 +270,6 @@ def release(
         ner_available=ner_available,
         extra=extra,
     )
-    if free_text and report.unresolved:
-        return UNRESOLVED
     return redacted
 
 
