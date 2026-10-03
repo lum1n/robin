@@ -7,7 +7,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from robin.capability import Capability, DueWork, Effect, FieldClass, FieldSpec, Tool
+from robin.capability import Capability, DueWork, Effect, FieldClass, FieldSpec, Tool, current_task
 from robin.store import HouseholdStore
 
 _RECURRENCE = re.compile(
@@ -132,6 +132,20 @@ class Jobs(Capability):
             count = len(self._jobs.get(account_id, []))
         return f"jobs: {count} automation(s)"
 
+    def brief(self, account_id: str, text: str = "") -> list[str]:
+        rows = self.records(account_id)
+        if not rows:
+            return []
+        lines = ["Scheduled jobs:"]
+        for row in rows[:12]:
+            line = f"- {row['id']} at {row['when']}: {row['instruction']}"
+            if row.get("result"):
+                line += f" Last: {row['result'][:120]}"
+            lines.append(line)
+        if len(rows) > 12:
+            lines.append(f"- (+{len(rows) - 12} more)")
+        return lines
+
     def records(self, account_id: str) -> list[dict[str, str]]:
         with self._lock:
             rows = [dict(row) for row in self._jobs.get(account_id, [])]
@@ -161,10 +175,11 @@ class Jobs(Capability):
             def finish(result: str, account_id: str = account_id, job_id: str = job_id, moment: datetime = moment) -> None:
                 self._complete(account_id, job_id, moment, result)
 
+            source = str(row.get("conversation_id") or "").strip()
             work.append(
                 DueWork(
                     account_id=account_id,
-                    conversation_id=f"job-{job_id}",
+                    conversation_id=source or f"job-{job_id}",
                     text=f"{row['instruction']}\nDo this now and answer with the delivery.",
                     finish=finish,
                 )
@@ -202,6 +217,8 @@ class Jobs(Capability):
         with self._lock:
             rows = self._jobs.setdefault(account_id, [])
             job_id = _fresh_id(instruction, int(schedule["hour"]), int(schedule["minute"]), rows)
+            turn = current_task.get()
+            conversation_id = turn.conversation_id if turn is not None else ""
             job = {
                 "id": job_id,
                 "instruction": instruction,
@@ -214,6 +231,7 @@ class Jobs(Capability):
                 "not_before": schedule["not_before"],
                 "last_run": "",
                 "result": "",
+                "conversation_id": conversation_id,
             }
             rows.append(job)
             self._save(account_id)

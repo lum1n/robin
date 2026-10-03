@@ -66,7 +66,9 @@ def test_add_waits_for_confirm_and_a_folded_title_is_one_line() -> None:
     )
     assert done["status"] == "done"
     assert done["result"].startswith("added")
-    assert directory.puts[0][0] == "https://cal.example/ada"
+    event_id = done["result"].split()[-1]
+    assert directory.puts[0][0] == f"https://cal.example/ada/{event_id}.ics"
+    assert f"UID:{event_id}" in directory.puts[0][3]
     assert SECRET in directory.puts[0][3]
     assert PASSWORD not in directory.puts[0][3]
     log = json.dumps(assistant.activity.read("ada"))
@@ -144,6 +146,54 @@ def test_hello_does_not_fetch_the_calendar() -> None:
     assert fetches == []
     converse(assistant, Task("ada", "home", "hello"), _Plain("hi"))
     assert fetches == []
+
+
+def test_calendar_update_and_delete_the_same_object() -> None:
+    broker = Assistant().broker
+    broker.put(
+        "ada",
+        "calendar",
+        calendar_secret(url="https://cal.example/ada", user="ada@example.com", password=PASSWORD),
+    )
+
+    class Objects:
+        def __init__(self) -> None:
+            self.objects: dict[str, str] = {}
+            self.puts: list[tuple[str, str, str, str]] = []
+            self.deletes: list[str] = []
+
+        def fetch(self, url: str, user: str, password: str) -> str:
+            prefix = url.rstrip("/")
+            bodies = [body for href, body in self.objects.items() if href.startswith(prefix)]
+            return "BEGIN:VCALENDAR\n" + "\n".join(bodies) + "\nEND:VCALENDAR\n"
+
+        def put(self, url: str, user: str, password: str, body: str) -> None:
+            self.puts.append((url, user, password, body))
+            self.objects[url] = body
+
+        def delete(self, url: str, user: str, password: str, event_id: str) -> None:
+            href = url.rstrip("/") + f"/{event_id}.ics"
+            self.deletes.append(href)
+            self.objects.pop(href, None)
+
+    store = Objects()
+    calendar = CalDAV(broker, fetch=store.fetch, put=store.put, delete=store.delete)
+    event_id = calendar.add("ada", "Dinner", "20261003T180000")
+    href = f"https://cal.example/ada/{event_id}.ics"
+    assert store.puts[0][0] == href
+    assert f"UID:{event_id}" in store.puts[0][3]
+    rows = calendar.events("ada")
+    assert rows == [{"id": event_id, "title": "Dinner", "when": "20261003T180000"}]
+    calendar.update("ada", event_id, title="Dinner with Bea")
+    assert store.puts[1][0] == href
+    assert f"UID:{event_id}" in store.puts[1][3]
+    assert "Dinner with Bea" in store.puts[1][3]
+    updated = calendar.events("ada")
+    assert updated == [{"id": event_id, "title": "Dinner with Bea", "when": "20261003T180000"}]
+    assert len(updated) == 1
+    calendar.delete("ada", event_id)
+    assert store.deletes == [href]
+    assert calendar.events("ada") == []
 
 
 def test_calendar_tools_hidden_until_connected() -> None:

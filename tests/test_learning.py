@@ -123,6 +123,19 @@ def test_guidance_cap_prefers_hits(tmp_path: Path) -> None:
     assert sum(len(row["text"]) for row in selected) <= 1600
 
 
+def test_memory_ranks_by_request_relevance_not_only_hits() -> None:
+    from robin.capabilities.memory import Memory
+
+    memory = Memory(facts={"ada": []})
+    memory.invoke("ada", "lesson_save", {"text": "The household is vegetarian", "kind": "fact"})
+    memory.invoke("ada", "lesson_save", {"text": "Prefer short replies", "kind": "preference"})
+    for row in memory._facts["ada"]:
+        if "short" in row["text"]:
+            row["hits"] = 99
+    selected = memory.select("ada", "what can we cook for vegetarians tonight")
+    assert selected[0]["text"] == "The household is vegetarian"
+
+
 def test_reflection_saves_lesson_without_tool_results(tmp_path: Path) -> None:
     store = HouseholdStore(tmp_path / "house.sqlite", new_key())
     memory = Memory(store=store)

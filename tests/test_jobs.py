@@ -246,6 +246,7 @@ def test_jobs_add_at_a_date_and_time_runs_once() -> None:
     assert jobs.due(datetime(2026, 10, 1, 19, 44)) == []
     work = jobs.due(datetime(2026, 10, 1, 19, 45))
     assert len(work) == 1 and "match at 20:45" in work[0].text
+    assert work[0].conversation_id.startswith("job-")
     work[0].finish("sent")
     assert jobs.due(datetime(2026, 10, 1, 19, 50)) == []
 

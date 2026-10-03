@@ -38,7 +38,7 @@ class Lists(Capability):
         ),
         Tool(
             name="lists_add_shared",
-            description="Add an item to a shared household list. Waits for confirmation.",
+            description="Add an item to a shared household list.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -47,7 +47,7 @@ class Lists(Capability):
                 },
                 "required": ["list", "item"],
             },
-            effect=Effect.EXTERNAL,
+            effect=Effect.MUTATE,
         ),
         Tool(
             name="lists_check",
@@ -64,7 +64,7 @@ class Lists(Capability):
         ),
         Tool(
             name="lists_check_shared",
-            description="Check off or remove an item from a shared list. Waits for confirmation.",
+            description="Check off or remove an item from a shared list.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -73,7 +73,7 @@ class Lists(Capability):
                 },
                 "required": ["list", "item"],
             },
-            effect=Effect.EXTERNAL,
+            effect=Effect.MUTATE,
         ),
         Tool(
             name="lists_add_member",
@@ -119,6 +119,23 @@ class Lists(Capability):
         if account_id in self.members:
             return "lists: household member"
         return "lists: private only"
+
+    def brief(self, account_id: str, text: str = "") -> list[str]:
+        rows = self.records(account_id)
+        if not rows:
+            return []
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            name = row.get("list") or "groceries"
+            item = (row.get("item") or "").strip()
+            if item:
+                grouped.setdefault(name, []).append(item)
+        lines = ["Household lists:"]
+        for name, items in grouped.items():
+            shown = items[:20]
+            extra = f" (+{len(items) - 20} more)" if len(items) > 20 else ""
+            lines.append(f"- {name}: {', '.join(shown)}{extra}")
+        return lines
 
     def visible_to(self, account_id: str) -> bool:
         return True

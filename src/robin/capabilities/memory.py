@@ -28,6 +28,25 @@ def _site_named(site: str, haystack: str) -> bool:
     return len(stem) >= 3 and re.search(r"(?<!\w)" + re.escape(stem) + r"(?!\w)", haystack) is not None
 
 
+def _relevance(row: dict[str, Any], haystack: str) -> int:
+    """Word and tag overlap with the current request; hit count is a later tie-break."""
+    if not haystack:
+        return 0
+    score = 0
+    text = str(row.get("text") or "").casefold()
+    words = {token for token in re.findall(r"[a-z0-9]{3,}", haystack)}
+    fact_words = {token for token in re.findall(r"[a-z0-9]{3,}", text)}
+    score += 3 * len(words & fact_words)
+    for tag in row.get("tags") or []:
+        folded = str(tag).casefold()
+        if folded and folded in haystack:
+            score += 4
+        stem = folded.split(".", 1)[0]
+        if len(stem) >= 3 and re.search(r"(?<!\w)" + re.escape(stem) + r"(?!\w)", haystack):
+            score += 2
+    return score
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -189,7 +208,11 @@ class Memory(Capability):
                 continue
             ranked.append(row)
         ranked.sort(
-            key=lambda row: (int(row.get("hits") or 0), str(row.get("created") or "")),
+            key=lambda row: (
+                _relevance(row, haystack),
+                int(row.get("hits") or 0),
+                str(row.get("created") or ""),
+            ),
             reverse=True,
         )
         chosen: list[dict[str, Any]] = []

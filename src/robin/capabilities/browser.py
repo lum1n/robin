@@ -1367,17 +1367,28 @@ class Browser(Capability):
                 "Open an http or https URL and return a text snapshot with URL, Interactive refs, and Content. "
                 "Use this for any website task: booking, shopping, reading, signing in, filling forms. "
                 "Pass a full URL such as https://example.com (a bare host is accepted and treated as https). "
+                "A site named without a domain (a store, brand, or service name, or its ORG reference) is still a site: "
+                "pass that name and Robin finds its website. "
+                "The site the latest Person line names always wins: if the open page is a different host, open the named one first. "
                 "If this site is already open, prefer browser_click/read on the current page instead of opening the homepage again. "
                 "Never pass a booking choice word (clinic, home visit, consultation) as the url — click that option on the page. "
                 "When the person names a site with an ORG reference (or similar), pass that entire reference as url — confirm restores the real host. "
                 "Do not invent a different hostname from memory (for example lot.com when they said Google). "
+                "Reach the site's actual search/results page, not just its category landing page. "
                 "To click or type, use Interactive refs (for example target 1) or the visible name. "
+                "Use browser_find or scoped browser_read to discover omitted search/filter/sort controls before scrolling blindly. "
                 "Use browser_select for dropdowns, browser_scroll to reveal more, browser_press for Enter or Tab, "
                 "browser_back to leave a page. Use browser_hover for menus, browser_type_focused when the caret is already in a field. "
                 "When a snapshot says a saved sign-in exists, use browser_fill_username and browser_fill_password; never invent the password. "
                 "When a snapshot lists saved profile fields, use browser_fill_profile for those — never type email, phone, or name yourself. "
                 "When Pages lists more than one entry, browser_switch focuses that popup by index. "
-                "If Content ends with (more below), scroll only to read more Content — Interactive refs are already listed and clickable."
+                "If Content ends with (more below), scroll only to read more Content — Interactive refs are already listed and clickable. "
+                "Empty, truncated or withheld Content does not mean zero search results. "
+                "Only claim no matches when the page explicitly says so after the requested filters are applied. "
+                "If a page snapshot says bot/captcha wall or has empty Content behind an iframe, stop hopping sites — "
+                "tell the person automation was blocked and use web_search for a rough estimate or ask which site to try. "
+                "If conversation history already says a host blocked Robin's automated browser, do not open that "
+                "same host again — say it is still blocked from this machine and offer web_search or another site."
             ),
             parameters={
                 "type": "object",
@@ -1389,7 +1400,12 @@ class Browser(Capability):
         ),
         Tool(
             name="browser_read",
-            description="Read the structured text snapshot of this account's page (URL, interactive refs, content).",
+            description=(
+                "Read the structured text snapshot of this account's page (URL, interactive refs, content). "
+                "Use a query or region to find omitted search/filter/sort controls before scrolling blindly. "
+                "Empty or truncated Content is not zero results. (more below) only means Content text is truncated; "
+                "do not scroll away from a form to find a button that is already listed under Interactive."
+            ),
             parameters={"type": "object", "properties": {
                 "query": {"type": "string"},
                 "region": {"type": "string", "enum": ["dialog", "main", "nav", "header", "page"]},
@@ -1399,13 +1415,19 @@ class Browser(Capability):
         ),
         Tool(
             name="browser_find",
-            description="Find omitted controls by label, group or role across the page. Returns current refs; use before blind scrolling.",
+            description=(
+                "Find omitted controls by label, group or role across the page. Returns current refs; use before blind scrolling. "
+                "No observable change is not progress — try a different justified action after two unchanged attempts."
+            ),
             parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
             effect=Effect.READ,
         ),
         Tool(
             name="browser_set_checked",
-            description="Set a checkbox or switch to checked=true or false, without toggling an already correct state.",
+            description=(
+                "Set a checkbox or switch to checked=true or false, without toggling an already correct state. "
+                "Use this for search filters and verify range limits and selected sorting in the new snapshot."
+            ),
             parameters={"type": "object", "properties": {
                 "target": {"type": "string"}, "checked": {"type": "boolean"},
             }, "required": ["target", "checked"]},
@@ -1418,9 +1440,11 @@ class Browser(Capability):
                 "Prefer a ref when the same name appears more than once. "
                 "Use this to follow booking buttons, menus, and links on the open page. "
                 "When the person describes a choice in plain language (clinic, home visit, consultation), "
-                "match it to a control and click — do not ask them to pick 1/2/3. "
+                "match it to a control and click — do not ask them to pick 1/2/3, and never invent a numbered menu. "
+                "Words like clinic or home visit are page choices — click them after the site is open; never browser_open them as a URL. "
                 "If the snapshot marks a control disabled, fill required fields first. "
                 "A button listed under Interactive is available — click its ref; do not claim it is missing. "
+                "For named actions such as Send bestilling, click that ref; browser_submit is only for type=submit login forms. "
                 "If a click fails, browser_read and try a different ref — do not retry the same target. "
                 "After typing a search query, browser_press Enter or click a search suggestion option."
             ),
@@ -1432,8 +1456,8 @@ class Browser(Capability):
             description=(
                 "Type into a textbox ref or labeled field that is not a password. "
                 "Prefer an Interactive ref number (for example 12). "
-                "For email, phone, or name, prefer browser_fill_profile when a saved profile exists — "
-                "never invent contact information."
+                "For email, phone, name, or address, prefer browser_fill_profile when a saved profile exists — "
+                "never invent contact details and never type them here."
             ),
             parameters={
                 "type": "object",

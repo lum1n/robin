@@ -487,9 +487,7 @@ class Assistant:
             if self.store is not None:
                 self.store.append_activity(account_id, entry)
             return {"status": "error", "result": str(exc)}
-        if tool.egress and not confirmed and _egress_needs_restore(
-            arguments, vault, approved=self._egress_approved(account_id)
-        ):
+        if not confirmed and self.confirm_reason(account_id, conversation_id, tool_name, arguments) == "egress":
             return {"status": "confirm", "tool": tool_name, "reason": "egress"}
         logged_input = {
             redact(key, vault, vocabulary=vocabulary)[0]: (
@@ -507,13 +505,7 @@ class Assistant:
         if tool_name == "browser_open" and _PLACEHOLDER_ONLY.fullmatch(str(arguments.get("url", "")).strip()):
             # The person named this site (NER tagged it); the browser may resolve a bare name to its website.
             raw["named_site"] = True
-        if (tool.effect is Effect.EXTERNAL or tool.confirm) and not confirmed:
-            return {"status": "confirm", "tool": tool_name}
-        if (
-            tool_name in {"lesson_save", "lesson_update", "memory_remember"}
-            and not confirmed
-            and _lesson_needs_confirm()
-        ):
+        if not confirmed and self.confirm_reason(account_id, conversation_id, tool_name, arguments):
             return {"status": "confirm", "tool": tool_name}
         try:
             outcome = capability.invoke(account_id, tool.name, raw)
@@ -540,6 +532,29 @@ class Assistant:
         if for_model or tool.effect is Effect.EXTERNAL:
             return {"status": "done", "result": text}
         return {"status": "done", "result": vault.restore(text)}
+
+    def confirm_reason(
+        self,
+        account_id: str,
+        conversation_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        """Why this call waits for the person, or empty when it can run now."""
+        try:
+            _capability, tool = self.registry.resolve(account_id, tool_name)
+        except KeyError:
+            return ""
+        vault = self.vaults.get(account_id, conversation_id)
+        if tool.egress and _egress_needs_restore(
+            arguments, vault, approved=self._egress_approved(account_id)
+        ):
+            return "egress"
+        if tool.effect is Effect.EXTERNAL or tool.confirm:
+            return "external"
+        if tool_name in {"lesson_save", "lesson_update", "memory_remember"} and _lesson_needs_confirm():
+            return "lesson"
+        return ""
 
     def _restore_store(self) -> None:
         assert self.store is not None

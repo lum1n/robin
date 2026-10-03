@@ -564,16 +564,13 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     assert "identity questions" in SYSTEM.lower()
     assert "browser tools" in SYSTEM
     assert "own calendar" in SYSTEM or "third-party" in SYSTEM
-    assert "never ask the person to reply with 1, 2, or 3" in SYSTEM.lower()
-    assert "never invent a numbered menu" in SYSTEM.lower()
-    assert "page choices" in SYSTEM.lower() or "browser_click them" in SYSTEM.lower()
-    assert "do not invent contact details" in SYSTEM.lower() or "never invent contact details" in SYSTEM.lower()
-    assert "browser_fill_profile" in SYSTEM
-    assert "disabled" in SYSTEM.lower()
-    assert "interactive are available" in SYSTEM.lower() or "listed under interactive" in SYSTEM.lower()
-    assert "never say a button is missing" in SYSTEM.lower()
+    assert "confirm before sending" in SYSTEM.lower()
+    assert "list, calendar, and memory" in SYSTEM.lower()
+    assert "already available" in SYSTEM.lower()
     assert "lack access" in SYSTEM.lower()
     assert "web_search fails" in SYSTEM.lower()
+    assert "clinic" not in SYSTEM.lower()
+    assert "Send bestilling" not in SYSTEM
     assistant = Assistant(ner=StubNer())
     assistant.add(Browser(owner="ada", page=_LoopPage()))
     assistant.add(Calendar(_NoCal()))
@@ -582,6 +579,8 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
     tools = {tool["name"]: tool["description"] for tool in assistant.tools("ada")}
     assert "browser_open" in tools
     assert "website" in tools["browser_open"].lower() or "booking" in tools["browser_open"].lower()
+    assert "clinic" in tools["browser_open"].lower() or "clinic" in tools["browser_click"].lower()
+    assert "never invent a numbered menu" in tools["browser_click"].lower()
     assert "browser_fill_profile" in tools
     assert "never appears" in tools["browser_fill_profile"].lower() or "never appear" in tools["browser_fill_profile"].lower()
     assert "browser_fill_profile" in tools["browser_type"].lower()
@@ -803,6 +802,95 @@ def _tool_pairs_ok(messages: list[dict]) -> bool:
         message.get("role") != "tool" or index > 0 and messages[index - 1].get("role") in ("assistant", "tool")
         for index, message in enumerate(messages)
     )
+
+
+def test_household_context_reaches_the_model_before_tools() -> None:
+    from datetime import datetime
+
+    from robin.capabilities.jobs import Jobs
+    from robin.capabilities.memory import Memory
+    from robin.loop import _system
+
+    lists = Lists(members={"ada"}, shared=[{"item": "oat milk", "list": "groceries", "loyalty": ""}], private={})
+    jobs = Jobs(clock=lambda: datetime(2026, 9, 23, 18, 0))
+    memory = Memory(facts={"ada": []})
+    memory.invoke("ada", "lesson_save", {"text": "The household is vegetarian", "kind": "fact"})
+    memory.invoke("ada", "lesson_save", {"text": "Prefer short replies", "kind": "preference"})
+    for row in memory._facts["ada"]:
+        if "short" in row["text"]:
+            row["hits"] = 99
+    assistant = Assistant(ner=StubNer())
+    assistant.add(lists)
+    assistant.add(jobs)
+    assistant.add(memory)
+    converse(
+        assistant,
+        Task("ada", "home", "remind me to take out the trash every evening"),
+        Scripted(
+            [
+                ModelTurn(
+                    "",
+                    (
+                        ToolCall(
+                            "jobs_add",
+                            {"instruction": "take out the trash", "hour": 18, "minute": 0, "days": "every day"},
+                        ),
+                    ),
+                ),
+                ModelTurn("Saved."),
+            ]
+        ),
+    )
+    model = Scripted([ModelTurn("Pasta works.")])
+    converse(assistant, Task("ada", "home", "what can we cook from the fridge for vegetarians"), model)
+    prompt = model.seen[0][0][0]["content"]
+    assert "Household (already on this account" in prompt
+    assert "oat milk" in prompt
+    assert "take out the trash" in prompt
+    assert "The household is vegetarian" in prompt
+    selected = memory.select("ada", "what can we cook from the fridge for vegetarians")
+    assert selected[0]["text"] == "The household is vegetarian"
+    stored = jobs._jobs["ada"][0]
+    assert stored["conversation_id"] == "home"
+    due = jobs.due(datetime(2026, 9, 24, 18, 0))
+    assert due and due[0].conversation_id == "home"
+    job_prompt = _system(assistant, "ada", "take out the trash", vault=assistant.vaults.get("ada", "home"))
+    assert "oat milk" in job_prompt
+
+
+def test_confirm_does_not_abort_readonly_calls_in_the_same_batch() -> None:
+    from robin.loop import resume
+
+    screen = Screen(owner="ada", text="desk", password="")
+    lists = Lists(members={"ada"}, shared=[{"item": "milk", "list": "groceries", "loyalty": ""}], private={})
+    assistant = Assistant(ner=StubNer())
+    assistant.add(screen)
+    assistant.add(lists)
+    model = Scripted(
+        [
+            ModelTurn(
+                "",
+                (
+                    ToolCall("lists_show", {"list": "groceries"}, id="a"),
+                    ToolCall("screen_submit", {}, id="b"),
+                    ToolCall("lists_show", {"list": "groceries"}, id="c"),
+                ),
+            ),
+            ModelTurn("Done."),
+        ]
+    )
+    held = converse(assistant, Task("ada", "t", "check dinner and send the invite"), model)
+    assert held.status == "confirm"
+    assert held.tool == "screen_submit"
+    assert held.task_text == "check dinner and send the invite"
+    pending = assistant._pending[("ada", "t")]
+    assert pending["text"] == "check dinner and send the invite"
+    done_ids = {item["id"] for item in pending["done_calls"]}
+    assert done_ids == {"a", "c"}
+    assert screen.submitted is False
+    reply = resume(assistant, "ada", "t", model)
+    assert reply.text == "Done."
+    assert screen.submitted is True
 
 
 def test_confirming_one_of_several_calls_runs_the_rest() -> None:

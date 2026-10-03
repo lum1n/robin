@@ -156,6 +156,10 @@ class Capability:
         """Short lines for the system prompt about this account's learned preferences."""
         return []
 
+    def brief(self, account_id: str, text: str = "") -> list[str]:
+        """Household state for the system prompt before the first model call (lists, jobs, memory)."""
+        return []
+
     def public_terms(self, account_id: str) -> list[str]:
         """Names this account set up (for example MCP servers) that NER must not mask."""
         return []
@@ -253,6 +257,12 @@ class Registry:
         lines: list[str] = []
         for capability in self.for_account(account_id):
             lines.extend(capability.guidance(account_id, text))
+        return lines
+
+    def brief(self, account_id: str, text: str = "") -> list[str]:
+        lines: list[str] = []
+        for capability in self.for_account(account_id):
+            lines.extend(capability.brief(account_id, text))
         return lines
 
     def public_terms(self, account_id: str) -> list[str]:

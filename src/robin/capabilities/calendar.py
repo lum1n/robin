@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from base64 import b64encode
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -71,7 +72,28 @@ class CalDAV:
             raise RuntimeError("calendar is not connected")
         if "\n" in title or "\r" in title or "\n" in when or "\r" in when:
             raise ValueError("event fields must be one line")
-        event_id = f"robin-{abs(hash((title, when))) % 10_000_000}"
+        event_id = f"robin-{uuid.uuid4()}"
+        self._put_event(creds, event_id, title, when)
+        return event_id
+
+    def update(self, account_id: str, event_id: str, title: str = "", when: str = "") -> None:
+        creds = self._credentials(account_id)
+        if creds is None:
+            raise RuntimeError("calendar is not connected")
+        rows = self.events(account_id)
+        match = next((row for row in rows if row.get("id") == event_id), None)
+        if match is None:
+            raise RuntimeError("event not found")
+        self._put_event(
+            creds,
+            event_id,
+            title or match.get("title") or "event",
+            when or match.get("when") or "",
+        )
+
+    def _put_event(self, creds: dict[str, str], event_id: str, title: str, when: str) -> None:
+        if "\n" in title or "\r" in title or "\n" in when or "\r" in when:
+            raise ValueError("event fields must be one line")
         ics = (
             "BEGIN:VCALENDAR\n"
             "BEGIN:VEVENT\n"
@@ -81,20 +103,13 @@ class CalDAV:
             "END:VEVENT\n"
             "END:VCALENDAR\n"
         )
+        href = creds["url"].rstrip("/") + f"/{event_id}.ics"
         try:
-            self._put(creds["url"], creds["user"], creds["password"], ics)
+            self._put(href, creds["user"], creds["password"], ics)
         except Exception as exc:
             if creds["password"] in str(exc):
                 raise RuntimeError("calendar login failed") from None
             raise
-        return event_id
-
-    def update(self, account_id: str, event_id: str, title: str = "", when: str = "") -> None:
-        rows = self.events(account_id)
-        match = next((row for row in rows if row.get("id") == event_id), None)
-        if match is None:
-            raise RuntimeError("event not found")
-        self.add(account_id, title or match.get("title") or "event", when or match.get("when") or "")
 
     def delete(self, account_id: str, event_id: str) -> None:
         creds = self._credentials(account_id)

@@ -42,13 +42,9 @@ SYSTEM = (
     "Never invent, shorten, change the type of, or reuse references from another conversation. "
     "A blocked reference is not an executed action: obtain a valid reference or ask the person. "
     "[UNRESOLVED] means text was withheld; do not guess its contents. "
-    "Use browser_find or scoped browser_read to discover omitted search/filter/sort controls before scrolling blindly. "
-    "Reach the site's actual search/results page, not just its category landing page. "
-    "Set checkbox filters with browser_set_checked and verify range limits and selected sorting in the new snapshot. "
-    "No observable change is not progress. Try a different justified action after two unchanged attempts. "
-    "Empty, truncated or withheld Content does not mean zero search results. "
-    "Only claim no matches when the page explicitly says so after the requested filters are applied. "
     "Never invent passwords or national IDs. "
+    "Confirm before sending mail, paying, deleting, or using a password. "
+    "Shared household list adds do not need a fresh confirm each time. "
     "When the person corrects how you did something or states a lasting preference, call lesson_save "
     "with one imperative line and optional tags (tool names or website hosts). "
     "Follow Learned lessons over your defaults, and over skill steps when they conflict. "
@@ -57,38 +53,18 @@ SYSTEM = (
     "Connect Home Assistant or an MCP server in chat with home_connect / mcp_setup_start — "
     "for remote MCPs that use OAuth (for example Sentry), pass auth=oauth then mcp_setup_oauth or mcp_setup_test. "
     "Robin will ask for secrets through a secure form. "
-    "When the person names a website or URL (vg.no, finn.no, https://…), browser_open that host "
-    "and finish the task on the page — do not use web_search as a substitute for opening the site. "
-    "A site named without a domain (a store, brand, or service name, or its ORG reference) is still a site: "
-    "pass that name to browser_open and Robin finds its website. "
-    "The site the latest Person line names always wins: never switch to a site from earlier turns, "
-    "lessons, or skills, and if the open page is a different host, browser_open the named one first. "
+    "Household lists, jobs, and remembered facts in this prompt are already available — "
+    "do not wait to call a recall tool before using them. "
+    "For multi-step household questions (dinner from the calendar and the fridge list), "
+    "plan the steps and use list, calendar, and memory tools together. "
     "calendar_* tools are only this account's own calendar, not a third-party booking site. "
     "For reminders ('remind me …', 'an hour before …'), use jobs_add with at or in_minutes; "
     "notify_person only sends now. Never say a reminder is set unless jobs_add saved it. "
     "mail_* tools are only this account's mailbox. "
+    "When the person names a website or URL, browser_open that host "
+    "and finish the task on the page — do not use web_search as a substitute for opening the site. "
     "Do not say you lack access to a website or the web when browser tools are available — use browser_open. "
     "If web_search fails, browser_open the named site instead of giving up. "
-    "Prefer Interactive refs from the latest page snapshot when a name matches more than one control. "
-    "Never ask the person to reply with 1, 2, or 3, and never invent a numbered menu from memory. "
-    "Map their plain language to an Interactive control and browser_click that ref. Only ask when no control matches. "
-    "Open the website host first (for example https://example.com or the site placeholder alone). "
-    "Words like clinic or home visit are page choices — browser_click them after the site is open; never browser_open them as a URL. "
-    "When filling forms, prefer Interactive ref numbers. "
-    "For email, phone, name, or address, use browser_fill_profile when a saved profile exists — "
-    "never invent contact details and never type them with browser_type. "
-    "If a needed profile field is missing, ask the person or tell them to set it in the app. "
-    "If a submit button is disabled, finish required fields first. "
-    "Controls listed under Interactive are available now — browser_click their ref. "
-    "Never say a button is missing or not visible when it appears in Interactive. "
-    "(more below) only means Content text is truncated; do not scroll away from a form to find a button that is already listed. "
-    "For named actions such as Send bestilling, use browser_click on that ref; browser_submit is only for type=submit login forms. "
-    "If a browser tool fails, do not repeat the same target — browser_read or try a different Interactive ref. "
-    "If a page snapshot says bot/captcha wall or has empty Content behind an iframe, stop hopping sites — "
-    "tell the person automation was blocked and use web_search for a rough estimate or ask which site to try. "
-    "If conversation history already says a host blocked Robin's automated browser, do not browser_open that "
-    "same host again — say it is still blocked from this machine and offer web_search or another site. "
-    "When the Person line names a site with an ORG reference, pass that exact reference to browser_open — do not invent another host. "
     "The latest Person line is the current task. If it continues an open task "
     "(continue, same for, the other), keep that task and its prior tools. "
     "Conversation history is context only — do not resume an earlier website, news, or "
@@ -334,7 +310,8 @@ def _converse(
         nudges: list[dict[str, Any]] = []
 
         browser_acted = False
-        for index, call in enumerate(calls):
+        # Read-only (and other non-confirm) calls in this batch finish before the first confirm.
+        for index, call in enumerate(_order_batch(assistant, task, calls)):
             if _superseded():
                 return Reply("reply", "That turn was replaced by a newer message.", decision.route)
             if call.name not in allowed:
@@ -587,6 +564,18 @@ def _last_assistant_index(messages: list[dict[str, Any]]) -> int:
     return len(messages)
 
 
+def _order_batch(assistant: Assistant, task: Task, calls: tuple[ToolCall, ...]) -> list[ToolCall]:
+    """Run calls that do not wait for confirm first so reads in the same batch still finish."""
+    ready: list[ToolCall] = []
+    later: list[ToolCall] = []
+    for call in calls:
+        if assistant.confirm_reason(task.account_id, task.conversation_id, call.name, call.arguments):
+            later.append(call)
+        else:
+            ready.append(call)
+    return ready + later
+
+
 def _split_batch(
     messages: list[dict[str, Any]], assistant_index: int, batch: tuple[ToolCall, ...]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -783,6 +772,18 @@ def _system(
     if statuses:
         lines.append("Connectors:")
         lines.extend(f"- {line}" for line in statuses)
+    briefs = assistant.registry.brief(account_id, text)
+    if briefs:
+        if vault is None:
+            vault = assistant.vaults.get(account_id, "guidance")
+        vocabulary = assistant.vocabulary_for(account_id)
+        released = [
+            _release(line, vault, vocabulary, assistant.ner_for(account_id), free_text=False) for line in briefs
+        ]
+        released = [line for line in released if line and line != "[UNRESOLVED]"]
+        if released:
+            lines.append("Household (already on this account; use these before guessing):")
+            lines.extend(released)
     guidance = assistant.registry.guidance(account_id, text)
     if guidance:
         # Lessons and chat share references for the same site.
@@ -1201,7 +1202,7 @@ _TRACE_RESULT_CHARS = 160
 _TRACE_ARG_CHARS = 200
 _WORK_FAMILIES = (
     ("transit", re.compile(r"\b(bus|buss|train|tog|tram|trikk|metro|ferry|transit|departure|avganger)\b", re.I)),
-    ("lists", re.compile(r"\b(list|lists|grocery|groceries|handleliste|todo)\b", re.I)),
+    ("lists", re.compile(r"\b(list|lists|grocery|groceries|handleliste|todo|fridge|kjøleskap)\b", re.I)),
     ("mail", re.compile(r"\b(mail|inbox|e-?post|mailbox|email)\b", re.I)),
     ("calendar", re.compile(r"\b(calendar|kalender|appointment)\b", re.I)),
     ("weather", re.compile(r"\b(weather|forecast|været)\b", re.I)),

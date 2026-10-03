@@ -47,6 +47,24 @@ class FakeImaplib:
         label = number if isinstance(number, bytes) else str(number).encode()
         return "OK", [(b"%b (BODY[] {%d}" % (label, len(raw)), raw), b")"]
 
+    def uid(self, command, *args):
+        command = command.upper()
+        self.calls.append(("uid", command, *args))
+        if command == "SEARCH":
+            ids = b" ".join(str(1001 + index).encode() for index in range(len(self.messages)))
+            return "OK", [ids]
+        if command == "FETCH":
+            uid = args[0]
+            if isinstance(uid, bytes):
+                uid = uid.decode()
+            index = int(uid) - 1001
+            raw = self.messages[index]
+            label = str(uid).encode()
+            return "OK", [(b"%b (UID %b BODY[] {%d}" % (label, label, len(raw)), raw), b")"]
+        if command in {"STORE", "COPY"}:
+            return "OK", []
+        raise RuntimeError(command)
+
     def logout(self) -> tuple[str, list]:
         self.calls.append(("logout",))
         return "OK", []
@@ -58,8 +76,8 @@ class Directory:
         self.sent: list[EmailMessage] = []
         self.opened_smtp: list[str] = []
         self.boxes = {
-            "ada@example.com": [_letter("Jane Doe", f"hello from ada {SECRET}")],
-            "bea@example.com": [_letter("Sam", "bea-only-note")],
+            "ada@example.com": [("5001", _letter("Jane Doe", f"hello from ada {SECRET}"))],
+            "bea@example.com": [("5002", _letter("Sam", "bea-only-note"))],
         }
 
     def open_imap(self, host: str):
@@ -81,7 +99,29 @@ class _Client:
         self.user = user
 
     def fetch_recent(self, limit: int) -> list[bytes]:
-        return self.directory.boxes.get(self.user, [])[-limit:]
+        return [raw for _uid, raw in self._items()[-limit:]]
+
+    def search(self, criteria: str, limit: int) -> list[tuple[str, bytes]]:
+        return self._items()[-limit:]
+
+    def fetch_one(self, uid: str) -> bytes | None:
+        for item_uid, raw in self._items():
+            if item_uid == uid:
+                return raw
+        return None
+
+    def store_flags(self, uid: str, action: str) -> None:
+        self.directory.logins.append((self.host, f"flag:{uid}", action))
+
+    def _items(self) -> list[tuple[str, bytes]]:
+        rows = self.directory.boxes.get(self.user, [])
+        found: list[tuple[str, bytes]] = []
+        for index, item in enumerate(rows, start=1):
+            if isinstance(item, tuple):
+                found.append((str(item[0]), item[1]))
+            else:
+                found.append((str(5000 + index), item))
+        return found
 
     def logout(self) -> None:
         return None
@@ -116,9 +156,11 @@ class ExplodingLogin:
         return None
 
 
-def _letter(sender: str, body: str) -> bytes:
+def _letter(sender: str, body: str, message_id: str = "") -> bytes:
     message = EmailMessage()
     message["From"] = sender
+    if message_id:
+        message["Message-ID"] = f"<{message_id}>"
     message.set_content(body)
     return message.as_bytes()
 
@@ -157,6 +199,12 @@ def test_plain_part_is_the_body_and_a_missing_secret_does_not_connect() -> None:
         def fetch_recent(self, limit: int) -> list[bytes]:
             return [message.as_bytes()]
 
+        def search(self, criteria: str, limit: int) -> list[tuple[str, bytes]]:
+            return [("9001", message.as_bytes())]
+
+        def fetch_one(self, uid: str) -> bytes | None:
+            return message.as_bytes() if uid == "9001" else None
+
         def logout(self) -> None:
             return None
 
@@ -168,7 +216,7 @@ def test_plain_part_is_the_body_and_a_missing_secret_does_not_connect() -> None:
     assert seen == []
     broker.put("ada", "mailbox", mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD))
     rows = mailbox.messages("ada")
-    assert rows == [{"id": "1", "sender": "Jane Doe", "subject": "", "body": "plain note"}]
+    assert rows == [{"id": "9001", "sender": "Jane Doe", "subject": "", "body": "plain note"}]
     assert "<p>" not in rows[0]["body"]
 
 
@@ -235,7 +283,7 @@ def test_imaplib_client_reads_the_newest_message_without_marking_it_seen() -> No
     assert b"newer" in raw[0]
     assert b"older" not in raw[0]
     assert ("select", "INBOX", True) in fake.calls
-    assert ("fetch", "(BODY.PEEK[])") in fake.calls
+    assert any(call[0] == "uid" and call[1] == "FETCH" for call in fake.calls)
     assert PASSWORD not in str(fake.calls)
 
 
@@ -297,6 +345,78 @@ def test_mail_list_tool_fetches_the_inbox() -> None:
     reply = converse(assistant, Task("ada", "home", "what mail do I have"), Scripted())
     assert "Jane" in reply.text or "mail" in reply.text.lower()
     assert directory.logins
+
+
+def test_mail_read_reply_and_archive_use_stable_uids() -> None:
+    broker = Broker()
+    broker.put(
+        "ada",
+        "mailbox",
+        mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD),
+    )
+    older = _letter("Old Sender", "keep this body", message_id="stable-old@test")
+    newer = _letter("New Sender", "brand new", message_id="stable-new@test")
+    extra = _letter("Latest", "arrived later", message_id="stable-latest@test")
+
+    class UidBox:
+        def __init__(self) -> None:
+            self.messages = [("10042", older), ("10099", newer)]
+            self.sent: list[EmailMessage] = []
+            self.flags: list[tuple[str, str]] = []
+
+        def open_imap(self, host: str):
+            return self
+
+        def open_smtp(self, host: str):
+            return self
+
+        def login(self, user: str, password: str) -> None:
+            return None
+
+        def search(self, criteria: str, limit: int) -> list[tuple[str, bytes]]:
+            return self.messages[-limit:]
+
+        def fetch_one(self, uid: str) -> bytes | None:
+            for item_uid, raw in self.messages:
+                if item_uid == uid:
+                    return raw
+            return None
+
+        def store_flags(self, uid: str, action: str) -> None:
+            self.flags.append((uid, action))
+
+        def send_message(self, message: EmailMessage) -> None:
+            self.sent.append(message)
+
+        def close(self) -> None:
+            return None
+
+        def logout(self) -> None:
+            return None
+
+    box = UidBox()
+    mailbox = ImapMailbox(broker, open_imap=box.open_imap, open_smtp=box.open_smtp)
+    listed = mailbox.messages("ada")
+    assert [row["id"] for row in listed] == ["10042", "10099"]
+    assert listed[0]["sender"] == "Old Sender"
+    box.messages.append(("10110", extra))
+    window = mailbox.messages("ada")
+    assert [row["id"] for row in window] == ["10042", "10099", "10110"][-mailbox.limit :]
+    read = mailbox.read("ada", "10042")
+    assert read is not None
+    assert read["id"] == "10042"
+    assert "keep this body" in read["body"]
+    assert read["sender"] == "Old Sender"
+    mail = Mail(mailbox)
+    reply = mail.invoke("ada", "mail_reply", {"id": "10042", "body": "thanks"})
+    assert reply == "sent"
+    assert box.sent[0]["To"] == "Old Sender"
+    assert "Re:" in box.sent[0]["Subject"]
+    marked = mail.invoke("ada", "mail_mark", {"id": "10042", "action": "archive"})
+    assert marked == "marked archive"
+    assert box.flags == [("10042", "archive")]
+    latest = mailbox.read("ada", "10110")
+    assert latest is not None and "arrived later" in latest["body"]
 
 
 def test_an_icloud_address_uses_icloud_mail_servers() -> None:
