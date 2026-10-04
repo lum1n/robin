@@ -269,3 +269,81 @@ def test_agent_receives_explicit_reference_error_without_running_the_tool():
     reply = converse(assistant, Task("ada", "one", "Send that"), Model())
     assert echo.calls == []
     assert "valid recipient" in reply.text
+
+
+class PhraseNer(UnavailableNer):
+    def __init__(self, phrases: dict[str, str]) -> None:
+        self.phrases = {phrase.lower(): label for phrase, label in phrases.items()}
+
+    def available(self) -> bool:
+        return True
+
+    def detect(self, text: str) -> tuple[Entity, ...]:
+        found: list[Entity] = []
+        lower = text.lower()
+        for needle, label in sorted(self.phrases.items(), key=lambda item: -len(item[0])):
+            start = 0
+            while True:
+                index = lower.find(needle, start)
+                if index < 0:
+                    break
+                end = index + len(needle)
+                if not any(index < other.end and end > other.start for other in found):
+                    found.append(Entity(index, end, label))
+                start = end
+        return tuple(sorted(found, key=lambda entity: entity.start))
+
+
+class Lookup(Capability):
+    id = "lookup"
+    tools = [
+        Tool(
+            "lookup",
+            "Look up a name.",
+            {"type": "object", "properties": {"name": {"type": "string"}}},
+            Effect.READ,
+        )
+    ]
+    fields = []
+
+    def __init__(self) -> None:
+        self.seen: list[dict] = []
+
+    def invoke(self, account_id, tool_name, arguments):
+        self.seen.append(arguments)
+        return f"Reached {arguments['name']}. Contact Riley Quinn about the order."
+
+
+def test_every_tool_resolves_references_and_redacts_new_result_names():
+    shop = "Northwind"
+    contact = "Riley Quinn"
+    lookup = Lookup()
+    assistant = Assistant(ner=PhraseNer({shop: "ORG", contact: "PERSON"}))
+    assistant.add(lookup)
+
+    class Model:
+        def __init__(self) -> None:
+            self.step = 0
+            self.contact_ref = ""
+
+        def complete(self, *, messages, tools):
+            blob = json.dumps(messages)
+            assert shop not in blob
+            assert contact not in blob
+            self.step += 1
+            if self.step == 1:
+                spoken = str(messages[1]["content"])
+                org = next(match.group() for match in REFERENCE.finditer(spoken) if match.group().startswith("[ORG_"))
+                return ModelTurn("", (ToolCall("lookup", {"name": org}),))
+            if self.step == 2:
+                result = str(messages[-1]["content"])
+                self.contact_ref = next(
+                    match.group() for match in REFERENCE.finditer(result) if match.group().startswith("[PERSON_")
+                )
+                return ModelTurn("", (ToolCall("lookup", {"name": self.contact_ref}),))
+            return ModelTurn("Reached them.")
+
+    reply = converse(assistant, Task("ada", "one", f"Ask {shop} for the status"), Model())
+    assert lookup.seen[0] == {"name": shop}
+    assert lookup.seen[1] == {"name": contact}
+    assert shop.lower() in reply.text.lower() or "reached" in reply.text.lower()

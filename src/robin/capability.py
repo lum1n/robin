@@ -345,11 +345,41 @@ def render_result(
             ner=ner,
             for_cloud=for_cloud,
         )
+        body = json.dumps(rows, sort_keys=True)
         if result.text:
-            return f"{result.text}\n{json.dumps(rows, sort_keys=True)}", report
-        return json.dumps(rows, sort_keys=True), report
+            prefix, prefix_report = _release_text(
+                result.text, vault, vocabulary=vocabulary, ner=ner, for_cloud=for_cloud
+            )
+            return f"{prefix}\n{body}", report.merge(prefix_report)
+        return body, report
     text = result.text if isinstance(result, Result) else str(result)
-    return text, Report(entities=(), unresolved=False)
+    return _release_text(text, vault, vocabulary=vocabulary, ner=ner, for_cloud=for_cloud)
+
+
+def _release_text(
+    text: str,
+    vault: Vault,
+    *,
+    vocabulary: tuple[VocabularyTerm, ...],
+    ner: Ner | None,
+    for_cloud: bool,
+    free_text: bool = True,
+) -> tuple[str, Report]:
+    if not text:
+        return "", Report(entities=(), unresolved=False)
+    detector = ner or UnavailableNer()
+    extra = detector.detect(text) if detector.available() else ()
+    redacted, report = redact(
+        text,
+        vault,
+        vocabulary=vocabulary,
+        free_text=free_text,
+        ner_available=detector.available(),
+        extra=extra,
+    )
+    if for_cloud:
+        return redacted, report
+    return vault.restore(redacted), report
 
 
 def render_context(
