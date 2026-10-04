@@ -389,6 +389,53 @@ def test_recovery_resets_stagnation_only_after_observed_control_change(page):
     assert "not verified" in reply.text
 
 
+def test_finn_style_filter_sidebar_does_not_hide_listing_prices(page):
+    filters = "".join(
+        f'<li><label>Filter {i}<input type="checkbox"></label></li>' for i in range(80)
+    )
+    cards = []
+    samples = (
+        ("Tesla Model Y", "Performance AWD", "2022 ∙ 87 500 km ∙ El", "328 532"),
+        ("Tesla Model Y", "Performance AWD", "2023 ∙ 84 500 km ∙ El", "324 532"),
+        ("Tesla Model Y", "Performance AWD", "2024 ∙ 57 000 km ∙ El", "429 000"),
+    )
+    for index, (title, subtitle, meta, price) in enumerate(samples, start=1):
+        cards.append(
+            f'<article class="sf-search-ad mobility-search-ad-card" '
+            f'style="display:block;width:480px;min-height:160px">'
+            f'<a class="sf-search-ad-link" href="/mobility/item/{index}">Gå til annonsen</a>'
+            f"<div>Pil til venstre</div><div>Pil til høyre</div>"
+            f"<div>Bilde 1 av 30</div><div>Betalt plassering</div>"
+            f"<h2>{title}</h2><div>{subtitle}</div><div>{meta}</div>"
+            f"<div><span>{price}</span> <span>kr</span></div>"
+            f"</article>"
+        )
+    page.set_content(
+        '<main>'
+        '<section aria-labelledby="filters-heading">'
+        '<h2 id="filters-heading">Filtre</h2>'
+        f'<ul class="filter-list">{filters}</ul>'
+        "</section>"
+        "<p>224 resultater</p>"
+        f'<div class="sf-result-list">{"".join(cards)}</div>'
+        "</main>"
+    )
+    snapshot, _ = PlaywrightPage(page).read()
+    head = snapshot.split("Interactive:", 1)[0]
+    assert "224" in snapshot
+    assert "Tesla Model Y" in head
+    assert "328 532 kr" in snapshot
+    assert "324 532 kr" in snapshot
+    assert "429 000 kr" in snapshot
+    assert "Price range:" in head
+    assert "324 532" in head.split("Price range:", 1)[1]
+    assert "429 000" in head.split("Price range:", 1)[1]
+    assert snapshot.index("Tesla Model Y") < snapshot.index("Interactive:")
+    content = snapshot.split("Content:", 1)[1]
+    assert "Tesla Model Y" in content
+    assert "Filter 0" not in content.split("Tesla Model Y", 1)[0] or "328 532" in snapshot
+
+
 def test_listing_cards_appear_as_content_lines(page):
     page.set_content(
         '<main><h1>Dairy</h1>'

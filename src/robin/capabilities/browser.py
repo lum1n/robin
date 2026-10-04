@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from robin.capability import (
     ActiveTurn,
@@ -247,6 +247,7 @@ class PlaywrightPage:
                         "discovery_limited": bool(raw.get("discoveryLimited")),
                         "scroll": raw.get("scroll"),
                         "listings": list(raw.get("listings") or []),
+                        "result_count": str(raw.get("resultCount") or raw.get("result_count") or ""),
                         "dismissible_dialogs": list(
                             raw.get("dismissibleDialogs") or raw.get("dismissible_dialogs") or []
                         ),
@@ -264,6 +265,8 @@ class PlaywrightPage:
             "interactive": [],
             "content": content,
             "secrets": secrets,
+            "listings": [],
+            "result_count": "",
         }
 
     def _main_text(self) -> str:
@@ -1441,6 +1444,9 @@ class Browser(Capability):
                 "When the person names a site with an ORG reference (or similar), pass that entire reference as url — confirm restores the real host. "
                 "Do not invent a different hostname from memory (for example lot.com when they said Google). "
                 "Reach the site's actual search/results page, not just its category landing page. "
+                "Type only the product the person named into site search — do not invent a model year "
+                "or extra filters they did not ask for. "
+                "When the snapshot includes Listings or Price range, answer from those (prices and the range). "
                 "To click or type, use Interactive refs (for example target 1) or the visible name. "
                 "Use browser_find or scoped browser_read to discover omitted search/filter/sort controls before scrolling blindly. "
                 "Use browser_select for dropdowns, browser_scroll to reveal more, browser_press for Enter or Tab, "
@@ -1450,6 +1456,7 @@ class Browser(Capability):
                 "When Pages lists more than one entry, browser_switch focuses that popup by index. "
                 "If Content ends with (more below), scroll only to read more Content — Interactive refs are already listed and clickable. "
                 "Empty, truncated or withheld Content does not mean zero search results. "
+                "Listings and Price range are the ads on the page — report those prices; do not say you found nothing. "
                 "Only claim no matches when the page explicitly says so after the requested filters are applied. "
                 "If a page snapshot says bot/captcha wall, stop hopping sites — "
                 "tell the person automation was blocked and use web_search for a rough estimate or ask which site to try. "
@@ -1470,7 +1477,8 @@ class Browser(Capability):
             description=(
                 "Read the structured text snapshot of this account's page (URL, interactive refs, content). "
                 "Use a query or region to find omitted search/filter/sort controls before scrolling blindly. "
-                "Empty or truncated Content is not zero results. (more below) only means Content text is truncated; "
+                "Empty or truncated Content is not zero results. Listings and Price range are visible ads. "
+                "(more below) only means Content text is truncated; "
                 "do not scroll away from a form to find a button that is already listed under Interactive."
             ),
             parameters={"type": "object", "properties": {
@@ -1494,7 +1502,8 @@ class Browser(Capability):
             name="browser_set_checked",
             description=(
                 "Set a checkbox or switch to checked=true or false, without toggling an already correct state. "
-                "Use this for search filters and verify range limits and selected sorting in the new snapshot."
+                "Use this for search filters the person asked for. Do not add a year or extra filter they did not name. "
+                "Verify range limits and selected sorting in the new snapshot."
             ),
             parameters={"type": "object", "properties": {
                 "target": {"type": "string"}, "checked": {"type": "boolean"},
@@ -1523,6 +1532,7 @@ class Browser(Capability):
             name="browser_type",
             description=(
                 "Type into a textbox ref or labeled field that is not a password. "
+                "For site search, type the product the person named — do not add a year they did not say. "
                 "Prefer an Interactive ref number (for example 12). "
                 "For email, phone, name, or address, prefer browser_fill_profile when a saved profile exists — "
                 "never invent contact details and never type them here."
@@ -1875,6 +1885,7 @@ class Browser(Capability):
                         "for the person's choice, not browser_open."
                     )
                 return str(exc)
+            url = _marketplace_results_url(url, _active_text())
             try:
                 if self.desk is not None:
                     self.desk.open(account_id, url)
@@ -3545,20 +3556,98 @@ _SNAPSHOT_JS = """() => {
     const text = cleanLabel(node.innerText || node.textContent || "");
     pushContent(text, headingLevelOf(node));
   }
-  const listingSelector = "article, [role='article'], [role='listitem'], [role='row'], tr, li, a[href]";
-  const listingRoot = contentRoot;
+  const cleanLine = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+  const LISTING_CHROME = /^(pil til (venstre|høyre)|bilde \\d+ av \\d+|scale|sammenlign( biler)?|legg til som favoritt|gå til annonsen|betalt plassering|nyhet!?|annonse|kryss|previous|next|1 of \\d+|favorite|favoritt)$/i;
+  const isFilterChrome = (node) => {
+    try {
+      if (node.closest("nav, header, aside, [role='navigation'], [role='banner'], [role='complementary'], [aria-labelledby='filters-heading'], [class*='filter-list']")) {
+        return true;
+      }
+      const host = node.closest("ul, ol, [role='list']");
+      if (host && host.querySelector("input[type='checkbox'], input[type='radio']") && !host.querySelector("article, [class*='search-ad']")) {
+        return true;
+      }
+      return false;
+    } catch (err) {
+      return false;
+    }
+  };
+  const looksLikeListing = (node, text) => {
+    const cls = String(node.className || "");
+    if (/(sf-search-ad|search-ad|mobility-search-ad|result-item|ads__unit)/i.test(cls)) return true;
+    const tag = String(node.tagName || "").toLowerCase();
+    const role = roleOf(node);
+    if ((tag === "article" || role === "article" || role === "row") && String(text || "").length >= 8) return true;
+    if (/\\d[\\d\\s.,]*\\s*(kr|nok|€|\\$|£)/i.test(text)) return true;
+    if (/\\bkr\\b/i.test(text) && /\\d{2,}/.test(text)) return true;
+    if (/\\b20\\d\\d\\b/.test(text) && /\\bkm\\b/i.test(text)) return true;
+    return false;
+  };
+  const composeListing = (node) => {
+    const headingNode = node.querySelector("h1,h2,h3,h4,[class*='heading']");
+    const heading = cleanLine((headingNode && (headingNode.innerText || headingNode.textContent)) || "");
+    const lines = String(node.innerText || node.textContent || "")
+      .split("\\n")
+      .map(cleanLine)
+      .filter((line) => line && line.length < 200 && !LISTING_CHROME.test(line));
+    let price = "";
+    for (let i = 0; i < lines.length; i++) {
+      const direct = lines[i].match(/(\\d[\\d\\s.,]*)\\s*(kr|nok|€|\\$|£)/i);
+      if (direct) { price = direct[0]; break; }
+      if (/^(kr|nok|€|\\$|£)$/i.test(lines[i]) && i && /^\\d[\\d\\s.,]{2,}$/.test(lines[i - 1])) {
+        price = lines[i - 1] + " " + lines[i];
+        break;
+      }
+    }
+    const meta = lines.find((line) => /20\\d\\d/.test(line) && /km/i.test(line)) || "";
+    const subtitle = lines.find((line) => (
+      line !== heading && line !== price && line !== meta
+      && /performance|awd|long range|premium|pro|sport/i.test(line)
+    )) || "";
+    const parts = [];
+    const seenParts = new Set();
+    for (const part of [heading, price, meta, subtitle]) {
+      const key = part.toLowerCase();
+      if (!part || seenParts.has(key)) continue;
+      seenParts.add(key);
+      parts.push(part);
+    }
+    if (parts.length >= 2) return parts.join(" · ").slice(0, 220);
+    const useful = lines.filter((line) => !/sammenlign|favoritt|privat|skala|service/i.test(line));
+    return useful.slice(0, 6).join(" · ").slice(0, 220);
+  };
+  const listingVisible = (node) => {
+    if (visible(node)) return true;
+    const cls = String(node.className || "");
+    if (/(sf-search-ad|search-ad|mobility-search-ad)/i.test(cls)) {
+      return String(node.innerText || node.textContent || "").trim().length >= 12;
+    }
+    return false;
+  };
+  const listingSelector = "article, [role='article'], [role='listitem'], [role='row'], [class*='search-ad'], tr, li, a[href]";
+  const taggedResults = document.querySelector("[class*='sf-result-list'], [class*='result-list'], [class*='search-result']");
+  const listingRoot = (taggedResults && !isFilterChrome(taggedResults)) ? taggedResults : contentRoot;
+  let resultCount = "";
+  const countBlob = ((contentRoot || listingRoot || document.body).innerText || "");
+  const countMatch = countBlob.match(/(\\d[\\d\\s]*)\\s*(treff|resultater|results|matches|annonser)/i);
+  if (countMatch) resultCount = countMatch[0].replace(/\\s+/g, " ").trim();
+  if (resultCount) pushContent(resultCount, 0);
   if (listingRoot && listingRoot.querySelectorAll) {
     for (const node of listingRoot.querySelectorAll(listingSelector)) {
-      if (!visible(node) || !inViewport(node)) continue;
+      if (!listingVisible(node)) continue;
+      if (isFilterChrome(node)) continue;
       if (node.closest("nav, header, [role='navigation'], [role='banner']")) continue;
       const parentListing = node.parentElement && node.parentElement.closest
         ? node.parentElement.closest(listingSelector) : null;
       if (parentListing && parentListing !== listingRoot) continue;
-      const text = cleanLabel(node.innerText || node.textContent || "");
+      const rawText = String(node.innerText || node.textContent || "");
+      const text = composeListing(node);
       if (!text || text.length < 2) continue;
+      if (!looksLikeListing(node, text) && !looksLikeListing(node, rawText)) continue;
       const key = text.toLowerCase();
       if (listings.some(row => row.text.toLowerCase() === key)) continue;
-      if (discovery.query && text.toLowerCase().includes(discovery.query.toLowerCase())) {
+      if (discovery.query && (text.toLowerCase().includes(discovery.query.toLowerCase())
+          || rawText.toLowerCase().includes(discovery.query.toLowerCase()))) {
         const listingRole = roleOf(node) || (String(node.tagName || "").toLowerCase() === "a" ? "link" : "listitem");
         add(node, listingRole);
       }
@@ -3567,9 +3656,9 @@ _SNAPSHOT_JS = """() => {
         const near = node.querySelector("[data-robin-ref]") || node.closest("[data-robin-ref]");
         if (near) ref = near.getAttribute("data-robin-ref") || "";
       }
-      listings.push({text: text.slice(0, 200), ref, region: regionOf(node)});
+      listings.push({text, ref, region: regionOf(node)});
       pushContent(text, 0);
-      if (listings.length >= 40) {
+      if (listings.length >= 24) {
         moreBelow = true;
         break;
       }
@@ -3577,7 +3666,8 @@ _SNAPSHOT_JS = """() => {
   }
   if (!listings.length && contentRoot && contentRoot.innerText) {
     for (const raw of String(contentRoot.innerText).split("\\n")) {
-      const text = cleanLabel(raw);
+      const text = cleanLine(raw);
+      if (LISTING_CHROME.test(text)) continue;
       if (!pushContent(text, 0)) continue;
       if (contentLines.length >= 60) {
         moreBelow = true;
@@ -3625,9 +3715,124 @@ _SNAPSHOT_JS = """() => {
     moreBelow,
     secrets,
     listings,
+    resultCount,
     dismissibleDialogs,
   };
 }"""
+
+
+_PRICE_IN_TEXT = re.compile(
+    r"(?P<amount>\d(?:[\d\s.,]{0,12}\d)?)\s*(?P<currency>kr|nok|€|\$|£)",
+    re.IGNORECASE,
+)
+_LISTING_TASK = re.compile(
+    r"\b(find|search|look(?:ing)?\s+for|listings?|ads?|annonser|pris(?:er)?|price(?:s| range)?|bruktbil)\b",
+    re.IGNORECASE,
+)
+_CAR_TASK = re.compile(
+    r"\b(tesla|bmw|audi|volvo|toyota|mercedes|volkswagen|\bvw\b|ford|porsche|"
+    r"model [3sxy]|bil(?:er)?|cars?|hybrid|elbil|awd|performance|skoda|peugeot|hyundai)\b",
+    re.IGNORECASE,
+)
+_MARKETPLACE_HOME = re.compile(
+    r"^https?://(?:www\.)?(?P<host>finn\.no)/?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_listing_price(text: str) -> tuple[int, str] | None:
+    match = _PRICE_IN_TEXT.search(text or "")
+    if match is None:
+        return None
+    digits = re.sub(r"[^\d]", "", match.group("amount"))
+    if not digits:
+        return None
+    amount = int(digits)
+    if amount < 10:
+        return None
+    return amount, match.group("currency")
+
+
+def _format_amount(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ")
+
+
+def _price_range_line(listings: list[dict[str, Any]]) -> str:
+    parsed: list[tuple[int, str]] = []
+    for row in listings:
+        found = _parse_listing_price(str(row.get("text") or ""))
+        if found:
+            parsed.append(found)
+    if not parsed:
+        return ""
+    prices = [amount for amount, _currency in parsed]
+    currency = parsed[0][1]
+    if any(amount >= 50_000 for amount in prices) and any(amount < 20_000 for amount in prices):
+        prices = [amount for amount in prices if amount >= 20_000] or prices
+    low, high = min(prices), max(prices)
+    count = len(prices)
+    if low == high:
+        noun = "listing" if count == 1 else "listings"
+        return f"Price range: {_format_amount(low)} {currency} from {count} {noun}"
+    return (
+        f"Price range: {_format_amount(low)}–{_format_amount(high)} {currency} "
+        f"from {count} listings"
+    )
+
+
+def _listing_search_query(task: str) -> str:
+    """Product words the person named, without invented years or site chrome."""
+    text = str(task or "").strip()
+    if not text:
+        return ""
+    quoted = re.findall(r"[\"«»]([^\"«»]+)[\"«»]", text)
+    if quoted:
+        return re.sub(r"\s+", " ", quoted[0]).strip()[:80]
+    cut = re.split(
+        r"\b(?:listings?|ads?|annonser|prices?|price range|pris(?:er|område)?|"
+        r"so (?:i|they|we) can|on (?:the )?(?:site|page|web)|https?://|www\.)",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    cut = re.sub(
+        r"\b(?:find|search|look(?:ing)?\s+for|used|brukt|please|the|a|an|"
+        r"on|at|finn(?:\.no)?)\b",
+        " ",
+        cut,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"\s+", " ", cut).strip(" .,;:-")
+    tokens = query.split()
+    if len(tokens) >= 2:
+        return " ".join(tokens[:8])
+    return query[:80]
+
+
+def _marketplace_results_url(url: str, task: str) -> str:
+    """Open a marketplace homepage onto its results page for a product search."""
+    if not url or not task or not _LISTING_TASK.search(task):
+        return url
+    home = _MARKETPLACE_HOME.match(url.rstrip("/"))
+    if home is None:
+        return url
+    query = _listing_search_query(task)
+    if len(query.split()) < 2:
+        return url
+    if home.group("host").lower() == "finn.no" and _CAR_TASK.search(task):
+        return "https://www.finn.no/mobility/search/car?q=" + quote(query)
+    return url
+
+
+def _snapshot_listings(data: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in data.get("listings") or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            rows.append(item)
+    return rows
 
 
 def _format_snapshot(data: dict[str, Any]) -> str:
@@ -3639,6 +3844,9 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     interactive = windowed[:_MAX_INTERACTIVE]
     content, truncated = _content_lines(str(data.get("content") or ""))
     more_below = bool(data.get("more_below") or data.get("moreBelow") or truncated)
+    listings = _snapshot_listings(data)
+    result_count = str(data.get("result_count") or data.get("resultCount") or "").strip()
+    range_line = _price_range_line(listings)
     if len(content) > _MAX_CONTENT:
         kept: list[str] = []
         for line in content.splitlines():
@@ -3654,6 +3862,19 @@ def _format_snapshot(data: dict[str, Any]) -> str:
         lines.append(f"Scroll position: {data['scroll']}")
     if data.get("still_updating"):
         lines.append("Still updating")
+    if result_count:
+        lines.append(f"Results: {result_count}")
+    elif listings:
+        lines.append(f"Results: {len(listings)} listings")
+    if range_line:
+        lines.append(range_line)
+    if listings:
+        lines.append("Listings:")
+        for row in listings[:24]:
+            text = str(row.get("text") or "").strip()
+            ref = str(row.get("ref") or "").strip()
+            prefix = f"[{ref}] " if ref else ""
+            lines.append(f"- {prefix}{text}")
     dialogs = list(data.get("dismissible_dialogs") or data.get("dismissibleDialogs") or [])
     if dialogs:
         names = ", ".join(

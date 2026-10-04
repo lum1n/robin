@@ -398,6 +398,64 @@ def test_scroll_position_change_is_progress() -> None:
     assert page.scrolls == 3
 
 
+def test_give_up_is_nudged_when_snapshot_already_has_listing_prices() -> None:
+    from robin.capabilities.browser import Browser
+
+    snapshot = (
+        "URL: https://www.finn.no/mobility/search/car?q=Tesla\n"
+        "Results: 224 treff\n"
+        "Price range: 324 532–429 000 kr from 3 listings\n"
+        "Listings:\n"
+        "- Tesla Model Y · Performance AWD · 2022 · 328 532 kr\n"
+        "- Tesla Model Y · Performance AWD · 2023 · 324 532 kr\n"
+        "- Tesla Model Y · Performance · 2024 · 429 000 kr\n\n"
+        "Interactive:\n[1] checkbox \"Tesla\" (page)\n\n"
+        "Content:\nTesla Model Y · Performance AWD · 328 532 kr"
+    )
+
+    class Page:
+        def location(self) -> str:
+            return "https://www.finn.no/mobility/search/car?q=Tesla"
+
+        def read(self, *, query: str = "", cursor: int = 0, region: str = ""):
+            return snapshot, ""
+
+        def open(self, url: str) -> None:
+            return None
+
+    page = Page()
+    browser = Browser("ada", page)
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (ToolCall("browser_read", {}),)),
+        ModelTurn(
+            "I couldn’t find specific listings for a 2022 Tesla Model Y Performance on the site. "
+            "However, it might help to look at similar models or websites to gauge the price."
+        ),
+        ModelTurn(
+            "Listings are on the page. Prices run from 324 532 kr to 429 000 kr "
+            "(examples: 328 532 kr, 324 532 kr, 429 000 kr)."
+        ),
+    ])
+    reply = converse(
+        assistant,
+        Task("ada", "t", "Find Tesla Model Y Performance listings on finn.no and a price range"),
+        model,
+        max_steps=6,
+    )
+    assert "324 532" in reply.text and "429 000" in reply.text
+    assert "couldn’t find" not in reply.text.lower() and "couldn't find" not in reply.text.lower()
+    nudge = "\n".join(
+        str(message.get("content") or "")
+        for messages, _ in model.seen
+        for message in messages
+        if message.get("role") == "user"
+    )
+    assert "already lists matching ads with prices" in nudge
+    assert "2022" not in nudge or "did not ask" in nudge
+
+
 def test_blocked_repeat_returns_listing_text_instead_of_ending() -> None:
     from robin.capabilities.browser import Browser
 

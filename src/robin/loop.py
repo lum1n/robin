@@ -270,6 +270,7 @@ def _converse(
 
     repeats: dict[str, int] = {}
     steps_used = 0
+    listing_nudge = False
     assistant_index = _last_assistant_index(messages) if queued else -1
     for _ in range(max_steps):
         steps_used += 1
@@ -302,6 +303,27 @@ def _converse(
                                 f"{_family_labels(remaining)}. Keep using tools. "
                                 "Do not give a final answer until those are done, you need the person, "
                                 "or you explicitly finish."
+                            ),
+                        }
+                    )
+                    _trim_messages(messages)
+                    continue
+                if (
+                    not listing_nudge
+                    and _gave_up_on_listings(turn.message)
+                    and _snapshot_has_listing_prices(_last_tool_text(messages))
+                    and not _needs_person(turn.message)
+                    and not _explicit_finish(turn.message)
+                ):
+                    listing_nudge = True
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The latest page snapshot already lists matching ads with prices. "
+                                "Report those listing prices and the observed price range. "
+                                "Do not claim there are no matches, and do not add a year or filter "
+                                "the person did not ask for."
                             ),
                         }
                     )
@@ -1465,6 +1487,36 @@ def _menu_spam(body: str) -> bool:
 def _is_overlay_miss(result: str) -> bool:
     lower = (result or "").lower()
     return "intercepts pointer" in lower or ("covered by" in lower and "overlay" in lower)
+
+
+_GAVE_UP_MATCHES = re.compile(
+    r"couldn(?:'|’)t find|could not find|cannot find|can(?:'|’)t find|"
+    r"no (?:specific )?listings|no matches|no results|"
+    r"might help to look at similar",
+    re.IGNORECASE,
+)
+
+
+def _gave_up_on_listings(message: str) -> bool:
+    return bool(_GAVE_UP_MATCHES.search(message or ""))
+
+
+def _snapshot_has_listing_prices(text: str) -> bool:
+    blob = text or ""
+    if re.search(r"^Price range:", blob, re.MULTILINE):
+        return True
+    if re.search(r"^Listings:", blob, re.MULTILINE) and re.search(
+        r"\b\d[\d\s.]*\s*kr\b", blob, re.IGNORECASE
+    ):
+        return True
+    return bool(re.search(r"^\s*-\s+.+\b\d[\d\s.]*\s*kr\b", blob, re.MULTILINE | re.IGNORECASE))
+
+
+def _last_tool_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "tool":
+            return str(message.get("content") or "")
+    return ""
 
 
 def _recover_listing_text(assistant: Assistant, task: Task, call: ToolCall, lead: str) -> dict[str, str]:
