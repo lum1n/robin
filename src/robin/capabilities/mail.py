@@ -5,17 +5,57 @@ from __future__ import annotations
 import hashlib
 import imaplib
 import json
+import re
 import smtplib
 from email import message_from_bytes
 from email.message import EmailMessage
 from email.policy import default
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Protocol
 
 from robin.capability import Capability, Effect, FieldClass, FieldSpec, Result, Tool
 
 INBOX_LIMIT = 10
+SEARCH_LIMIT = 50
 _SECRET = ("imap_host", "smtp_host", "user", "password")
+_SEARCH_STOP = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "my",
+        "your",
+        "our",
+        "me",
+        "us",
+        "please",
+        "get",
+        "find",
+        "show",
+        "fetch",
+        "read",
+        "mail",
+        "email",
+        "message",
+        "inbox",
+        "letter",
+        "from",
+        "about",
+        "for",
+        "to",
+        "of",
+        "on",
+        "in",
+        "min",
+        "mitt",
+        "din",
+        "ditt",
+        "fra",
+        "om",
+        "epost",
+        "post",
+    }
+)
 _HOSTS = {
     "icloud.com": ("imap.mail.me.com", "smtp.mail.me.com"),
     "me.com": ("imap.mail.me.com", "smtp.mail.me.com"),
@@ -126,11 +166,13 @@ class ImapMailbox:
         open_imap: Any = None,
         open_smtp: Any = None,
         limit: int = INBOX_LIMIT,
+        search_limit: int = SEARCH_LIMIT,
     ) -> None:
         self.secrets = secrets
         self._open_imap = open_imap or (lambda host: ImaplibClient(host))
         self._open_smtp = open_smtp or (lambda host: SmtplibClient(host))
         self.limit = limit
+        self.search_limit = search_limit
         self._drafts: dict[str, dict[str, str]] = {}
 
     def connected(self, account_id: str) -> bool:
@@ -152,19 +194,29 @@ class ImapMailbox:
         creds = self._credentials(account_id)
         if creds is None:
             return []
+        filtered = bool(query or sender or since or unread)
+        fetch_limit = self.search_limit if filtered else self.limit
         criteria = _imap_criteria(query=query, sender=sender, since=since, unread=unread)
         client: _Imap = self._open_imap(creds["imap_host"])
+        matched: list[dict[str, str]] = []
         try:
             _login(client, creds)
-            if hasattr(client, "search"):
-                raw_messages = client.search(criteria, self.limit)
-            else:
-                raw_messages = client.fetch_recent(self.limit)
-            rows = [_row_from_found(item, index) for index, item in enumerate(raw_messages, start=1)]
+            rows = self._rows(client, criteria, fetch_limit)
+            matched = [row for row in rows if _message_matches(row, query=query, sender=sender)]
+            if not matched and filtered and criteria != "ALL":
+                rows = self._rows(client, "ALL", fetch_limit)
+                matched = [row for row in rows if _message_matches(row, query=query, sender=sender)]
         finally:
             client.logout()
         _ = folder
-        return rows
+        return matched
+
+    def _rows(self, client: _Imap, criteria: str, limit: int) -> list[dict[str, str]]:
+        if hasattr(client, "search"):
+            raw_messages = client.search(criteria, limit)
+        else:
+            raw_messages = client.fetch_recent(limit)
+        return [_row_from_found(item, index) for index, item in enumerate(raw_messages, start=1)]
 
     def read(self, account_id: str, message_id: str) -> dict[str, str] | None:
         creds = self._credentials(account_id)
@@ -255,7 +307,11 @@ class Mail(Capability):
         ),
         Tool(
             name="mail_search",
-            description="Search this account's mailbox. Optional filters: query, from, since (YYYY-MM-DD), unread, folder.",
+            description=(
+                "Search this account's mailbox. from matches a sender name or address; "
+                "query matches words in the subject or a short preview, not only an exact subject. "
+                "Copy conversation references verbatim. Optional: since (YYYY-MM-DD), unread, folder."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -337,6 +393,7 @@ class Mail(Capability):
         FieldSpec("id", FieldClass.ORDINARY),
         FieldSpec("sender", FieldClass.TOKENIZE, label="PERSON"),
         FieldSpec("subject", FieldClass.ORDINARY, free_text=True),
+        FieldSpec("date", FieldClass.ORDINARY),
         FieldSpec("body", FieldClass.ORDINARY, free_text=True),
     ]
 
@@ -440,17 +497,58 @@ def _imap_criteria(*, query: str, sender: str, since: str, unread: bool) -> str:
     parts: list[str] = []
     if unread:
         parts.append("UNSEEN")
-    if sender:
-        parts.append(f'FROM "{sender}"')
     if since:
-        parts.append(f'SINCE "{since}"')
-    if query:
-        parts.append(f'TEXT "{query}"')
+        parts.append(f"SINCE {_imap_quote(since)}")
+    needles: list[str] = []
+    if sender.strip():
+        needles.append(f"FROM {_imap_quote(sender.strip())}")
+        for token in _search_needles(sender):
+            needles.append(f"SUBJECT {_imap_quote(token)}")
+            needles.append(f"TEXT {_imap_quote(token)}")
+    for token in _search_needles(query):
+        needles.append(f"SUBJECT {_imap_quote(token)}")
+        needles.append(f"TEXT {_imap_quote(token)}")
+    if needles:
+        parts.append(_imap_or(needles))
     if not parts:
         return "ALL"
     if len(parts) == 1:
         return parts[0]
     return "(" + " ".join(parts) + ")"
+
+
+def _imap_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _imap_or(parts: list[str]) -> str:
+    if not parts:
+        return "ALL"
+    expr = parts[0]
+    for part in parts[1:]:
+        expr = f"OR {expr} {part}"
+    return expr
+
+
+def _search_needles(text: str) -> list[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    tokens = [word for word in re.findall(r"[a-z0-9]+", cleaned.lower()) if word not in _SEARCH_STOP and len(word) > 1]
+    return tokens or [cleaned.lower()]
+
+
+def _message_matches(row: dict[str, str], *, query: str, sender: str) -> bool:
+    haystack = " ".join(
+        (row.get("sender") or "", row.get("subject") or "", (row.get("body") or "")[:500])
+    ).lower()
+    for needle in _search_needles(sender):
+        if needle not in haystack:
+            return False
+    for needle in _search_needles(query):
+        if needle not in haystack:
+            return False
+    return True
 
 
 def _login(client: Any, creds: dict[str, str]) -> None:
@@ -516,8 +614,19 @@ def _message(raw: bytes, message_id: str | int = 1) -> dict[str, str]:
         "id": str(message_id),
         "sender": name or address,
         "subject": subject,
+        "date": _date(parsed),
         "body": _text(parsed),
     }
+
+
+def _date(parsed: EmailMessage) -> str:
+    raw = str(parsed.get("date") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return parsedate_to_datetime(raw).date().isoformat()
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return raw
 
 
 def _text(parsed: EmailMessage) -> str:

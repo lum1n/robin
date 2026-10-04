@@ -1,11 +1,14 @@
 import json
 from email.message import EmailMessage
 
+from robin.airlock import Entity
 from robin.capabilities.mail import ImapMailbox, ImaplibClient, Mail, SmtplibClient, mailbox_secret
 from robin.loop import converse
-from robin.model import ModelTurn
+from robin.model import ModelTurn, ToolCall
+from robin.ner import UnavailableNer
 from robin.policy import Task
 from robin.session import Assistant
+from robin.vault import REFERENCE
 
 PASSWORD = "sk-mailboxsecretvalue1234567890"
 SECRET = "sk-abcdefghijklmnopqrstuvwxyz123456"
@@ -156,9 +159,13 @@ class ExplodingLogin:
         return None
 
 
-def _letter(sender: str, body: str, message_id: str = "") -> bytes:
+def _letter(sender: str, body: str, message_id: str = "", subject: str = "", date: str = "") -> bytes:
     message = EmailMessage()
     message["From"] = sender
+    if subject:
+        message["Subject"] = subject
+    if date:
+        message["Date"] = date
     if message_id:
         message["Message-ID"] = f"<{message_id}>"
     message.set_content(body)
@@ -216,7 +223,7 @@ def test_plain_part_is_the_body_and_a_missing_secret_does_not_connect() -> None:
     assert seen == []
     broker.put("ada", "mailbox", mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD))
     rows = mailbox.messages("ada")
-    assert rows == [{"id": "9001", "sender": "Jane Doe", "subject": "", "body": "plain note"}]
+    assert rows == [{"id": "9001", "sender": "Jane Doe", "subject": "", "date": "", "body": "plain note"}]
     assert "<p>" not in rows[0]["body"]
 
 
@@ -428,3 +435,212 @@ def test_an_icloud_address_uses_icloud_mail_servers() -> None:
     result = mail.invoke("ada", "mail_list", {})
     text = result if isinstance(result, str) else str(result)
     assert directory.logins and directory.logins[0][0].endswith("mail.me.com") or "icloud" in text.lower() or "Apple" in text
+
+
+SHOP = "Northwind"
+CONTACT = "Riley Quinn"
+ORDER_SUBJECT = "Your order 4412"
+ORDER_BODY = "Thanks for your order. Riley Quinn will deliver it. Keep the receipt."
+
+
+class PhraseNer(UnavailableNer):
+    """Tags listed phrases so tests can stand in for a warm ORG/PERSON detector."""
+
+    def __init__(self, phrases: dict[str, str]) -> None:
+        self.phrases = {phrase.lower(): (phrase, label) for phrase, label in phrases.items()}
+
+    def available(self) -> bool:
+        return True
+
+    def detect(self, text: str) -> tuple[Entity, ...]:
+        found: list[Entity] = []
+        lower = text.lower()
+        for needle, (_original, label) in sorted(self.phrases.items(), key=lambda item: -len(item[0])):
+            start = 0
+            while True:
+                index = lower.find(needle, start)
+                if index < 0:
+                    break
+                end = index + len(needle)
+                if not any(index < other.end and end > other.start for other in found):
+                    found.append(Entity(index, end, label))
+                start = end
+        return tuple(sorted(found, key=lambda entity: entity.start))
+
+
+class RecordingBox:
+    def __init__(self, items: list[tuple[str, bytes]]) -> None:
+        self.items = items
+        self.criteria: list[str] = []
+        self.sent: list[EmailMessage] = []
+
+    def open_imap(self, host: str):
+        return self
+
+    def open_smtp(self, host: str):
+        return self
+
+    def login(self, user: str, password: str) -> None:
+        return None
+
+    def search(self, criteria: str, limit: int) -> list[tuple[str, bytes]]:
+        self.criteria.append(criteria)
+        return self.items[-limit:]
+
+    def fetch_one(self, uid: str) -> bytes | None:
+        for item_uid, raw in self.items:
+            if item_uid == uid:
+                return raw
+        return None
+
+    def send_message(self, message: EmailMessage) -> None:
+        self.sent.append(message)
+
+    def close(self) -> None:
+        return None
+
+    def logout(self) -> None:
+        return None
+
+
+def _shop_mailbox() -> tuple[Broker, RecordingBox, ImapMailbox]:
+    broker = Broker()
+    broker.put(
+        "ada",
+        "mailbox",
+        mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD),
+    )
+    order = _letter(
+        f"{SHOP} <orders@northwind.test>",
+        ORDER_BODY,
+        message_id="order@northwind.test",
+        subject=ORDER_SUBJECT,
+        date="Fri, 03 Oct 2026 09:15:00 +0000",
+    )
+    decoy = _letter("Sam Lee <sam@example.com>", "Weekend plans", message_id="decoy@example.com", subject="Saturday")
+    box = RecordingBox([("7001", decoy), ("7002", order)])
+    mailbox = ImapMailbox(broker, open_imap=box.open_imap, open_smtp=box.open_smtp)
+    return broker, box, mailbox
+
+
+def test_mail_search_matches_sender_name_and_topic_words() -> None:
+    _broker, box, mailbox = _shop_mailbox()
+    by_sender = mailbox.search("ada", sender=SHOP)
+    assert [row["id"] for row in by_sender] == ["7002"]
+    assert by_sender[0]["sender"] == SHOP
+    assert by_sender[0]["subject"] == ORDER_SUBJECT
+    assert by_sender[0]["date"] == "2026-10-03"
+    assert "order" in by_sender[0]["body"].lower()
+    assert SHOP in box.criteria[0]
+    assert "[ORG_" not in box.criteria[0]
+
+    box.criteria.clear()
+    by_order = mailbox.search("ada", query="order")
+    assert [row["id"] for row in by_order] == ["7002"]
+    assert "order" in box.criteria[0].lower()
+
+    box.criteria.clear()
+    by_receipt = mailbox.search("ada", query="the receipt")
+    assert [row["id"] for row in by_receipt] == ["7002"]
+
+    missed = mailbox.search("ada", sender="[ORG_deadbeefdeadbeefdeadbeefdeadbeef_1]")
+    assert missed == []
+
+
+def test_mail_search_broadens_when_the_first_criteria_miss() -> None:
+    broker = Broker()
+    broker.put(
+        "ada",
+        "mailbox",
+        mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD),
+    )
+    order = _letter(f"{SHOP} <orders@northwind.test>", ORDER_BODY, subject=ORDER_SUBJECT)
+
+    class StrictThenAll:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def login(self, user: str, password: str) -> None:
+            return None
+
+        def search(self, criteria: str, limit: int) -> list[tuple[str, bytes]]:
+            self.calls.append(criteria)
+            if criteria == "ALL":
+                return [("8001", order)]
+            return []
+
+        def logout(self) -> None:
+            return None
+
+    client = StrictThenAll()
+    mailbox = ImapMailbox(broker, open_imap=lambda host: client, open_smtp=lambda host: None)
+    found = mailbox.search("ada", sender=SHOP)
+    assert client.calls[0] != "ALL"
+    assert "ALL" in client.calls
+    assert found and found[0]["sender"] == SHOP
+
+
+def test_mail_search_resolves_references_and_redacts_results_for_the_model() -> None:
+    _broker, box, mailbox = _shop_mailbox()
+    assistant = Assistant(ner=PhraseNer({SHOP: "ORG", CONTACT: "PERSON"}))
+    assistant.broker.put(
+        "ada",
+        "mailbox",
+        mailbox_secret(imap_host="imap.example", smtp_host="smtp.example", user="ada@example.com", password=PASSWORD),
+    )
+    assistant.add(Mail(mailbox))
+
+    class Model:
+        def __init__(self) -> None:
+            self.step = 0
+            self.person_ref = ""
+
+        def complete(self, *, messages, tools):
+            blob = json.dumps(messages)
+            assert SHOP not in blob
+            assert CONTACT not in blob
+            self.step += 1
+            if self.step == 1:
+                spoken = str(messages[1]["content"])
+                org = next(match.group() for match in REFERENCE.finditer(spoken) if match.group().startswith("[ORG_"))
+                return ModelTurn("", (ToolCall("mail_search", {"from": org}),))
+            if self.step == 2:
+                result = str(messages[-1]["content"])
+                assert ORDER_SUBJECT.split()[-1] in result or "order" in result.lower()
+                self.person_ref = next(
+                    match.group() for match in REFERENCE.finditer(result) if match.group().startswith("[PERSON_")
+                )
+                return ModelTurn("", (ToolCall("mail_search", {"query": self.person_ref}),))
+            return ModelTurn("Here is the order email.")
+
+    model = Model()
+    reply = converse(assistant, Task("ada", "mail", f"Get the {SHOP} email about my order"), model)
+    assert SHOP.lower() in reply.text.lower() or "order" in reply.text.lower()
+    assert box.criteria
+    assert SHOP in box.criteria[0]
+    assert "[ORG_" not in "".join(box.criteria)
+    assert "riley" in "".join(box.criteria).lower()
+    assert model.person_ref
+    assert CONTACT not in model.person_ref
+
+
+def test_mail_search_by_topic_redacts_a_sender_that_only_appears_in_the_result() -> None:
+    _broker, box, mailbox = _shop_mailbox()
+    assistant = Assistant(ner=PhraseNer({SHOP: "ORG", CONTACT: "PERSON"}))
+    assistant.add(Mail(mailbox))
+
+    class Model:
+        def complete(self, *, messages, tools):
+            blob = json.dumps(messages)
+            assert SHOP not in blob
+            assert CONTACT not in blob
+            if messages[-1]["role"] != "tool":
+                return ModelTurn("", (ToolCall("mail_search", {"query": "order"}),))
+            result = str(messages[-1]["content"])
+            assert "4412" in result or "order" in result.lower()
+            assert any(match.group().startswith("[ORG_") for match in REFERENCE.finditer(result))
+            return ModelTurn("I found the order.")
+
+    reply = converse(assistant, Task("ada", "mail", "find my order"), Model())
+    assert "order" in reply.text.lower()
+    assert any("order" in criteria.lower() for criteria in box.criteria)

@@ -488,6 +488,7 @@ class Assistant:
         capability, tool = self.registry.resolve(account_id, tool_name)
         vault = self.vaults.get(account_id, conversation_id)
         vocabulary = self.vocabulary_for(account_id)
+        ner = self.ner_for(account_id)
         try:
             raw = _restore_arg(arguments, vault)
         except ReferenceError as exc:
@@ -500,7 +501,7 @@ class Assistant:
             return {"status": "confirm", "tool": tool_name, "reason": "egress"}
         logged_input = {
             redact(key, vault, vocabulary=vocabulary)[0]: (
-                "" if key in tool.drop_arguments else _redact_value(value, vault, vocabulary)
+                "" if key in tool.drop_arguments else _redact_value(value, vault, vocabulary, ner)
             )
             for key, value in raw.items()
         }
@@ -525,7 +526,7 @@ class Assistant:
             capability.fields,
             vault,
             vocabulary=vocabulary,
-            ner=self.ner_for(account_id),
+            ner=ner,
             for_cloud=True,
         )
         # Scan decoded JSON values before escaping can hide a mapped string.
@@ -534,8 +535,15 @@ class Assistant:
         except json.JSONDecodeError:
             structured = None
         if isinstance(structured, (dict, list)):
-            rendered = json.dumps(_redact_value(structured, vault, vocabulary), sort_keys=True)
-        text, _ = redact(rendered, vault, vocabulary=vocabulary)
+            rendered = json.dumps(_redact_value(structured, vault, vocabulary, ner), sort_keys=True)
+        extra = ner.detect(rendered) if ner.available() else ()
+        text, _ = redact(
+            rendered,
+            vault,
+            vocabulary=vocabulary,
+            extra=extra,
+            ner_available=ner.available(),
+        )
         if self.store is not None:
             self.store.save_vault(vault)
         if for_model or tool.effect is Effect.EXTERNAL:
@@ -627,14 +635,26 @@ def _restore_arg(value: Any, vault: Vault) -> Any:
     return vault.restore(str(value), strict=True)
 
 
-def _redact_value(value: Any, vault: Vault, vocabulary: tuple[VocabularyTerm, ...]) -> Any:
+def _redact_value(
+    value: Any,
+    vault: Vault,
+    vocabulary: tuple[VocabularyTerm, ...],
+    ner: Ner | None = None,
+) -> Any:
     if isinstance(value, str):
-        return redact(value, vault, vocabulary=vocabulary)[0]
+        extra = ner.detect(value) if ner is not None and ner.available() else ()
+        return redact(
+            value,
+            vault,
+            vocabulary=vocabulary,
+            extra=extra,
+            ner_available=ner.available() if ner is not None else False,
+        )[0]
     if isinstance(value, list):
-        return [_redact_value(item, vault, vocabulary) for item in value]
+        return [_redact_value(item, vault, vocabulary, ner) for item in value]
     if isinstance(value, dict):
         return {
-            redact(str(key), vault, vocabulary=vocabulary)[0]: _redact_value(item, vault, vocabulary)
+            redact(str(key), vault, vocabulary=vocabulary)[0]: _redact_value(item, vault, vocabulary, ner)
             for key, item in value.items()
         }
     return value
