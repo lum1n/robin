@@ -1576,65 +1576,28 @@ def test_session_marks_placeholder_site_as_named(tmp_path) -> None:
     assert seen == {"url": "Some Shop", "named_site": True}
 
 
-def test_browser_open_finn_homepage_jumps_to_car_results_for_listing_task() -> None:
-    from robin.capability import ActiveTurn, current_task
-
-    page = MemoryPage("https://example.com/")
-    browser = Browser("ada", page)
-    token = current_task.set(ActiveTurn(
-        "ada", "t", False, False,
-        "Find Tesla Model Y Performance listings on finn.no and a price range",
-    ))
-    try:
-        browser.invoke("ada", "browser_open", {"url": "https://www.finn.no/"})
-    finally:
-        current_task.reset(token)
-    assert "mobility/search/car" in page.text
-    assert "Tesla" in page.text
-    assert "2022" not in page.text
-
-
-def test_listing_search_query_keeps_the_named_product_not_an_invented_year() -> None:
-    from robin.capabilities.browser import _listing_search_query, _marketplace_results_url
-
-    task = (
-        "Find Tesla Model Y Performance listings on https://www.finn.no "
-        "and a price range so I can list my own"
-    )
-    assert _listing_search_query(task) == "Tesla Model Y Performance"
-    url = _marketplace_results_url("https://www.finn.no/", task)
-    assert url.startswith("https://www.finn.no/mobility/search/car?q=")
-    assert "Tesla" in url and "Performance" in url
-    assert "2022" not in url
-    assert _marketplace_results_url("https://www.finn.no/", "open finn.no") == "https://www.finn.no/"
-    assert _marketplace_results_url(
-        "https://www.finn.no/mobility/search/car",
-        task,
-    ) == "https://www.finn.no/mobility/search/car"
-
-
 def test_format_snapshot_puts_listing_prices_and_range_before_filters() -> None:
     from robin.capabilities.browser import _format_snapshot
 
     formatted = _format_snapshot({
-        "url": "https://www.finn.no/mobility/search/car?q=Tesla",
-        "title": "Tesla | Biler",
-        "result_count": "224 treff",
+        "url": "https://market.test/search?q=used+car",
+        "title": "Used cars",
+        "result_count": "224 matches",
         "interactive": [
             {"ref": "1", "role": "checkbox", "name": "Filter 1", "region": "page", "states": [], "value": ""},
         ],
         "listings": [
-            {"text": "Tesla Model Y · Performance AWD · 2022 · 87 500 km · 328 532 kr", "ref": "40"},
-            {"text": "Tesla Model Y · Performance AWD · 2023 · 84 500 km · 324 532 kr", "ref": "41"},
-            {"text": "Tesla Model Y · Performance · 2024 · 57 000 km · 429 000 kr", "ref": "42"},
+            {"text": "Model Y · Performance AWD · 2022 · 87 500 km · 328 532 kr", "ref": "40"},
+            {"text": "Model Y · Performance AWD · 2023 · 84 500 km · 324 532 kr", "ref": "41"},
+            {"text": "Model Y · Performance · 2024 · 57 000 km · 429 000 kr", "ref": "42"},
         ],
-        "content": "224 treff",
+        "content": "224 matches",
     })
     head = formatted.split("Interactive:", 1)[0]
-    assert "Results: 224 treff" in head
+    assert "Results: 224 matches" in head
     assert "Price range: 324 532–429 000 kr from 3 listings" in head
     assert "328 532 kr" in head
-    assert "Tesla Model Y" in head
+    assert "Model Y" in head
     assert formatted.index("Price range:") < formatted.index("Interactive:")
 
 

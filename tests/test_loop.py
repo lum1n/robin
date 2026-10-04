@@ -402,20 +402,20 @@ def test_give_up_is_nudged_when_snapshot_already_has_listing_prices() -> None:
     from robin.capabilities.browser import Browser
 
     snapshot = (
-        "URL: https://www.finn.no/mobility/search/car?q=Tesla\n"
-        "Results: 224 treff\n"
+        "URL: https://market.test/search?q=model+y\n"
+        "Results: 224 matches\n"
         "Price range: 324 532–429 000 kr from 3 listings\n"
         "Listings:\n"
-        "- Tesla Model Y · Performance AWD · 2022 · 328 532 kr\n"
-        "- Tesla Model Y · Performance AWD · 2023 · 324 532 kr\n"
-        "- Tesla Model Y · Performance · 2024 · 429 000 kr\n\n"
-        "Interactive:\n[1] checkbox \"Tesla\" (page)\n\n"
-        "Content:\nTesla Model Y · Performance AWD · 328 532 kr"
+        "- Model Y · Performance AWD · 2022 · 328 532 kr\n"
+        "- Model Y · Performance AWD · 2023 · 324 532 kr\n"
+        "- Model Y · Performance · 2024 · 429 000 kr\n\n"
+        "Interactive:\n[1] checkbox \"Brand\" (page)\n\n"
+        "Content:\nModel Y · Performance AWD · 328 532 kr"
     )
 
     class Page:
         def location(self) -> str:
-            return "https://www.finn.no/mobility/search/car?q=Tesla"
+            return "https://market.test/search?q=model+y"
 
         def read(self, *, query: str = "", cursor: int = 0, region: str = ""):
             return snapshot, ""
@@ -430,7 +430,7 @@ def test_give_up_is_nudged_when_snapshot_already_has_listing_prices() -> None:
     model = Scripted([
         ModelTurn("", (ToolCall("browser_read", {}),)),
         ModelTurn(
-            "I couldn’t find specific listings for a 2022 Tesla Model Y Performance on the site. "
+            "I couldn’t find specific listings for a 2022 Model Y Performance on the site. "
             "However, it might help to look at similar models or websites to gauge the price."
         ),
         ModelTurn(
@@ -440,7 +440,7 @@ def test_give_up_is_nudged_when_snapshot_already_has_listing_prices() -> None:
     ])
     reply = converse(
         assistant,
-        Task("ada", "t", "Find Tesla Model Y Performance listings on finn.no and a price range"),
+        Task("ada", "t", "Find Model Y Performance listings and a price range"),
         model,
         max_steps=6,
     )

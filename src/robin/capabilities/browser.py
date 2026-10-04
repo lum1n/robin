@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 from robin.capability import (
     ActiveTurn,
@@ -1885,7 +1885,6 @@ class Browser(Capability):
                         "for the person's choice, not browser_open."
                     )
                 return str(exc)
-            url = _marketplace_results_url(url, _active_text())
             try:
                 if self.desk is not None:
                     self.desk.open(account_id, url)
@@ -3560,11 +3559,11 @@ _SNAPSHOT_JS = """() => {
   const LISTING_CHROME = /^(pil til (venstre|høyre)|bilde \\d+ av \\d+|scale|sammenlign( biler)?|legg til som favoritt|gå til annonsen|betalt plassering|nyhet!?|annonse|kryss|previous|next|1 of \\d+|favorite|favoritt)$/i;
   const isFilterChrome = (node) => {
     try {
-      if (node.closest("nav, header, aside, [role='navigation'], [role='banner'], [role='complementary'], [aria-labelledby='filters-heading'], [class*='filter-list']")) {
+      if (node.closest("nav, header, aside, [role='navigation'], [role='banner'], [role='complementary'], [aria-labelledby*='filter' i], [class*='filter-list']")) {
         return true;
       }
       const host = node.closest("ul, ol, [role='list']");
-      if (host && host.querySelector("input[type='checkbox'], input[type='radio']") && !host.querySelector("article, [class*='search-ad']")) {
+      if (host && host.querySelector("input[type='checkbox'], input[type='radio']") && !host.querySelector("article, [role='article']")) {
         return true;
       }
       return false;
@@ -3573,8 +3572,6 @@ _SNAPSHOT_JS = """() => {
     }
   };
   const looksLikeListing = (node, text) => {
-    const cls = String(node.className || "");
-    if (/(sf-search-ad|search-ad|mobility-search-ad|result-item|ads__unit)/i.test(cls)) return true;
     const tag = String(node.tagName || "").toLowerCase();
     const role = roleOf(node);
     if ((tag === "article" || role === "article" || role === "row") && String(text || "").length >= 8) return true;
@@ -3602,7 +3599,7 @@ _SNAPSHOT_JS = """() => {
     const meta = lines.find((line) => /20\\d\\d/.test(line) && /km/i.test(line)) || "";
     const subtitle = lines.find((line) => (
       line !== heading && line !== price && line !== meta
-      && /performance|awd|long range|premium|pro|sport/i.test(line)
+      && line.length >= 4 && line.length <= 80
     )) || "";
     const parts = [];
     const seenParts = new Set();
@@ -3613,19 +3610,11 @@ _SNAPSHOT_JS = """() => {
       parts.push(part);
     }
     if (parts.length >= 2) return parts.join(" · ").slice(0, 220);
-    const useful = lines.filter((line) => !/sammenlign|favoritt|privat|skala|service/i.test(line));
+    const useful = lines.filter((line) => !/sammenlign|favoritt|favorite|compare|skala|scale/i.test(line));
     return useful.slice(0, 6).join(" · ").slice(0, 220);
   };
-  const listingVisible = (node) => {
-    if (visible(node)) return true;
-    const cls = String(node.className || "");
-    if (/(sf-search-ad|search-ad|mobility-search-ad)/i.test(cls)) {
-      return String(node.innerText || node.textContent || "").trim().length >= 12;
-    }
-    return false;
-  };
-  const listingSelector = "article, [role='article'], [role='listitem'], [role='row'], [class*='search-ad'], tr, li, a[href]";
-  const taggedResults = document.querySelector("[class*='sf-result-list'], [class*='result-list'], [class*='search-result']");
+  const listingSelector = "article, [role='article'], [role='listitem'], [role='row'], tr, li, a[href]";
+  const taggedResults = document.querySelector("[class*='result-list'], [class*='search-result']");
   const listingRoot = (taggedResults && !isFilterChrome(taggedResults)) ? taggedResults : contentRoot;
   let resultCount = "";
   const countBlob = ((contentRoot || listingRoot || document.body).innerText || "");
@@ -3634,7 +3623,7 @@ _SNAPSHOT_JS = """() => {
   if (resultCount) pushContent(resultCount, 0);
   if (listingRoot && listingRoot.querySelectorAll) {
     for (const node of listingRoot.querySelectorAll(listingSelector)) {
-      if (!listingVisible(node)) continue;
+      if (!visible(node)) continue;
       if (isFilterChrome(node)) continue;
       if (node.closest("nav, header, [role='navigation'], [role='banner']")) continue;
       const parentListing = node.parentElement && node.parentElement.closest
@@ -3725,19 +3714,6 @@ _PRICE_IN_TEXT = re.compile(
     r"(?P<amount>\d(?:[\d\s.,]{0,12}\d)?)\s*(?P<currency>kr|nok|€|\$|£)",
     re.IGNORECASE,
 )
-_LISTING_TASK = re.compile(
-    r"\b(find|search|look(?:ing)?\s+for|listings?|ads?|annonser|pris(?:er)?|price(?:s| range)?|bruktbil)\b",
-    re.IGNORECASE,
-)
-_CAR_TASK = re.compile(
-    r"\b(tesla|bmw|audi|volvo|toyota|mercedes|volkswagen|\bvw\b|ford|porsche|"
-    r"model [3sxy]|bil(?:er)?|cars?|hybrid|elbil|awd|performance|skoda|peugeot|hyundai)\b",
-    re.IGNORECASE,
-)
-_MARKETPLACE_HOME = re.compile(
-    r"^https?://(?:www\.)?(?P<host>finn\.no)/?$",
-    re.IGNORECASE,
-)
 
 
 def _parse_listing_price(text: str) -> tuple[int, str] | None:
@@ -3778,50 +3754,6 @@ def _price_range_line(listings: list[dict[str, Any]]) -> str:
         f"Price range: {_format_amount(low)}–{_format_amount(high)} {currency} "
         f"from {count} listings"
     )
-
-
-def _listing_search_query(task: str) -> str:
-    """Product words the person named, without invented years or site chrome."""
-    text = str(task or "").strip()
-    if not text:
-        return ""
-    quoted = re.findall(r"[\"«»]([^\"«»]+)[\"«»]", text)
-    if quoted:
-        return re.sub(r"\s+", " ", quoted[0]).strip()[:80]
-    cut = re.split(
-        r"\b(?:listings?|ads?|annonser|prices?|price range|pris(?:er|område)?|"
-        r"so (?:i|they|we) can|on (?:the )?(?:site|page|web)|https?://|www\.)",
-        text,
-        maxsplit=1,
-        flags=re.IGNORECASE,
-    )[0]
-    cut = re.sub(
-        r"\b(?:find|search|look(?:ing)?\s+for|used|brukt|please|the|a|an|"
-        r"on|at|finn(?:\.no)?)\b",
-        " ",
-        cut,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(r"\s+", " ", cut).strip(" .,;:-")
-    tokens = query.split()
-    if len(tokens) >= 2:
-        return " ".join(tokens[:8])
-    return query[:80]
-
-
-def _marketplace_results_url(url: str, task: str) -> str:
-    """Open a marketplace homepage onto its results page for a product search."""
-    if not url or not task or not _LISTING_TASK.search(task):
-        return url
-    home = _MARKETPLACE_HOME.match(url.rstrip("/"))
-    if home is None:
-        return url
-    query = _listing_search_query(task)
-    if len(query.split()) < 2:
-        return url
-    if home.group("host").lower() == "finn.no" and _CAR_TASK.search(task):
-        return "https://www.finn.no/mobility/search/car?q=" + quote(query)
-    return url
 
 
 def _snapshot_listings(data: dict[str, Any]) -> list[dict[str, Any]]:
