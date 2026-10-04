@@ -1576,6 +1576,52 @@ def test_session_marks_placeholder_site_as_named(tmp_path) -> None:
     assert seen == {"url": "Some Shop", "named_site": True}
 
 
+def test_format_snapshot_marks_homepage_versus_results() -> None:
+    from robin.capabilities.browser import _action_diff, _format_snapshot, _page_kind_line
+
+    home = _format_snapshot({
+        "url": "https://market.test/",
+        "interactive": [
+            {"ref": "1", "role": "searchbox", "name": "Search", "region": "header", "states": [], "value": ""},
+            {"ref": "2", "role": "checkbox", "name": "Brand", "region": "page", "states": [], "value": ""},
+        ],
+        "content": "Welcome",
+    })
+    assert "Page: home" in home.split("Interactive:", 1)[0]
+    assert "search box" in home
+    assert "not listings" in home
+
+    results = _format_snapshot({
+        "url": "https://market.test/search",
+        "result_count": "12 matches",
+        "listings": [
+            {"text": "Model Y · 2023 · 324 532 kr", "ref": "8"},
+        ],
+        "interactive": [
+            {"ref": "1", "role": "searchbox", "name": "Search", "region": "header", "states": [], "value": "Model Y"},
+        ],
+        "content": "12 matches",
+    })
+    assert "Page: results" in results.split("Interactive:", 1)[0]
+    assert results.index("Page: results") < results.index("Interactive:")
+
+    kind = _page_kind_line(
+        [{"role": "checkbox", "name": f"F{i}"} for i in range(8)],
+        [],
+        "",
+    )
+    assert kind.startswith("Page: filters")
+
+    before = {
+        "url": "https://market.test/",
+        "pages": 1,
+        "downloads": 0,
+        "snapshot": home,
+    }
+    diff = _action_diff(before, results)
+    assert "listings appeared" in diff
+
+
 def test_format_snapshot_puts_listing_prices_and_range_before_filters() -> None:
     from robin.capabilities.browser import _format_snapshot
 

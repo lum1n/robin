@@ -389,6 +389,107 @@ def test_recovery_resets_stagnation_only_after_observed_control_change(page):
     assert "not verified" in reply.text
 
 
+def test_search_submit_filter_apply_and_results_change(page):
+    page.set_content(
+        """
+        <main>
+          <form id="search-form">
+            <label>Search <input type="search" id="q"></label>
+            <button type="submit">Search</button>
+          </form>
+          <aside>
+            <h2>Filters</h2>
+            <ul class="filter-list">
+              <li><label>Electric<input type="checkbox" id="electric"></label></li>
+            </ul>
+            <button type="button" id="apply">Apply</button>
+          </aside>
+          <p id="count">0 matches</p>
+          <div id="results" class="result-list"></div>
+        </main>
+        <script>
+        const catalog = [
+          {title: "Model Y Performance", year: "2023", km: "84 500 km", price: "324 532", electric: true},
+          {title: "Model Y Performance", year: "2024", km: "57 000 km", price: "429 000", electric: true},
+          {title: "Model Y Performance", year: "2022", km: "90 000 km", price: "199 000", electric: false}
+        ];
+        function paint(rows) {
+          document.getElementById("count").textContent = rows.length + " matches";
+          document.getElementById("results").innerHTML = rows.map((row) => (
+            '<article style="display:block;width:400px;min-height:80px">'
+            + "<h2>" + row.title + "</h2>"
+            + "<div>" + row.year + " · " + row.km + "</div>"
+            + "<div><span>" + row.price + "</span> <span>kr</span></div>"
+            + "</article>"
+          )).join("");
+        }
+        function currentRows() {
+          const query = document.getElementById("q").value.toLowerCase();
+          let rows = catalog.filter((row) => row.title.toLowerCase().includes(query));
+          if (document.getElementById("electric").checked && window.applied) {
+            rows = rows.filter((row) => row.electric);
+          }
+          return rows;
+        }
+        document.getElementById("search-form").addEventListener("submit", (event) => {
+          event.preventDefault();
+          window.applied = false;
+          paint(currentRows());
+        });
+        document.getElementById("apply").addEventListener("click", () => {
+          window.applied = true;
+          paint(currentRows());
+        });
+        </script>
+        """
+    )
+    operator = PlaywrightPage(page)
+    assistant = Assistant(ner=ReadyNer())
+    assistant.add(Browser("ada", operator))
+    steps = [
+        ("browser_read", None, None, {}),
+        ("browser_type", "Search", "searchbox", {"text": "Model Y Performance"}),
+        ("browser_set_checked", "Electric", "checkbox", {"checked": True}),
+        ("browser_click", "Apply", "button", {}),
+    ]
+    seen = []
+
+    def target_ref(snapshot, label, role):
+        found = [
+            key for key, (item_role, name) in _parse_refs(snapshot).items()
+            if role == item_role and (name == label or name.endswith(label))
+        ]
+        assert len(found) == 1, (label, role, snapshot)
+        return found[0]
+
+    class Model:
+        def complete(self, *, messages, tools):
+            seen.append(messages[-1]["content"] if messages else "")
+            if steps:
+                name, label, role, arguments = steps.pop(0)
+                if label:
+                    arguments["target"] = target_ref(messages[-1]["content"], label, role)
+                return ModelTurn("", (ToolCall(name, arguments),))
+            result = messages[-1]["content"]
+            assert "Page: results" in result
+            assert "listings changed" in result or "324 532" in result
+            assert "324 532" in result and "429 000" in result
+            assert "199 000" not in result
+            return ModelTurn("Prices range from 324 532 kr to 429 000 kr.")
+
+    reply = converse(
+        assistant,
+        Task("ada", "nav", "Find Model Y Performance listings and a price range"),
+        Model(),
+    )
+    assert "324 532" in reply.text and "429 000" in reply.text
+    typed = next(content for content in seen if "typed into" in content)
+    assert "submitted search" in typed
+    assert "324 532" in typed
+    homepage = seen[1] if len(seen) > 1 else seen[0]
+    assert "Page: home" in homepage or "Search" in homepage
+
+
 def test_filter_sidebar_does_not_hide_listing_prices(page):
     filters = "".join(
         f'<li><label>Filter {i}<input type="checkbox"></label></li>' for i in range(80)

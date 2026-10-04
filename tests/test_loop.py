@@ -357,7 +357,8 @@ def test_type_then_enter_runs_in_one_batch() -> None:
     ])
     converse(assistant, Task("ada", "t", "next train to Oslo S"), model)
     assert page.typed == [("To", "Oslo S")]
-    assert page.keys == ["Enter"]
+    assert page.keys[0] == "Enter"
+    assert "Enter" in page.keys
 
 
 def test_scroll_position_change_is_progress() -> None:
@@ -396,6 +397,101 @@ def test_scroll_position_change_is_progress() -> None:
     ])
     converse(assistant, Task("ada", "t", "train times"), model)
     assert page.scrolls == 3
+
+
+def test_give_up_on_homepage_is_nudged_to_use_site_search() -> None:
+    from robin.capabilities.browser import Browser
+
+    snapshot = (
+        "URL: https://market.test/\n"
+        "Page: home — type the person's query in the search box and submit "
+        "(Enter or the search button). Filter checkboxes are not listings.\n\n"
+        "Interactive:\n[1] searchbox \"Search\" (page)\n[2] checkbox \"Brand\" (page)\n\n"
+        "Content:\nWelcome"
+    )
+
+    class Page:
+        def location(self) -> str:
+            return "https://market.test/"
+
+        def read(self, *, query: str = "", cursor: int = 0, region: str = ""):
+            return snapshot, ""
+
+        def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
+            return None
+
+        def press_key(self, key: str) -> None:
+            return None
+
+    browser = Browser("ada", Page())
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (ToolCall("browser_read", {}),)),
+        ModelTurn("I couldn’t find specific listings on the site."),
+        ModelTurn("", (ToolCall("browser_type", {"target": "1", "text": "Model Y Performance"}),)),
+        ModelTurn("I will read the results after search."),
+    ])
+    reply = converse(
+        assistant,
+        Task("ada", "t", "Find Model Y Performance listings and a price range"),
+        model,
+        max_steps=8,
+    )
+    nudge = "\n".join(
+        str(message.get("content") or "")
+        for messages, _ in model.seen
+        for message in messages
+        if message.get("role") == "user"
+    )
+    assert "not a result list yet" in nudge
+    assert "search box" in nudge
+    assert "couldn’t find" not in reply.text.lower() or "I will read" in reply.text
+
+
+def test_set_checked_then_apply_click_runs_in_one_batch() -> None:
+    from robin.capabilities.browser import Browser
+
+    class Page:
+        def __init__(self) -> None:
+            self.checked: list[tuple[str, bool]] = []
+            self.clicked: list[str] = []
+
+        def location(self) -> str:
+            return "https://market.test/search"
+
+        def read(self, *, query: str = "", cursor: int = 0, region: str = ""):
+            return (
+                "URL: https://market.test/search\n"
+                "Page: results — listings are on this page.\n\n"
+                "Interactive:\n"
+                '[2] checkbox "Electric" (page)\n'
+                '[3] button "Apply" (page)\n\n'
+                "Content:\nlistings",
+                "",
+            )
+
+        def set_checked(self, target: str, checked: bool, ref: str = "") -> None:
+            self.checked.append((target, checked))
+
+        def click(self, target: str, role: str = "", ref: str = "") -> None:
+            self.clicked.append(target)
+
+    page = Page()
+    browser = Browser("ada", page)
+    browser._refs["ada"] = {"2": ("checkbox", "Electric"), "3": ("button", "Apply")}
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (
+            ToolCall("browser_set_checked", {"target": "2", "checked": True}, id="check"),
+            ToolCall("browser_click", {"target": "3"}, id="apply"),
+        )),
+        ModelTurn("Filter applied."),
+    ])
+    converse(assistant, Task("ada", "t", "Filter to electric"), model)
+    assert page.checked == [("Electric", True)]
+    assert page.clicked == ["Apply"]
 
 
 def test_give_up_is_nudged_when_snapshot_already_has_listing_prices() -> None:

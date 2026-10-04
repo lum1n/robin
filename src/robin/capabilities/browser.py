@@ -1444,8 +1444,10 @@ class Browser(Capability):
                 "When the person names a site with an ORG reference (or similar), pass that entire reference as url — confirm restores the real host. "
                 "Do not invent a different hostname from memory (for example lot.com when they said Google). "
                 "Reach the site's actual search/results page, not just its category landing page. "
-                "Type only the product the person named into site search — do not invent a model year "
-                "or extra filters they did not ask for. "
+                "Use the site's search box: type only the product the person named and submit "
+                "(search fields send Enter; otherwise press Enter or click the search button). "
+                "Do not invent a model year or extra filters they did not ask for. "
+                "Page: home/search/filters means listings are not on this page yet — do not give up. "
                 "When the snapshot includes Listings or Price range, answer from those (prices and the range). "
                 "To click or type, use Interactive refs (for example target 1) or the visible name. "
                 "Use browser_find or scoped browser_read to discover omitted search/filter/sort controls before scrolling blindly. "
@@ -1503,7 +1505,8 @@ class Browser(Capability):
             description=(
                 "Set a checkbox or switch to checked=true or false, without toggling an already correct state. "
                 "Use this for search filters the person asked for. Do not add a year or extra filter they did not name. "
-                "Verify range limits and selected sorting in the new snapshot."
+                "If the page has Apply, click it after setting the filter. "
+                "Confirm listings or the result count changed in the new snapshot."
             ),
             parameters={"type": "object", "properties": {
                 "target": {"type": "string"}, "checked": {"type": "boolean"},
@@ -1523,7 +1526,8 @@ class Browser(Capability):
                 "A button listed under Interactive is available — click its ref; do not claim it is missing. "
                 "For named actions such as Send bestilling, click that ref; browser_submit is only for type=submit login forms. "
                 "If a click fails, browser_read and try a different ref — do not retry the same target. "
-                "After typing a search query, browser_press Enter or click a search suggestion option."
+                "After typing a search query, search boxes already submit; otherwise press Enter or click Search. "
+                "Use this for Apply after setting a filter, and for suggestions under the search box."
             ),
             parameters={"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]},
             effect=Effect.MUTATE,
@@ -1533,6 +1537,7 @@ class Browser(Capability):
             description=(
                 "Type into a textbox ref or labeled field that is not a password. "
                 "For site search, type the product the person named — do not add a year they did not say. "
+                "A search box submits the query (Enter) after typing. Other fields do not. "
                 "Prefer an Interactive ref number (for example 12). "
                 "For email, phone, name, or address, prefer browser_fill_profile when a saved profile exists — "
                 "never invent contact details and never type them here."
@@ -1912,8 +1917,7 @@ class Browser(Capability):
                 if role not in {"checkbox", "switch", "menuitemcheckbox", "radio"} or not ref:
                     raise RuntimeError("no current checkbox or switch matching the target")
                 self._use(account_id, lambda page: page.set_checked(name, checked, ref=ref))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 change = _action_diff(before, after)
                 if "no observable change" in change:
                     change = "outcome: already satisfied"
@@ -1929,8 +1933,7 @@ class Browser(Capability):
                     self._use(account_id, lambda page: _click(page, name, role, ref=ref))
                 except Exception as exc:
                     return _action_failure(exc)
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"clicked {target}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_type":
                 target = str(arguments.get("target", ""))
@@ -1944,9 +1947,25 @@ class Browser(Capability):
                     self._use(account_id, lambda page: _type_text(page, name, text, role, ref=ref))
                 except Exception as exc:
                     return _action_failure(exc)
-                self._settle(account_id)
-                after = self._observe(account_id)
-                return f"typed into {target}\n{_action_diff(before, after)}\n{after}"
+                submitted = False
+                if _looks_like_search_field(role, name):
+                    try:
+                        self._use(account_id, lambda page: _press_key(page, "Enter"))
+                        submitted = True
+                    except Exception:
+                        submitted = False
+                after = self._after_action(account_id)
+                lead = f"typed into {target}"
+                if submitted:
+                    lead += " and submitted search"
+                change = _action_diff(before, after)
+                if submitted and "listings appeared" not in change and "url " not in change:
+                    if not _snapshot_lists_results(after):
+                        change = (
+                            f"{change} — if listings did not appear, "
+                            "click the search button or press Enter again"
+                        )
+                return f"{lead}\n{change}\n{after}"
             if tool_name == "browser_select":
                 target = str(arguments.get("target", ""))
                 value = str(arguments.get("value", ""))
@@ -1956,8 +1975,7 @@ class Browser(Capability):
                 except RuntimeError as exc:
                     return str(exc)
                 self._use(account_id, lambda page: _select_option(page, name, value, ref=ref))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"selected {value} in {target}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_scroll":
                 direction = str(arguments.get("direction", "down"))
@@ -1972,8 +1990,7 @@ class Browser(Capability):
                     if not ref:
                         raise RuntimeError("no current scroll container matching the target")
                 movement = self._use(account_id, lambda page: _scroll(page, direction, ref=ref))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 change = _action_diff(before, after)
                 if isinstance(movement, dict):
                     if movement.get("before") == movement.get("after"):
@@ -1985,8 +2002,7 @@ class Browser(Capability):
                 key = str(arguments.get("key", ""))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _press_key(page, key))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"pressed {key}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_hover":
                 target = str(arguments.get("target", ""))
@@ -1996,28 +2012,24 @@ class Browser(Capability):
                 except RuntimeError as exc:
                     return str(exc)
                 self._use(account_id, lambda page: _hover(page, name, role, ref=ref))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"hovered {target}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_type_focused":
                 text = str(arguments.get("text", ""))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _type_focused(page, text))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"typed into focused field\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_back":
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _go_back(page))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"went back\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_switch":
                 index = int(arguments.get("index", 0))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _switch_page(page, index))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"switched to page {index}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_type_password":
                 secret = str(arguments.get("text", ""))
@@ -2045,8 +2057,7 @@ class Browser(Capability):
                         self._use(account_id, lambda page: _click(page, name, role, ref=ref))
                     except Exception as click_exc:
                         return _action_failure(click_exc)
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"submitted\n{_action_diff(before, after)}\n{after}"
             if tool_name in {"browser_read", "browser_find"}:
                 cursor = arguments.get("cursor", 0)
@@ -2297,6 +2308,15 @@ class Browser(Capability):
 
     def _settle(self, account_id: str) -> None:
         self._use(account_id, lambda page: _settle(page))
+
+    def _after_action(self, account_id: str) -> str:
+        """Settle, then re-read once if the page is still painting."""
+        self._settle(account_id)
+        after = self._observe(account_id)
+        if _still_updating_line(after):
+            self._settle(account_id)
+            after = self._observe(account_id)
+        return after
 
     def _use(self, account_id: str, function: Any) -> Any:
         if self.desk is not None:
@@ -3695,7 +3715,7 @@ _SNAPSHOT_JS = """() => {
     interactive: interactive.sort((a, b) => {
       const score = item => (item.region === "dialog" ? 100 : 0)
         + (["textbox", "searchbox", "spinbutton", "checkbox", "radio", "switch", "combobox", "listbox"].includes(item.role) ? 50 : 0)
-        + (item.viewport ? 20 : 0) + (/filter|sort|søk|search|alle biler/i.test(item.name) ? 30 : 0);
+        + (item.viewport ? 20 : 0) + (/filter|sort|søk|search/i.test(item.name) ? 30 : 0);
       return score(b) - score(a);
     }),
     discoveryLimited: interactive.length >= 2000,
@@ -3756,6 +3776,81 @@ def _price_range_line(listings: list[dict[str, Any]]) -> str:
     )
 
 
+_SEARCH_FIELD = re.compile(r"\b(search|søk|find|query|søkefelt)\b", re.IGNORECASE)
+
+
+def _looks_like_search_field(role: str, name: str) -> bool:
+    role = (role or "").lower()
+    if role == "searchbox":
+        return True
+    if role in {"textbox", "combobox"} and _SEARCH_FIELD.search(name or ""):
+        return True
+    return False
+
+
+def _still_updating_line(snapshot: str) -> bool:
+    for line in (snapshot or "").splitlines()[:12]:
+        if line.strip() == "Still updating":
+            return True
+    return False
+
+
+def _snapshot_lists_results(snapshot: str) -> bool:
+    text = snapshot or ""
+    if re.search(r"^Page: results\b", text, re.MULTILINE):
+        return True
+    if re.search(r"^Price range:", text, re.MULTILINE):
+        return True
+    return bool(re.search(r"^Listings:", text, re.MULTILINE))
+
+
+def _page_kind_line(
+    interactive: list[dict[str, Any]],
+    listings: list[dict[str, Any]],
+    range_line: str,
+) -> str:
+    if listings or range_line:
+        return (
+            "Page: results — listings are on this page. Report prices and the range. "
+            "Apply only filters the person asked for, then confirm the listing list or count changed."
+        )
+    search_fields = [
+        item for item in interactive
+        if _looks_like_search_field(str(item.get("role") or ""), str(item.get("name") or ""))
+    ]
+    typed = any(str(item.get("value") or "").strip() for item in search_fields)
+    if search_fields and typed:
+        return (
+            "Page: search — the query is typed. Submit with Enter or the search button. "
+            "This is not a result list yet."
+        )
+    if search_fields:
+        return (
+            "Page: home — type the person's query in the search box and submit "
+            "(Enter or the search button). Filter checkboxes are not listings."
+        )
+    checkboxes = [
+        item for item in interactive
+        if str(item.get("role") or "") in {"checkbox", "radio", "switch"}
+    ]
+    if len(checkboxes) >= 6:
+        return (
+            "Page: filters — these checkboxes are not listings. "
+            "Set the requested filter, apply it if there is an Apply button, then read the result list."
+        )
+    return ""
+
+
+def _results_fingerprint(snapshot: str) -> str:
+    lines: list[str] = []
+    for line in (snapshot or "").splitlines():
+        if line.startswith(("Results:", "Price range:", "Listings:")):
+            lines.append(line)
+        elif line.startswith("- ") and re.search(r"\b\d[\d\s.]*\s*(kr|nok|€|\$|£)\b", line, re.I):
+            lines.append(line)
+    return "\n".join(lines[:16])
+
+
 def _snapshot_listings(data: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in data.get("listings") or []:
@@ -3800,6 +3895,9 @@ def _format_snapshot(data: dict[str, Any]) -> str:
         lines.append(f"Results: {len(listings)} listings")
     if range_line:
         lines.append(range_line)
+    kind = _page_kind_line(list(data.get("interactive") or []), listings, range_line)
+    if kind:
+        lines.append(kind)
     if listings:
         lines.append("Listings:")
         for row in listings[:24]:
@@ -3993,6 +4091,16 @@ def _action_diff(before: dict[str, Any] | str, snapshot: str) -> str:
         bits.append(f"scroll position {after_scroll}")
     if "\nStill updating" in snapshot or snapshot.startswith("Still updating"):
         bits.append("still updating")
+    previous_snapshot = before.get("snapshot") if isinstance(before.get("snapshot"), str) else ""
+    before_results = _results_fingerprint(str(previous_snapshot or ""))
+    after_results = _results_fingerprint(snapshot)
+    if before_results != after_results:
+        if after_results and not before_results:
+            bits.append("listings appeared")
+        elif after_results:
+            bits.append("listings changed")
+        elif before_results:
+            bits.append("listings cleared")
     if not bits:
         previous = before.get("snapshot")
         if isinstance(previous, str):

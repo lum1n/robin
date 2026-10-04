@@ -65,6 +65,12 @@ SYSTEM = (
     "and finish the task on the page — do not use web_search as a substitute for opening the site. "
     "Do not say you lack access to a website or the web when browser tools are available — use browser_open. "
     "If web_search fails, browser_open the named site instead of giving up. "
+    "On a website, use that site's search box and submit the query (Enter or the search button). "
+    "A homepage or filter panel is not a result list. "
+    "To filter, open the control, set it, click Apply if the page has one, "
+    "and check that listings or the result count changed. "
+    "If a click does nothing, a consent dialog is in the way, or the page says Still updating, "
+    "dismiss the dialog or browser_read again — do not retry the same dead click. "
     "The latest Person line is the current task. If it continues an open task "
     "(continue, same for, the other), keep that task and its prior tools. "
     "Conversation history is context only — do not resume an earlier website, news, or "
@@ -81,8 +87,10 @@ _TOOL_RESULT_CHARS = 12_000
 _HISTORY_TURNS = 16
 _TURN_CHARS = 1200
 _CHAIN_AFTER = {
-    "browser_type": frozenset({"browser_press"}),
-    "browser_type_focused": frozenset({"browser_press"}),
+    "browser_type": frozenset({"browser_press", "browser_click"}),
+    "browser_type_focused": frozenset({"browser_press", "browser_click"}),
+    "browser_set_checked": frozenset({"browser_click"}),
+    "browser_select": frozenset({"browser_click"}),
     "browser_scroll": frozenset({"browser_read", "browser_find"}),
 }
 
@@ -311,24 +319,32 @@ def _converse(
                 if (
                     not listing_nudge
                     and _gave_up_on_listings(turn.message)
-                    and _snapshot_has_listing_prices(_last_tool_text(messages))
                     and not _needs_person(turn.message)
                     and not _explicit_finish(turn.message)
                 ):
-                    listing_nudge = True
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "The latest page snapshot already lists matching ads with prices. "
-                                "Report those listing prices and the observed price range. "
-                                "Do not claim there are no matches, and do not add a year or filter "
-                                "the person did not ask for."
-                            ),
-                        }
-                    )
-                    _trim_messages(messages)
-                    continue
+                    last = _last_tool_text(messages)
+                    if _snapshot_has_listing_prices(last):
+                        listing_nudge = True
+                        hint = (
+                            "The latest page snapshot already lists matching ads with prices. "
+                            "Report those listing prices and the observed price range. "
+                            "Do not claim there are no matches, and do not add a year or filter "
+                            "the person did not ask for."
+                        )
+                    elif _page_needs_search(last):
+                        listing_nudge = True
+                        hint = (
+                            "This page is not a result list yet. "
+                            "Type the person's query in the site search box and submit it "
+                            "(Enter or the search button). Then apply filters only if needed "
+                            "and read the listings. Do not claim there are no matches."
+                        )
+                    else:
+                        hint = ""
+                    if hint:
+                        messages.append({"role": "user", "content": hint})
+                        _trim_messages(messages)
+                        continue
                 reply = _reply_text(turn.message, vault, vocabulary, decision.route)
                 return _after_turn(assistant, task, model, reply, trace)
             messages.append(_assistant_message(turn.message, turn.tool_calls))
@@ -1499,6 +1515,10 @@ _GAVE_UP_MATCHES = re.compile(
 
 def _gave_up_on_listings(message: str) -> bool:
     return bool(_GAVE_UP_MATCHES.search(message or ""))
+
+
+def _page_needs_search(text: str) -> bool:
+    return bool(re.search(r"^Page: (home|search|filters)\b", text or "", re.MULTILINE))
 
 
 def _snapshot_has_listing_prices(text: str) -> bool:
