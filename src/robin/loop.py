@@ -65,6 +65,12 @@ SYSTEM = (
     "and finish the task on the page — do not use web_search as a substitute for opening the site. "
     "Do not say you lack access to a website or the web when browser tools are available — use browser_open. "
     "If web_search fails, browser_open the named site instead of giving up. "
+    "On a website, use that site's search box and submit the query (Enter or the search button). "
+    "A homepage or filter panel is not a result list. "
+    "To filter, open the control, set it, click Apply if the page has one, "
+    "and check that listings or the result count changed. "
+    "If a click does nothing, a consent dialog is in the way, or the page says Still updating, "
+    "dismiss the dialog or browser_read again — do not retry the same dead click. "
     "The latest Person line is the current task. If it continues an open task "
     "(continue, same for, the other), keep that task and its prior tools. "
     "Conversation history is context only — do not resume an earlier website, news, or "
@@ -80,6 +86,13 @@ _MODEL_CHARS = 60_000
 _TOOL_RESULT_CHARS = 12_000
 _HISTORY_TURNS = 16
 _TURN_CHARS = 1200
+_CHAIN_AFTER = {
+    "browser_type": frozenset({"browser_press", "browser_click"}),
+    "browser_type_focused": frozenset({"browser_press", "browser_click"}),
+    "browser_set_checked": frozenset({"browser_click"}),
+    "browser_select": frozenset({"browser_click"}),
+    "browser_scroll": frozenset({"browser_read", "browser_find"}),
+}
 
 
 class PendingMissing(LookupError):
@@ -265,6 +278,7 @@ def _converse(
 
     repeats: dict[str, int] = {}
     steps_used = 0
+    listing_nudge = False
     assistant_index = _last_assistant_index(messages) if queued else -1
     for _ in range(max_steps):
         steps_used += 1
@@ -302,6 +316,35 @@ def _converse(
                     )
                     _trim_messages(messages)
                     continue
+                if (
+                    not listing_nudge
+                    and _gave_up_on_listings(turn.message)
+                    and not _needs_person(turn.message)
+                    and not _explicit_finish(turn.message)
+                ):
+                    last = _last_tool_text(messages)
+                    if _snapshot_has_listing_prices(last):
+                        listing_nudge = True
+                        hint = (
+                            "The latest page snapshot already lists matching ads with prices. "
+                            "Report those listing prices and the observed price range. "
+                            "Do not claim there are no matches, and do not add a year or filter "
+                            "the person did not ask for."
+                        )
+                    elif _page_needs_search(last):
+                        listing_nudge = True
+                        hint = (
+                            "This page is not a result list yet. "
+                            "Type the person's query in the site search box and submit it "
+                            "(Enter or the search button). Then apply filters only if needed "
+                            "and read the listings. Do not claim there are no matches."
+                        )
+                    else:
+                        hint = ""
+                    if hint:
+                        messages.append({"role": "user", "content": hint})
+                        _trim_messages(messages)
+                        continue
                 reply = _reply_text(turn.message, vault, vocabulary, decision.route)
                 return _after_turn(assistant, task, model, reply, trace)
             messages.append(_assistant_message(turn.message, turn.tool_calls))
@@ -310,6 +353,8 @@ def _converse(
         nudges: list[dict[str, Any]] = []
 
         browser_acted = False
+        chain_head = ""
+        chain_used = False
         # Read-only (and other non-confirm) calls in this batch finish before the first confirm.
         for index, call in enumerate(_order_batch(assistant, task, calls)):
             if _superseded():
@@ -321,23 +366,31 @@ def _converse(
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": problem})
                 continue
             repeat_key = json.dumps({"name": call.name, "arguments": call.arguments}, sort_keys=True, default=str)
-            if repeats.get(repeat_key, 0) >= 4 and call.name.startswith("browser_"):
-                return Reply("reply", "The browser made no progress after repeated actions. "
-                             "I could not verify the requested filters or results.", decision.route)
             browser_action = call.name.startswith("browser_") and call.name not in {"browser_read", "browser_find"}
-            if browser_acted and browser_action:
+            chained = (
+                browser_acted
+                and not chain_used
+                and call.name in _CHAIN_AFTER.get(chain_head, ())
+            )
+            if repeats.get(repeat_key, 0) >= 2 and call.name.startswith("browser_"):
+                outcome = _recover_listing_text(
+                    assistant, task, call,
+                    "Action blocked: repeated operation made no progress. "
+                    "Newly revealed listing text follows. "
+                    "Use a different current control; do not retry these arguments.",
+                )
+            elif browser_acted and browser_action and not chained:
                 outcome = {"status": "error", "result": (
                     "Action blocked: inspect the preceding browser result before another action. "
                     "Request this action in the next turn using its current Interactive refs."
                 )}
-            elif repeats.get(repeat_key, 0) >= 2 and call.name.startswith("browser_"):
-                outcome = {"status": "error", "result": (
-                    "Action blocked: repeated operation made no progress. "
-                    "Use browser_find, scoped browser_read, or a different current control; "
-                    "the requested filters/results have not been verified."
-                )}
             else:
-                browser_acted = browser_acted or browser_action
+                if chained:
+                    chain_used = True
+                if browser_action:
+                    browser_acted = True
+                    if not chain_head:
+                        chain_head = call.name
                 outcome = assistant.invoke(
                     task.account_id, task.conversation_id, call.name, call.arguments, for_model=True,
                 )
@@ -398,7 +451,8 @@ def _converse(
             action_lead = result.split("\nURL:", 1)[0] if not result.startswith("URL:") else ""
             if any(line.startswith(("changed: url ", "changed: popup opened",
                                     "changed: page closed", "changed: dialog open",
-                                    "changed: control state changed"))
+                                    "changed: control state changed",
+                                    "changed: scroll position"))
                    for line in action_lead.splitlines()):
                 repeats.clear()
             if len(result) > _TOOL_RESULT_CHARS:
@@ -718,6 +772,8 @@ def _note_repeated_failure(
     """Detect identical failing tool calls so the model stops retrying the same dead end."""
     line = (result or "").strip().splitlines()[0].strip() if result else ""
     lead = result.split("\nURL:", 1)[0] if not result.startswith("URL:") else ""
+    if _is_overlay_miss(result):
+        return result, False
     failed = bool(line) and (
         "no observable change" in lead
         or line.startswith("Action blocked: repeated operation")
@@ -1444,26 +1500,79 @@ def _menu_spam(body: str) -> bool:
     return any(word in lower for word in ("clinic", "klinikk", "home visit", "hjemme", "video", "option", "appointment", "bestill"))
 
 
+def _is_overlay_miss(result: str) -> bool:
+    lower = (result or "").lower()
+    return "intercepts pointer" in lower or ("covered by" in lower and "overlay" in lower)
+
+
+_GAVE_UP_MATCHES = re.compile(
+    r"couldn(?:'|’)t find|could not find|cannot find|can(?:'|’)t find|"
+    r"no (?:specific )?listings|no matches|no results|"
+    r"might help to look at similar",
+    re.IGNORECASE,
+)
+
+
+def _gave_up_on_listings(message: str) -> bool:
+    return bool(_GAVE_UP_MATCHES.search(message or ""))
+
+
+def _page_needs_search(text: str) -> bool:
+    return bool(re.search(r"^Page: (home|search|filters)\b", text or "", re.MULTILINE))
+
+
+def _snapshot_has_listing_prices(text: str) -> bool:
+    blob = text or ""
+    if re.search(r"^Price range:", blob, re.MULTILINE):
+        return True
+    if re.search(r"^Listings:", blob, re.MULTILINE) and re.search(
+        r"\b\d[\d\s.]*\s*kr\b", blob, re.IGNORECASE
+    ):
+        return True
+    return bool(re.search(r"^\s*-\s+.+\b\d[\d\s.]*\s*kr\b", blob, re.MULTILINE | re.IGNORECASE))
+
+
+def _last_tool_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "tool":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _recover_listing_text(assistant: Assistant, task: Task, call: ToolCall, lead: str) -> dict[str, str]:
+    """After a blocked repeat, return newly revealed main-region text instead of ending the turn."""
+    recovered = ""
+    try:
+        recovered = str(
+            assistant.invoke(
+                task.account_id,
+                task.conversation_id,
+                "browser_read",
+                {},
+                for_model=True,
+            ).get("result")
+            or ""
+        )
+    except Exception:
+        recovered = ""
+    return {"status": "error", "result": f"{lead}\n{recovered}".strip()}
+
+
 def _bot_block_spam(body: str) -> bool:
-    """True when a past reply reported a real WAF/captcha/automation block (keep that fact)."""
+    """True when a past reply reported a real captcha/challenge wall (keep that fact)."""
     lower = body.lower()
     return any(
         phrase in lower
         for phrase in (
             "bot/captcha",
             "captcha wall",
-            "blocking automated",
-            "blocked automated",
-            "blocks automation",
-            "blocked automation",
-            "security polic",
-            "security policies",
-            "has been blocked",
-            "access to the website has been blocked",
-            "access to the website has been denied",
-            "waf",
-            "are you a human or a robot",
+            "a captcha or security check",
             "verify you are human",
+            "are you a human or a robot",
+            "px/captcha",
+            "checking your browser",
+            "cf-challenge",
+            "human verification",
         )
     )
 

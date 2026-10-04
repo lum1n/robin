@@ -184,17 +184,34 @@ class PlaywrightPage:
     def read(self, *, query: str = "", cursor: int = 0, region: str = "") -> tuple[str, str]:
         data = self._collect(query=query, region=region)
         controls = list(data.get("interactive") or [])
+        listings = list(data.get("listings") or [])
         if query:
             needle = query.casefold()
-            controls = [
+            matched = [
                 item for item in controls
                 if needle in f"{item.get('name', '')} {item.get('group', '')} {item.get('role', '')}".casefold()
             ]
+            listing_hits = [
+                row for row in listings
+                if needle in str(row.get("text") or "").casefold()
+            ]
+            listing_refs = {str(row.get("ref") or "") for row in listing_hits if row.get("ref")}
+            seen = {str(item.get("ref") or "") for item in matched}
+            for item in controls:
+                ref = str(item.get("ref") or "")
+                if ref in listing_refs and ref not in seen:
+                    matched.append(item)
+                    seen.add(ref)
+            controls = matched
+            if listing_hits:
+                data["content"] = "\n".join(
+                    str(row.get("text") or "") for row in listing_hits if row.get("text")
+                )
         if region:
             controls = [item for item in controls if item.get("region") == region]
         data["total_controls"] = len(controls)
         data["cursor"] = cursor
-        data["interactive"] = controls[cursor:cursor + _MAX_INTERACTIVE]
+        data["interactive"] = _window_interactive(controls)[cursor:cursor + _MAX_INTERACTIVE]
         data["pages"] = self.page_list()
         data["downloads"] = self.downloads()
         text = _format_snapshot(data)
@@ -229,6 +246,12 @@ class PlaywrightPage:
                         "secrets": list(raw.get("secrets") or []),
                         "discovery_limited": bool(raw.get("discoveryLimited")),
                         "scroll": raw.get("scroll"),
+                        "listings": list(raw.get("listings") or []),
+                        "result_count": str(raw.get("resultCount") or raw.get("result_count") or ""),
+                        "dismissible_dialogs": list(
+                            raw.get("dismissibleDialogs") or raw.get("dismissible_dialogs") or []
+                        ),
+                        "still_updating": bool(getattr(self, "_still_updating", False)),
                     }
             except Exception as exc:
                 raise RuntimeError("could not inspect page controls — browser_read before continuing") from exc
@@ -242,6 +265,8 @@ class PlaywrightPage:
             "interactive": [],
             "content": content,
             "secrets": secrets,
+            "listings": [],
+            "result_count": "",
         }
 
     def _main_text(self) -> str:
@@ -267,7 +292,7 @@ class PlaywrightPage:
                 values.append(value)
         return [value for value in values if value]
 
-    def settle(self, *, timeout_ms: int = 4000) -> None:
+    def settle(self, *, timeout_ms: int = 4000) -> dict[str, Any]:
         """Wait until a SPA route finishes painting, not just a fixed pause."""
         # Cookie/consent overlays often load after first paint and block clicks/content.
         try:
@@ -284,21 +309,19 @@ class PlaywrightPage:
         deadline = time.monotonic() + timeout_ms / 1000
         last = ""
         stable = 0
+        self._still_updating = False
         while time.monotonic() < deadline:
             try:
                 if int(self._fields("input[type='password']").count()) > 0:
-                    return
+                    self._still_updating = False
+                    return {"still_updating": False}
             except Exception:
                 pass
             try:
                 url = str(getattr(page, "url", "") or "")
                 inputs = int(self._fields("input, textarea, select").count())
                 state = self._collect()
-                fingerprint = json.dumps({
-                    "url": url, "inputs": inputs, "content": state.get("content"),
-                    "controls": [(item.get("role"), item.get("name"), item.get("states"), item.get("value"))
-                                 for item in state.get("interactive") or []],
-                }, sort_keys=True)
+                fingerprint = _stable_fingerprint(url, inputs, state)
                 loading = page.evaluate(
                     "() => !!document.querySelector('[aria-busy=\"true\"]')"
                 ) is True if callable(getattr(page, "evaluate", None)) else False
@@ -309,7 +332,8 @@ class PlaywrightPage:
             if fingerprint and fingerprint == last:
                 stable += 1
                 if stable >= 5 and not waiting_for_form and not loading:
-                    return
+                    self._still_updating = False
+                    return {"still_updating": False}
             else:
                 stable = 0
                 last = fingerprint
@@ -321,16 +345,22 @@ class PlaywrightPage:
                 except Exception:
                     pass
             time.sleep(0.2)
-        raise RuntimeError("page is still loading or changing — browser_read before continuing")
+        self._still_updating = True
+        return {"still_updating": True}
 
     def click(self, target: str, role: str = "", ref: str = "") -> None:
         if ref:
-            if self._act_ref(ref, "click"):
+            overlay = self._click_ref(ref)
+            if overlay is None:
                 return
-            raise RuntimeError(
-                f'control [{ref}] is gone or not clickable — browser_read for a fresh snapshot, '
-                f'then click a current Interactive ref (do not retry [{ref}])'
-            )
+            try:
+                self.clear_gate()
+            except Exception:
+                pass
+            overlay = self._click_ref(ref)
+            if overlay is None:
+                return
+            raise RuntimeError(overlay)
         if role in {"link", "button"}:
             try:
                 control = self._page.get_by_role(role, name=target, exact=True)
@@ -583,6 +613,21 @@ class PlaywrightPage:
             if frame is not None and frame is not main
         ]
 
+    def _click_ref(self, ref: str) -> str | None:
+        """Click a stamped ref. None means success; otherwise an overlay/stale message."""
+        try:
+            if self._act_ref(ref, "click"):
+                return None
+        except RuntimeError as exc:
+            text = str(exc)
+            if _is_overlay_result(text):
+                return text
+            raise
+        return (
+            f"control [{ref}] is gone or not clickable — browser_read for a fresh snapshot, "
+            f"then click a current Interactive ref (do not retry [{ref}])"
+        )
+
     def _act_ref(self, ref: str, action: str, text: str = "") -> bool:
         selector = f'[data-robin-ref="{ref}"]'
         saw = False
@@ -613,8 +658,17 @@ class PlaywrightPage:
                         raise RuntimeError(
                             f'control [{ref}] is disabled — fill required fields first, then click again'
                         )
-                    if _click_locator(target):
+                    ok, detail = _click_locator(target)
+                    if ok:
                         return True
+                    if _is_pointer_intercept(detail):
+                        cover = _overlay_name(target)
+                        label = f'overlay "{cover}"' if cover else "an overlay"
+                        raise RuntimeError(
+                            f"control [{ref}] is covered by {label} that intercepts pointer "
+                            f"— target [{ref}] still current"
+                        )
+                    last_error = RuntimeError(detail or "click failed")
                     continue
                 if action == "select":
                     self._select_control(target, text, root=frame)
@@ -806,6 +860,21 @@ class PlaywrightPage:
             "Accept",
             "Godta",
             "Tillat",
+            "Jeg forstår",
+            "Forstått",
+            "Bare nødvendige",
+            "Kun nødvendige",
+            "Avvis alle",
+            "Avvis",
+            "Avslå",
+            "Nekt alle",
+            "Lukk",
+            "Fortsett uten",
+            "Reject all",
+            "Reject",
+            "Close",
+            "Got it",
+            "I understand",
         )
         # CMP iframes often appear a beat after first paint.
         for _attempt in range(6):
@@ -1375,6 +1444,11 @@ class Browser(Capability):
                 "When the person names a site with an ORG reference (or similar), pass that entire reference as url — confirm restores the real host. "
                 "Do not invent a different hostname from memory (for example lot.com when they said Google). "
                 "Reach the site's actual search/results page, not just its category landing page. "
+                "Use the site's search box: type only the product the person named and submit "
+                "(search fields send Enter; otherwise press Enter or click the search button). "
+                "Do not invent a model year or extra filters they did not ask for. "
+                "Page: home/search/filters means listings are not on this page yet — do not give up. "
+                "When the snapshot includes Listings or Price range, answer from those (prices and the range). "
                 "To click or type, use Interactive refs (for example target 1) or the visible name. "
                 "Use browser_find or scoped browser_read to discover omitted search/filter/sort controls before scrolling blindly. "
                 "Use browser_select for dropdowns, browser_scroll to reveal more, browser_press for Enter or Tab, "
@@ -1384,9 +1458,11 @@ class Browser(Capability):
                 "When Pages lists more than one entry, browser_switch focuses that popup by index. "
                 "If Content ends with (more below), scroll only to read more Content — Interactive refs are already listed and clickable. "
                 "Empty, truncated or withheld Content does not mean zero search results. "
+                "Listings and Price range are the ads on the page — report those prices; do not say you found nothing. "
                 "Only claim no matches when the page explicitly says so after the requested filters are applied. "
-                "If a page snapshot says bot/captcha wall or has empty Content behind an iframe, stop hopping sites — "
+                "If a page snapshot says bot/captcha wall, stop hopping sites — "
                 "tell the person automation was blocked and use web_search for a rough estimate or ask which site to try. "
+                "An unread cross-origin frame is not a captcha — report the host and keep using the readable page. "
                 "If conversation history already says a host blocked Robin's automated browser, do not open that "
                 "same host again — say it is still blocked from this machine and offer web_search or another site."
             ),
@@ -1403,7 +1479,8 @@ class Browser(Capability):
             description=(
                 "Read the structured text snapshot of this account's page (URL, interactive refs, content). "
                 "Use a query or region to find omitted search/filter/sort controls before scrolling blindly. "
-                "Empty or truncated Content is not zero results. (more below) only means Content text is truncated; "
+                "Empty or truncated Content is not zero results. Listings and Price range are visible ads. "
+                "(more below) only means Content text is truncated; "
                 "do not scroll away from a form to find a button that is already listed under Interactive."
             ),
             parameters={"type": "object", "properties": {
@@ -1416,7 +1493,8 @@ class Browser(Capability):
         Tool(
             name="browser_find",
             description=(
-                "Find omitted controls by label, group or role across the page. Returns current refs; use before blind scrolling. "
+                "Find omitted controls by label, group, role, or visible Content/listing text. "
+                "Matching listing lines return the nearest Interactive ref. Use before blind scrolling. "
                 "No observable change is not progress — try a different justified action after two unchanged attempts."
             ),
             parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
@@ -1426,7 +1504,9 @@ class Browser(Capability):
             name="browser_set_checked",
             description=(
                 "Set a checkbox or switch to checked=true or false, without toggling an already correct state. "
-                "Use this for search filters and verify range limits and selected sorting in the new snapshot."
+                "Use this for search filters the person asked for. Do not add a year or extra filter they did not name. "
+                "If the page has Apply, click it after setting the filter. "
+                "Confirm listings or the result count changed in the new snapshot."
             ),
             parameters={"type": "object", "properties": {
                 "target": {"type": "string"}, "checked": {"type": "boolean"},
@@ -1446,7 +1526,8 @@ class Browser(Capability):
                 "A button listed under Interactive is available — click its ref; do not claim it is missing. "
                 "For named actions such as Send bestilling, click that ref; browser_submit is only for type=submit login forms. "
                 "If a click fails, browser_read and try a different ref — do not retry the same target. "
-                "After typing a search query, browser_press Enter or click a search suggestion option."
+                "After typing a search query, search boxes already submit; otherwise press Enter or click Search. "
+                "Use this for Apply after setting a filter, and for suggestions under the search box."
             ),
             parameters={"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]},
             effect=Effect.MUTATE,
@@ -1455,6 +1536,8 @@ class Browser(Capability):
             name="browser_type",
             description=(
                 "Type into a textbox ref or labeled field that is not a password. "
+                "For site search, type the product the person named — do not add a year they did not say. "
+                "A search box submits the query (Enter) after typing. Other fields do not. "
                 "Prefer an Interactive ref number (for example 12). "
                 "For email, phone, name, or address, prefer browser_fill_profile when a saved profile exists — "
                 "never invent contact details and never type them here."
@@ -1834,8 +1917,7 @@ class Browser(Capability):
                 if role not in {"checkbox", "switch", "menuitemcheckbox", "radio"} or not ref:
                     raise RuntimeError("no current checkbox or switch matching the target")
                 self._use(account_id, lambda page: page.set_checked(name, checked, ref=ref))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 change = _action_diff(before, after)
                 if "no observable change" in change:
                     change = "outcome: already satisfied"
@@ -1851,8 +1933,7 @@ class Browser(Capability):
                     self._use(account_id, lambda page: _click(page, name, role, ref=ref))
                 except Exception as exc:
                     return _action_failure(exc)
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"clicked {target}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_type":
                 target = str(arguments.get("target", ""))
@@ -1866,9 +1947,25 @@ class Browser(Capability):
                     self._use(account_id, lambda page: _type_text(page, name, text, role, ref=ref))
                 except Exception as exc:
                     return _action_failure(exc)
-                self._settle(account_id)
-                after = self._observe(account_id)
-                return f"typed into {target}\n{_action_diff(before, after)}\n{after}"
+                submitted = False
+                if _looks_like_search_field(role, name):
+                    try:
+                        self._use(account_id, lambda page: _press_key(page, "Enter"))
+                        submitted = True
+                    except Exception:
+                        submitted = False
+                after = self._after_action(account_id)
+                lead = f"typed into {target}"
+                if submitted:
+                    lead += " and submitted search"
+                change = _action_diff(before, after)
+                if submitted and "listings appeared" not in change and "url " not in change:
+                    if not _snapshot_lists_results(after):
+                        change = (
+                            f"{change} — if listings did not appear, "
+                            "click the search button or press Enter again"
+                        )
+                return f"{lead}\n{change}\n{after}"
             if tool_name == "browser_select":
                 target = str(arguments.get("target", ""))
                 value = str(arguments.get("value", ""))
@@ -1878,8 +1975,7 @@ class Browser(Capability):
                 except RuntimeError as exc:
                     return str(exc)
                 self._use(account_id, lambda page: _select_option(page, name, value, ref=ref))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"selected {value} in {target}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_scroll":
                 direction = str(arguments.get("direction", "down"))
@@ -1894,8 +1990,7 @@ class Browser(Capability):
                     if not ref:
                         raise RuntimeError("no current scroll container matching the target")
                 movement = self._use(account_id, lambda page: _scroll(page, direction, ref=ref))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 change = _action_diff(before, after)
                 if isinstance(movement, dict):
                     if movement.get("before") == movement.get("after"):
@@ -1907,8 +2002,7 @@ class Browser(Capability):
                 key = str(arguments.get("key", ""))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _press_key(page, key))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"pressed {key}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_hover":
                 target = str(arguments.get("target", ""))
@@ -1918,28 +2012,24 @@ class Browser(Capability):
                 except RuntimeError as exc:
                     return str(exc)
                 self._use(account_id, lambda page: _hover(page, name, role, ref=ref))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"hovered {target}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_type_focused":
                 text = str(arguments.get("text", ""))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _type_focused(page, text))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"typed into focused field\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_back":
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _go_back(page))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"went back\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_switch":
                 index = int(arguments.get("index", 0))
                 before = self._glance(account_id)
                 self._use(account_id, lambda page: _switch_page(page, index))
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"switched to page {index}\n{_action_diff(before, after)}\n{after}"
             if tool_name == "browser_type_password":
                 secret = str(arguments.get("text", ""))
@@ -1967,8 +2057,7 @@ class Browser(Capability):
                         self._use(account_id, lambda page: _click(page, name, role, ref=ref))
                     except Exception as click_exc:
                         return _action_failure(click_exc)
-                self._settle(account_id)
-                after = self._observe(account_id)
+                after = self._after_action(account_id)
                 return f"submitted\n{_action_diff(before, after)}\n{after}"
             if tool_name in {"browser_read", "browser_find"}:
                 cursor = arguments.get("cursor", 0)
@@ -2220,6 +2309,15 @@ class Browser(Capability):
     def _settle(self, account_id: str) -> None:
         self._use(account_id, lambda page: _settle(page))
 
+    def _after_action(self, account_id: str) -> str:
+        """Settle, then re-read once if the page is still painting."""
+        self._settle(account_id)
+        after = self._observe(account_id)
+        if _still_updating_line(after):
+            self._settle(account_id)
+            after = self._observe(account_id)
+        return after
+
     def _use(self, account_id: str, function: Any) -> Any:
         if self.desk is not None:
             return self.desk.run(account_id, function)
@@ -2462,7 +2560,7 @@ def _call_timeout(method: Any, timeout_ms: int, *args: Any) -> Any:
         return method(*args)
 
 
-def _click_locator(locator: Any) -> bool:
+def _click_locator(locator: Any) -> tuple[bool, str]:
     """Only report clicks that pass Playwright's normal actionability checks."""
     try:
         scroll = getattr(locator, "scroll_into_view_if_needed", None)
@@ -2477,10 +2575,42 @@ def _click_locator(locator: Any) -> bool:
         pass
     try:
         _call_timeout(locator.click, 5000)
-        return True
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _is_pointer_intercept(detail: str) -> bool:
+    lower = (detail or "").lower()
+    return "intercept" in lower or "subtree intercept" in lower
+
+
+def _is_overlay_result(text: str) -> bool:
+    lower = (text or "").lower()
+    return "intercepts pointer" in lower or ("covered by" in lower and "overlay" in lower)
+
+
+def _overlay_name(locator: Any) -> str:
+    evaluate = getattr(locator, "evaluate", None)
+    if not callable(evaluate):
+        return ""
+    try:
+        raw = evaluate(
+            """(node) => {
+              const r = node.getBoundingClientRect();
+              const el = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+              if (!el || el === node || node.contains(el)) return "";
+              const name = el.getAttribute("aria-label") || el.innerText || el.id
+                || el.className || el.tagName;
+              return String(name || "").replace(/\\s+/g, " ").trim().slice(0, 80);
+            }"""
+        )
     except Exception:
-        pass
-    return False
+        return ""
+    text = str(raw or "").strip()
+    if text in {"True", "true", "False", "false"}:
+        return ""
+    return text
 
 
 def _click_fragment(target: str) -> str:
@@ -2542,6 +2672,13 @@ _LOGIN_BLOCK = re.compile(
     r"are you a .{0,20} or a robot|px/captcha",
     re.IGNORECASE,
 )
+_CHALLENGE_WALL = re.compile(
+    r"verify you are human|are you a human or a robot|are you a robot|"
+    r"\bcaptcha\b|px/captcha|human verification|"
+    r"attention required|just a moment\.\.\.|checking your browser|"
+    r"cf-challenge|challenges\.cloudflare",
+    re.IGNORECASE,
+)
 
 
 def is_handoff_result(text: str) -> bool:
@@ -2557,21 +2694,8 @@ def handoff_prompt(snapshot: str) -> str:
 
 
 def _bot_wall_note(snapshot: str) -> str:
-    """Tell the model when the page is a bot/captcha wall, not a usable booking UI."""
-    sample = snapshot
-    if "\nContent:\n" in snapshot:
-        sample = snapshot.split("\nContent:\n", 1)[1]
-    sample = sample[:2500]
-    lowered = snapshot.lower()
-    if not _LOGIN_BLOCK.search(sample) and "captcha" not in lowered and "/captcha" not in lowered:
-        # Empty shell often means a blocked iframe (cookie/bot gate) with no usable content.
-        if "content:\n(empty)" in lowered and ("iframe" in lowered or "interactive:\n\n(none)" in lowered):
-            return (
-                "This page has no usable content for Robin's automated browser "
-                "(likely a bot, captcha, or cookie wall). Do not keep opening more of the same "
-                "kind of site. Tell the person the site blocked automation, or try web_search "
-                "for a rough price estimate, or ask which airline site to open."
-            )
+    """Tell the model when the page is a real captcha/challenge wall."""
+    if not _is_challenge_wall(snapshot):
         return ""
     return (
         "Bot/captcha wall — this site is blocking Robin's automated Chromium. "
@@ -2579,6 +2703,15 @@ def _bot_wall_note(snapshot: str) -> str:
         "Tell the person those aggregators often block automation; offer web_search for a rough "
         "estimate, or ask them to name an airline site, or to check prices in their own browser."
     )
+
+
+def _is_challenge_wall(snapshot: str) -> bool:
+    """True only for tight captcha/WAF challenge copy, not empty frames or generic errors."""
+    sample = snapshot
+    if "\nContent:\n" in snapshot:
+        sample = snapshot.split("\nContent:\n", 1)[1]
+    blob = f"{snapshot[:800]}\n{sample[:2500]}"
+    return bool(_CHALLENGE_WALL.search(blob))
 
 
 _SIGNED_IN_PATH = re.compile(r"/(?:browse|profiles?|kids|gateway)(?:/|$|\?)", re.IGNORECASE)
@@ -3007,7 +3140,54 @@ _PLACEHOLDER = REFERENCE
 
 
 _MAX_INTERACTIVE = 80
+_MAIN_LINK_RESERVE = 28
+_LISTING_ROLES = frozenset({"link", "listitem", "article", "row", "option", "treeitem"})
 _MAX_CONTENT = 3500
+_VOLATILE_CONTENT = re.compile(
+    r"(\b\d{1,2}:\d{2}(?::\d{2})?\b|^(advertisement|annonse)\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_main_listing(item: dict[str, Any]) -> bool:
+    role = str(item.get("role") or "")
+    region = str(item.get("region") or "page")
+    return role in _LISTING_ROLES and region in {"main", "page"}
+
+
+def _window_interactive(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reorder so the default 80-ref window keeps main-area listings visible."""
+    if not items:
+        return []
+    main_links = [item for item in items if _is_main_listing(item)]
+    others = [item for item in items if not _is_main_listing(item)]
+    main_links.sort(key=lambda item: int(item.get("order") or 0))
+    if len(items) <= _MAX_INTERACTIVE:
+        return list(items)
+    reserved = min(_MAIN_LINK_RESERVE, len(main_links))
+    head_others = others[: max(0, _MAX_INTERACTIVE - reserved)]
+    head_main = main_links[:reserved]
+    used = {id(item) for item in head_others + head_main}
+    tail = [item for item in others[len(head_others):] + main_links[reserved:] if id(item) not in used]
+    return head_others + head_main + tail
+
+
+def _stable_fingerprint(url: str, inputs: int, state: dict[str, Any]) -> str:
+    """Quiet-period fingerprint that ignores clocks, live regions, and ads."""
+    content_lines = [
+        line for line in str(state.get("content") or "").splitlines()
+        if line and not _VOLATILE_CONTENT.search(line)
+    ]
+    controls = []
+    for item in state.get("interactive") or []:
+        role = str(item.get("role") or "")
+        if role in {"timer", "marquee", "log", "status"}:
+            continue
+        name = str(item.get("name") or "")
+        if _VOLATILE_CONTENT.search(name):
+            continue
+        controls.append((role, name, item.get("states"), item.get("value")))
+    return json.dumps({"url": url, "inputs": inputs, "content": content_lines, "controls": controls}, sort_keys=True)
 _REF_LINE = re.compile(
     r'^\[(\d+)\]\s+(\w+)\s+"(.*)"(?:\s+\(([^)]*)\))?\s*$'
 )
@@ -3025,7 +3205,7 @@ _SNAPSHOT_JS = """() => {
   const INTERACTIVE = new Set([
     "link", "button", "textbox", "password", "searchbox", "combobox", "listbox", "option",
     "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
-    "slider", "spinbutton", "treeitem", "tabpanel", "menu", "menubar", "toolbar",
+    "slider", "spinbutton", "treeitem", "tabpanel", "menu", "menubar", "toolbar", "frame",
   ]);
   const SKIP_ROLE = new Set(["presentation", "none", "generic", "Inline", "paragraph", "text"]);
   const implicitRole = (node) => {
@@ -3057,6 +3237,7 @@ _SNAPSHOT_JS = """() => {
     if (tag === "aside") return "complementary";
     if (tag === "form") return "form";
     if (tag === "img") return "img";
+    if (tag === "iframe") return "frame";
     if (tag === "h1" || tag === "h2" || tag === "h3" || tag === "h4" || tag === "h5" || tag === "h6") return "heading";
     if (tag === "li") return "listitem";
     if (node.isContentEditable) return "textbox";
@@ -3151,6 +3332,14 @@ _SNAPSHOT_JS = """() => {
       if (/\\+?\\d[\\d\\s-]{6,}\\d/.test(text)) return true;
       return false;
     };
+    if (role === "frame" || String(node.tagName || "").toLowerCase() === "iframe") {
+      try {
+        const host = node.src ? new URL(node.src, location.href).hostname : "";
+        return cleanLabel(node.getAttribute("title") || node.getAttribute("aria-label") || host || "embedded frame");
+      } catch (err) {
+        return "embedded frame";
+      }
+    }
     const from = [
       node.getAttribute("aria-label"),
       labeledBy(node),
@@ -3197,6 +3386,13 @@ _SNAPSHOT_JS = """() => {
       if (node.selectedOptions && node.selectedOptions[0]) return cleanLabel(node.selectedOptions[0].text);
       return cleanLabel(node.value || "");
     }
+    if (role === "frame") {
+      try {
+        return node.src ? new URL(node.src, location.href).hostname : "";
+      } catch (err) {
+        return "";
+      }
+    }
     return "";
   };
   const passwordToggle = (node, role) => {
@@ -3242,12 +3438,14 @@ _SNAPSHOT_JS = """() => {
       group,
       viewport: node.getBoundingClientRect().top < window.innerHeight && node.getBoundingClientRect().bottom > 0,
       options: node.tagName === "SELECT" ? [...node.options].slice(0, 40).map(option => cleanLabel(option.text)) : [],
+      order: interactive.length,
     });
   };
   const walkTree = (root) => {
     if (!root) return;
     const visit = (node) => {
       if (!node || node.nodeType !== 1) return;
+      if (String(node.tagName || "").toLowerCase() === "iframe") return;
       const role = roleOf(node);
       if (role && !SKIP_ROLE.has(role)) add(node, role);
       else if (node.tabIndex >= 0) add(node, role || "button");
@@ -3272,93 +3470,227 @@ _SNAPSHOT_JS = """() => {
     const blob = id + " " + cls + " " + title;
     return /sp_message|cookie|consent|cmp|tcf|onetrust|gdpr/.test(blob);
   };
+  const isBlockingDialog = (node, results) => {
+    if (!node || !visible(node) || isCookieDialog(node)) return false;
+    const text = String(node.innerText || node.getAttribute("aria-label") || "").toLowerCase();
+    if (node.querySelector("input[type='password']")) return true;
+    if (/logg?\\s*inn|sign[\\s-]*in|passord|password|betaling|payment|checkout/.test(text)
+        && node.querySelector("input,button")) return true;
+    const modal = node.getAttribute("aria-modal") === "true"
+      || String(node.tagName || "").toLowerCase() === "dialog";
+    if (!modal) return false;
+    try {
+      const dr = node.getBoundingClientRect();
+      const area = Math.max(0, dr.width) * Math.max(0, dr.height);
+      if (area >= window.innerWidth * window.innerHeight * 0.35) return true;
+      if (results) {
+        const rr = results.getBoundingClientRect();
+        const overlapW = Math.max(0, Math.min(dr.right, rr.right) - Math.max(dr.left, rr.left));
+        const overlapH = Math.max(0, Math.min(dr.bottom, rr.bottom) - Math.max(dr.top, rr.top));
+        if (overlapW * overlapH > 0.5 * Math.max(1, rr.width * rr.height)) return true;
+      }
+    } catch (err) {}
+    return false;
+  };
+  const markUnreadFrame = (frame) => {
+    add(frame, "frame");
+    const last = interactive[interactive.length - 1];
+    if (last && last.role === "frame" && !last.states.includes("unread")) last.states.push("unread");
+  };
   const walkDocument = (doc) => {
     if (!doc) return;
     clearStamps(doc);
-    const dialog = [...doc.querySelectorAll('[role="dialog"], dialog[open], [aria-modal="true"]')]
-      .find((node) => !isCookieDialog(node));
-    if (dialog) walkTree(dialog);
+    const mainRoot = doc.querySelector("main, article, [role='main']") || doc.body;
+    const blocking = [...doc.querySelectorAll('[role="dialog"], dialog[open], [aria-modal="true"]')]
+      .find((node) => isBlockingDialog(node, mainRoot));
+    if (blocking) walkTree(blocking);
     walkTree(doc);
     for (const frame of doc.querySelectorAll("iframe")) {
       try {
         const child = frame.contentDocument;
         if (child) walkDocument(child);
-      } catch (err) {}
+        else markUnreadFrame(frame);
+      } catch (err) {
+        markUnreadFrame(frame);
+      }
     }
   };
   walkDocument(document);
-  const contentDialog = [...document.querySelectorAll('[role="dialog"], dialog[open], [aria-modal="true"]')]
-    .find((node) => !isCookieDialog(node));
-  const contentRoot = contentDialog
-    || document.querySelector("main, article, [role='main']")
+  const mainRoot = document.querySelector("main, article, [role='main']") || document.body;
+  const pageDialogs = [...document.querySelectorAll('[role="dialog"], dialog[open], [aria-modal="true"]')]
+    .filter((node) => !isCookieDialog(node) && visible(node));
+  const blockingDialog = pageDialogs.find((node) => isBlockingDialog(node, mainRoot));
+  const contentRoot = blockingDialog
+    || mainRoot
     || document.body
     || document.documentElement;
+  const dismissibleDialogs = pageDialogs
+    .filter((node) => node !== blockingDialog)
+    .map((node) => ({
+      name: cleanLabel(node.getAttribute("aria-label") || node.getAttribute("title")
+        || (node.querySelector("h1,h2,h3,[role='heading']") || {}).textContent || "dialog"),
+      ref: node.getAttribute("data-robin-ref") || "",
+    }))
+    .filter((row) => row.name);
   const vh = window.innerHeight || 800;
   const contentLines = [];
   const contentSeen = new Set();
+  const listings = [];
   let moreBelow = false;
-  const contentPriority = node => {
-    if (node.matches("h1,h2,h3,h4,h5,h6,[role='heading'],[role='status'],[aria-live],output")) return 3;
-    if (node.childElementCount === 0 && /^\\d[\\d\\s.,]*\\s+(treff|results?|matches?|annonser|ads)\\b/i.test(node.textContent || "")) return 3;
-    if (node.matches("p,pre,blockquote")) return 2;
-    return 1;
-  };
-  const blocks = contentRoot
-    ? [...contentRoot.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading'],[role='status'],[aria-live],output,p,li,td,th,pre,blockquote,label,dt,dd,div,span")]
-        .sort((a, b) => contentPriority(b) - contentPriority(a))
-    : [];
-  for (const node of blocks) {
-    if (["DIV", "SPAN"].includes(node.tagName)
-        && (node.childElementCount > 0 || node.closest("label,button,a,nav"))) continue;
-    if (!visible(node)) continue;
-    let rect;
-    try {
-      rect = node.getBoundingClientRect();
-    } catch (err) {
-      continue;
-    }
-    if (rect.bottom < 0) continue;
-    if (rect.top > vh) {
-      moreBelow = true;
-      continue;
-    }
-    let text = cleanLabel(node.innerText || node.textContent || "");
-    if (!text || text.length < 2) continue;
+  const pushContent = (text, headingLevel) => {
+    const line = headingLevel ? "#".repeat(headingLevel) + " " + text.slice(0, 200) : text.slice(0, 240);
     const key = text.toLowerCase();
-    if (contentSeen.has(key)) continue;
+    if (!text || text.length < 2 || contentSeen.has(key)) return false;
     contentSeen.add(key);
+    contentLines.push(line);
+    return true;
+  };
+  const headingLevelOf = (node) => {
     const tag = String(node.tagName || "").toLowerCase();
     let level = 0;
     if (tag.length === 2 && tag[0] === "h") level = Number(tag[1]) || 0;
     const ariaLevel = Number(node.getAttribute("aria-level") || 0);
     if (ariaLevel >= 1 && ariaLevel <= 6) level = ariaLevel;
     if (roleOf(node) === "heading" && !level) level = 2;
-    if (level >= 1 && level <= 6) {
-      contentLines.push("#".repeat(level) + " " + text.slice(0, 200));
-    } else {
-      contentLines.push(text.slice(0, 240));
+    return level >= 1 && level <= 6 ? level : 0;
+  };
+  const inViewport = (node) => {
+    try {
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom < 0) return false;
+      if (rect.top > vh) {
+        moreBelow = true;
+        return false;
+      }
+      return true;
+    } catch (err) {
+      return false;
     }
-    if (contentLines.length >= 60) {
-      moreBelow = true;
-      break;
+  };
+  const headingBlocks = contentRoot
+    ? [...contentRoot.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading'],[role='status'],output")]
+    : [];
+  for (const node of headingBlocks) {
+    if (!visible(node) || !inViewport(node)) continue;
+    const text = cleanLabel(node.innerText || node.textContent || "");
+    pushContent(text, headingLevelOf(node));
+  }
+  const cleanLine = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+  const LISTING_CHROME = /^(pil til (venstre|høyre)|bilde \\d+ av \\d+|scale|sammenlign( biler)?|legg til som favoritt|gå til annonsen|betalt plassering|nyhet!?|annonse|kryss|previous|next|1 of \\d+|favorite|favoritt)$/i;
+  const isFilterChrome = (node) => {
+    try {
+      if (node.closest("nav, header, aside, [role='navigation'], [role='banner'], [role='complementary'], [aria-labelledby*='filter' i], [class*='filter-list']")) {
+        return true;
+      }
+      const host = node.closest("ul, ol, [role='list']");
+      if (host && host.querySelector("input[type='checkbox'], input[type='radio']") && !host.querySelector("article, [role='article']")) {
+        return true;
+      }
+      return false;
+    } catch (err) {
+      return false;
+    }
+  };
+  const looksLikeListing = (node, text) => {
+    const tag = String(node.tagName || "").toLowerCase();
+    const role = roleOf(node);
+    if ((tag === "article" || role === "article" || role === "row") && String(text || "").length >= 8) return true;
+    if (/\\d[\\d\\s.,]*\\s*(kr|nok|€|\\$|£)/i.test(text)) return true;
+    if (/\\bkr\\b/i.test(text) && /\\d{2,}/.test(text)) return true;
+    if (/\\b20\\d\\d\\b/.test(text) && /\\bkm\\b/i.test(text)) return true;
+    return false;
+  };
+  const composeListing = (node) => {
+    const headingNode = node.querySelector("h1,h2,h3,h4,[class*='heading']");
+    const heading = cleanLine((headingNode && (headingNode.innerText || headingNode.textContent)) || "");
+    const lines = String(node.innerText || node.textContent || "")
+      .split("\\n")
+      .map(cleanLine)
+      .filter((line) => line && line.length < 200 && !LISTING_CHROME.test(line));
+    let price = "";
+    for (let i = 0; i < lines.length; i++) {
+      const direct = lines[i].match(/(\\d[\\d\\s.,]*)\\s*(kr|nok|€|\\$|£)/i);
+      if (direct) { price = direct[0]; break; }
+      if (/^(kr|nok|€|\\$|£)$/i.test(lines[i]) && i && /^\\d[\\d\\s.,]{2,}$/.test(lines[i - 1])) {
+        price = lines[i - 1] + " " + lines[i];
+        break;
+      }
+    }
+    const meta = lines.find((line) => /20\\d\\d/.test(line) && /km/i.test(line)) || "";
+    const subtitle = lines.find((line) => (
+      line !== heading && line !== price && line !== meta
+      && line.length >= 4 && line.length <= 80
+    )) || "";
+    const parts = [];
+    const seenParts = new Set();
+    for (const part of [heading, price, meta, subtitle]) {
+      const key = part.toLowerCase();
+      if (!part || seenParts.has(key)) continue;
+      seenParts.add(key);
+      parts.push(part);
+    }
+    if (parts.length >= 2) return parts.join(" · ").slice(0, 220);
+    const useful = lines.filter((line) => !/sammenlign|favoritt|favorite|compare|skala|scale/i.test(line));
+    return useful.slice(0, 6).join(" · ").slice(0, 220);
+  };
+  const listingSelector = "article, [role='article'], [role='listitem'], [role='row'], tr, li, a[href]";
+  const taggedResults = document.querySelector("[class*='result-list'], [class*='search-result']");
+  const listingRoot = (taggedResults && !isFilterChrome(taggedResults)) ? taggedResults : contentRoot;
+  let resultCount = "";
+  const countBlob = ((contentRoot || listingRoot || document.body).innerText || "");
+  const countMatch = countBlob.match(/(\\d[\\d\\s]*)\\s*(treff|resultater|results|matches|annonser)/i);
+  if (countMatch) resultCount = countMatch[0].replace(/\\s+/g, " ").trim();
+  if (resultCount) pushContent(resultCount, 0);
+  if (listingRoot && listingRoot.querySelectorAll) {
+    for (const node of listingRoot.querySelectorAll(listingSelector)) {
+      if (!visible(node)) continue;
+      if (isFilterChrome(node)) continue;
+      if (node.closest("nav, header, [role='navigation'], [role='banner']")) continue;
+      const parentListing = node.parentElement && node.parentElement.closest
+        ? node.parentElement.closest(listingSelector) : null;
+      if (parentListing && parentListing !== listingRoot) continue;
+      const rawText = String(node.innerText || node.textContent || "");
+      const text = composeListing(node);
+      if (!text || text.length < 2) continue;
+      if (!looksLikeListing(node, text) && !looksLikeListing(node, rawText)) continue;
+      const key = text.toLowerCase();
+      if (listings.some(row => row.text.toLowerCase() === key)) continue;
+      if (discovery.query && (text.toLowerCase().includes(discovery.query.toLowerCase())
+          || rawText.toLowerCase().includes(discovery.query.toLowerCase()))) {
+        const listingRole = roleOf(node) || (String(node.tagName || "").toLowerCase() === "a" ? "link" : "listitem");
+        add(node, listingRole);
+      }
+      let ref = node.getAttribute("data-robin-ref") || "";
+      if (!ref) {
+        const near = node.querySelector("[data-robin-ref]") || node.closest("[data-robin-ref]");
+        if (near) ref = near.getAttribute("data-robin-ref") || "";
+      }
+      listings.push({text, ref, region: regionOf(node)});
+      pushContent(text, 0);
+      if (listings.length >= 24) {
+        moreBelow = true;
+        break;
+      }
     }
   }
-  if (contentLines.length < 3 && contentRoot && contentRoot.innerText) {
+  if (!listings.length && contentRoot && contentRoot.innerText) {
     for (const raw of String(contentRoot.innerText).split("\\n")) {
-      const text = cleanLabel(raw);
-      if (!text || text.length < 2) continue;
-      const key = text.toLowerCase();
-      if (contentSeen.has(key)) continue;
-      contentSeen.add(key);
-      contentLines.push(text.slice(0, 240));
+      const text = cleanLine(raw);
+      if (LISTING_CHROME.test(text)) continue;
+      if (!pushContent(text, 0)) continue;
       if (contentLines.length >= 60) {
         moreBelow = true;
         break;
       }
     }
   }
-  if (!moreBelow) {
-    for (const node of blocks) {
+  for (const item of interactive) {
+    if (item.role === "frame" && (item.states || []).includes("unread")) {
+      pushContent("embedded frame from " + (item.value || item.name) + " — text not readable", 0);
+    }
+  }
+  if (!moreBelow && listingRoot && listingRoot.querySelectorAll) {
+    for (const node of listingRoot.querySelectorAll(listingSelector)) {
       try {
         if (visible(node) && node.getBoundingClientRect().top > vh) {
           moreBelow = true;
@@ -3383,7 +3715,7 @@ _SNAPSHOT_JS = """() => {
     interactive: interactive.sort((a, b) => {
       const score = item => (item.region === "dialog" ? 100 : 0)
         + (["textbox", "searchbox", "spinbutton", "checkbox", "radio", "switch", "combobox", "listbox"].includes(item.role) ? 50 : 0)
-        + (item.viewport ? 20 : 0) + (/filter|sort|søk|search|alle biler/i.test(item.name) ? 30 : 0);
+        + (item.viewport ? 20 : 0) + (/filter|sort|søk|search/i.test(item.name) ? 30 : 0);
       return score(b) - score(a);
     }),
     discoveryLimited: interactive.length >= 2000,
@@ -3391,8 +3723,143 @@ _SNAPSHOT_JS = """() => {
     content,
     moreBelow,
     secrets,
+    listings,
+    resultCount,
+    dismissibleDialogs,
   };
 }"""
+
+
+_PRICE_IN_TEXT = re.compile(
+    r"(?P<amount>\d(?:[\d\s.,]{0,12}\d)?)\s*(?P<currency>kr|nok|€|\$|£)",
+    re.IGNORECASE,
+)
+
+
+def _parse_listing_price(text: str) -> tuple[int, str] | None:
+    match = _PRICE_IN_TEXT.search(text or "")
+    if match is None:
+        return None
+    digits = re.sub(r"[^\d]", "", match.group("amount"))
+    if not digits:
+        return None
+    amount = int(digits)
+    if amount < 10:
+        return None
+    return amount, match.group("currency")
+
+
+def _format_amount(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ")
+
+
+def _price_range_line(listings: list[dict[str, Any]]) -> str:
+    parsed: list[tuple[int, str]] = []
+    for row in listings:
+        found = _parse_listing_price(str(row.get("text") or ""))
+        if found:
+            parsed.append(found)
+    if not parsed:
+        return ""
+    prices = [amount for amount, _currency in parsed]
+    currency = parsed[0][1]
+    if any(amount >= 50_000 for amount in prices) and any(amount < 20_000 for amount in prices):
+        prices = [amount for amount in prices if amount >= 20_000] or prices
+    low, high = min(prices), max(prices)
+    count = len(prices)
+    if low == high:
+        noun = "listing" if count == 1 else "listings"
+        return f"Price range: {_format_amount(low)} {currency} from {count} {noun}"
+    return (
+        f"Price range: {_format_amount(low)}–{_format_amount(high)} {currency} "
+        f"from {count} listings"
+    )
+
+
+_SEARCH_FIELD = re.compile(r"\b(search|søk|find|query|søkefelt)\b", re.IGNORECASE)
+
+
+def _looks_like_search_field(role: str, name: str) -> bool:
+    role = (role or "").lower()
+    if role == "searchbox":
+        return True
+    if role in {"textbox", "combobox"} and _SEARCH_FIELD.search(name or ""):
+        return True
+    return False
+
+
+def _still_updating_line(snapshot: str) -> bool:
+    for line in (snapshot or "").splitlines()[:12]:
+        if line.strip() == "Still updating":
+            return True
+    return False
+
+
+def _snapshot_lists_results(snapshot: str) -> bool:
+    text = snapshot or ""
+    if re.search(r"^Page: results\b", text, re.MULTILINE):
+        return True
+    if re.search(r"^Price range:", text, re.MULTILINE):
+        return True
+    return bool(re.search(r"^Listings:", text, re.MULTILINE))
+
+
+def _page_kind_line(
+    interactive: list[dict[str, Any]],
+    listings: list[dict[str, Any]],
+    range_line: str,
+) -> str:
+    if listings or range_line:
+        return (
+            "Page: results — listings are on this page. Report prices and the range. "
+            "Apply only filters the person asked for, then confirm the listing list or count changed."
+        )
+    search_fields = [
+        item for item in interactive
+        if _looks_like_search_field(str(item.get("role") or ""), str(item.get("name") or ""))
+    ]
+    typed = any(str(item.get("value") or "").strip() for item in search_fields)
+    if search_fields and typed:
+        return (
+            "Page: search — the query is typed. Submit with Enter or the search button. "
+            "This is not a result list yet."
+        )
+    if search_fields:
+        return (
+            "Page: home — type the person's query in the search box and submit "
+            "(Enter or the search button). Filter checkboxes are not listings."
+        )
+    checkboxes = [
+        item for item in interactive
+        if str(item.get("role") or "") in {"checkbox", "radio", "switch"}
+    ]
+    if len(checkboxes) >= 6:
+        return (
+            "Page: filters — these checkboxes are not listings. "
+            "Set the requested filter, apply it if there is an Apply button, then read the result list."
+        )
+    return ""
+
+
+def _results_fingerprint(snapshot: str) -> str:
+    lines: list[str] = []
+    for line in (snapshot or "").splitlines():
+        if line.startswith(("Results:", "Price range:", "Listings:")):
+            lines.append(line)
+        elif line.startswith("- ") and re.search(r"\b\d[\d\s.]*\s*(kr|nok|€|\$|£)\b", line, re.I):
+            lines.append(line)
+    return "\n".join(lines[:16])
+
+
+def _snapshot_listings(data: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in data.get("listings") or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            rows.append(item)
+    return rows
 
 
 def _format_snapshot(data: dict[str, Any]) -> str:
@@ -3400,9 +3867,13 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     title = str(data.get("title") or "").strip()
     pages = list(data.get("pages") or [])
     downloads = [str(item) for item in (data.get("downloads") or []) if str(item).strip()]
-    interactive = list(data.get("interactive") or [])[:_MAX_INTERACTIVE]
+    windowed = _window_interactive(list(data.get("interactive") or []))
+    interactive = windowed[:_MAX_INTERACTIVE]
     content, truncated = _content_lines(str(data.get("content") or ""))
     more_below = bool(data.get("more_below") or data.get("moreBelow") or truncated)
+    listings = _snapshot_listings(data)
+    result_count = str(data.get("result_count") or data.get("resultCount") or "").strip()
+    range_line = _price_range_line(listings)
     if len(content) > _MAX_CONTENT:
         kept: list[str] = []
         for line in content.splitlines():
@@ -3416,6 +3887,33 @@ def _format_snapshot(data: dict[str, Any]) -> str:
         lines.append(f"Title: {title}")
     if isinstance(data.get("scroll"), (int, float)):
         lines.append(f"Scroll position: {data['scroll']}")
+    if data.get("still_updating"):
+        lines.append("Still updating")
+    if result_count:
+        lines.append(f"Results: {result_count}")
+    elif listings:
+        lines.append(f"Results: {len(listings)} listings")
+    if range_line:
+        lines.append(range_line)
+    kind = _page_kind_line(list(data.get("interactive") or []), listings, range_line)
+    if kind:
+        lines.append(kind)
+    if listings:
+        lines.append("Listings:")
+        for row in listings[:24]:
+            text = str(row.get("text") or "").strip()
+            ref = str(row.get("ref") or "").strip()
+            prefix = f"[{ref}] " if ref else ""
+            lines.append(f"- {prefix}{text}")
+    dialogs = list(data.get("dismissible_dialogs") or data.get("dismissibleDialogs") or [])
+    if dialogs:
+        names = ", ".join(
+            str(item.get("name") or "dialog") for item in dialogs[:3] if isinstance(item, dict)
+        )
+        if names:
+            lines.append(
+                f"Dismissible dialog: {names} — dismiss if it hides results; Content is from main."
+            )
     if len(pages) > 1 or downloads:
         lines.append("")
         lines.append("Pages:")
@@ -3476,7 +3974,7 @@ def _format_snapshot(data: dict[str, Any]) -> str:
             lines.append(row)
             control_chars += len(row) + 1
             emitted += 1
-        total = int(data.get("total_controls") or len(interactive))
+        total = int(data.get("total_controls") or len(windowed))
         cursor = int(data.get("cursor") or 0)
         if cursor + emitted < total:
             lines.append(f"Controls omitted: {total - cursor - emitted}. browser_read cursor={cursor + emitted} or browser_find.")
@@ -3587,6 +4085,22 @@ def _action_diff(before: dict[str, Any] | str, snapshot: str) -> str:
         bits.append("download started")
     if " (dialog" in snapshot and " (dialog" not in str(before.get("snapshot") or ""):
         bits.append("dialog open")
+    before_scroll = _snapshot_scroll(str(before.get("snapshot") or ""))
+    after_scroll = _snapshot_scroll(snapshot)
+    if before_scroll is not None and after_scroll is not None and before_scroll != after_scroll:
+        bits.append(f"scroll position {after_scroll}")
+    if "\nStill updating" in snapshot or snapshot.startswith("Still updating"):
+        bits.append("still updating")
+    previous_snapshot = before.get("snapshot") if isinstance(before.get("snapshot"), str) else ""
+    before_results = _results_fingerprint(str(previous_snapshot or ""))
+    after_results = _results_fingerprint(snapshot)
+    if before_results != after_results:
+        if after_results and not before_results:
+            bits.append("listings appeared")
+        elif after_results:
+            bits.append("listings changed")
+        elif before_results:
+            bits.append("listings cleared")
     if not bits:
         previous = before.get("snapshot")
         if isinstance(previous, str):
@@ -3619,6 +4133,16 @@ def _action_diff(before: dict[str, Any] | str, snapshot: str) -> str:
         else:
             bits.append("change not verified (no previous observation)")
     return "changed: " + ", ".join(bits)
+
+
+def _snapshot_scroll(text: str) -> int | None:
+    for line in str(text or "").splitlines():
+        if line.startswith("Scroll position:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
 
 
 def _count_pages(snapshot: str) -> int:

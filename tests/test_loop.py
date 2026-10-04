@@ -319,6 +319,330 @@ def test_dependent_browser_batch_waits_for_next_observation_turn() -> None:
                for message in model.seen[-1][0])
 
 
+def test_type_then_enter_runs_in_one_batch() -> None:
+    from robin.capabilities.browser import Browser
+
+    class Page:
+        def __init__(self) -> None:
+            self.typed: list[tuple[str, str]] = []
+            self.keys: list[str] = []
+
+        def location(self) -> str:
+            return "https://vy.test/"
+
+        def read(self):
+            return (
+                'URL: https://vy.test/\n\nInteractive:\n'
+                '[4] searchbox "To"\n\nContent:\nSearch departures',
+                "",
+            )
+
+        def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
+            self.typed.append((target, text))
+
+        def press_key(self, key: str) -> None:
+            self.keys.append(key)
+
+    page = Page()
+    browser = Browser("ada", page)
+    browser._refs["ada"] = {"4": ("searchbox", "To")}
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (
+            ToolCall("browser_type", {"target": "4", "text": "Oslo S"}, id="type"),
+            ToolCall("browser_press", {"key": "Enter"}, id="enter"),
+        )),
+        ModelTurn("Searching Oslo S."),
+    ])
+    converse(assistant, Task("ada", "t", "next train to Oslo S"), model)
+    assert page.typed == [("To", "Oslo S")]
+    assert page.keys[0] == "Enter"
+    assert "Enter" in page.keys
+
+
+def test_scroll_position_change_is_progress() -> None:
+    from robin.capabilities.browser import Browser
+
+    class Page:
+        def __init__(self) -> None:
+            self.y = 0
+            self.scrolls = 0
+
+        def location(self) -> str:
+            return "https://vy.test/"
+
+        def read(self):
+            return (
+                f"URL: https://vy.test/\nScroll position: {self.y}\n\nInteractive:\n"
+                '[1] checkbox "Filter"\n\nContent:\nOslo S 14:32',
+                "",
+            )
+
+        def scroll(self, direction: str, ref: str = "") -> dict:
+            self.scrolls += 1
+            before = self.y
+            self.y += 800
+            return {"before": before, "after": self.y, "maximum": 8000}
+
+    page = Page()
+    browser = Browser("ada", page)
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (ToolCall("browser_scroll", {"direction": "down"}),)),
+        ModelTurn("", (ToolCall("browser_scroll", {"direction": "down"}),)),
+        ModelTurn("", (ToolCall("browser_scroll", {"direction": "down"}),)),
+        ModelTurn("14:32 from Oslo S."),
+    ])
+    converse(assistant, Task("ada", "t", "train times"), model)
+    assert page.scrolls == 3
+
+
+def test_give_up_on_homepage_is_nudged_to_use_site_search() -> None:
+    from robin.capabilities.browser import Browser
+
+    snapshot = (
+        "URL: https://market.test/\n"
+        "Page: home — type the person's query in the search box and submit "
+        "(Enter or the search button). Filter checkboxes are not listings.\n\n"
+        "Interactive:\n[1] searchbox \"Search\" (page)\n[2] checkbox \"Brand\" (page)\n\n"
+        "Content:\nWelcome"
+    )
+
+    class Page:
+        def location(self) -> str:
+            return "https://market.test/"
+
+        def read(self, *, query: str = "", cursor: int = 0, region: str = ""):
+            return snapshot, ""
+
+        def type_text(self, target: str, text: str, role: str = "", ref: str = "") -> None:
+            return None
+
+        def press_key(self, key: str) -> None:
+            return None
+
+    browser = Browser("ada", Page())
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (ToolCall("browser_read", {}),)),
+        ModelTurn("I couldn’t find specific listings on the site."),
+        ModelTurn("", (ToolCall("browser_type", {"target": "1", "text": "Model Y Performance"}),)),
+        ModelTurn("I will read the results after search."),
+    ])
+    reply = converse(
+        assistant,
+        Task("ada", "t", "Find Model Y Performance listings and a price range"),
+        model,
+        max_steps=8,
+    )
+    nudge = "\n".join(
+        str(message.get("content") or "")
+        for messages, _ in model.seen
+        for message in messages
+        if message.get("role") == "user"
+    )
+    assert "not a result list yet" in nudge
+    assert "search box" in nudge
+    assert "couldn’t find" not in reply.text.lower() or "I will read" in reply.text
+
+
+def test_set_checked_then_apply_click_runs_in_one_batch() -> None:
+    from robin.capabilities.browser import Browser
+
+    class Page:
+        def __init__(self) -> None:
+            self.checked: list[tuple[str, bool]] = []
+            self.clicked: list[str] = []
+
+        def location(self) -> str:
+            return "https://market.test/search"
+
+        def read(self, *, query: str = "", cursor: int = 0, region: str = ""):
+            return (
+                "URL: https://market.test/search\n"
+                "Page: results — listings are on this page.\n\n"
+                "Interactive:\n"
+                '[2] checkbox "Electric" (page)\n'
+                '[3] button "Apply" (page)\n\n'
+                "Content:\nlistings",
+                "",
+            )
+
+        def set_checked(self, target: str, checked: bool, ref: str = "") -> None:
+            self.checked.append((target, checked))
+
+        def click(self, target: str, role: str = "", ref: str = "") -> None:
+            self.clicked.append(target)
+
+    page = Page()
+    browser = Browser("ada", page)
+    browser._refs["ada"] = {"2": ("checkbox", "Electric"), "3": ("button", "Apply")}
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (
+            ToolCall("browser_set_checked", {"target": "2", "checked": True}, id="check"),
+            ToolCall("browser_click", {"target": "3"}, id="apply"),
+        )),
+        ModelTurn("Filter applied."),
+    ])
+    converse(assistant, Task("ada", "t", "Filter to electric"), model)
+    assert page.checked == [("Electric", True)]
+    assert page.clicked == ["Apply"]
+
+
+def test_give_up_is_nudged_when_snapshot_already_has_listing_prices() -> None:
+    from robin.capabilities.browser import Browser
+
+    snapshot = (
+        "URL: https://market.test/search?q=model+y\n"
+        "Results: 224 matches\n"
+        "Price range: 324 532–429 000 kr from 3 listings\n"
+        "Listings:\n"
+        "- Model Y · Performance AWD · 2022 · 328 532 kr\n"
+        "- Model Y · Performance AWD · 2023 · 324 532 kr\n"
+        "- Model Y · Performance · 2024 · 429 000 kr\n\n"
+        "Interactive:\n[1] checkbox \"Brand\" (page)\n\n"
+        "Content:\nModel Y · Performance AWD · 328 532 kr"
+    )
+
+    class Page:
+        def location(self) -> str:
+            return "https://market.test/search?q=model+y"
+
+        def read(self, *, query: str = "", cursor: int = 0, region: str = ""):
+            return snapshot, ""
+
+        def open(self, url: str) -> None:
+            return None
+
+    page = Page()
+    browser = Browser("ada", page)
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (ToolCall("browser_read", {}),)),
+        ModelTurn(
+            "I couldn’t find specific listings for a 2022 Model Y Performance on the site. "
+            "However, it might help to look at similar models or websites to gauge the price."
+        ),
+        ModelTurn(
+            "Listings are on the page. Prices run from 324 532 kr to 429 000 kr "
+            "(examples: 328 532 kr, 324 532 kr, 429 000 kr)."
+        ),
+    ])
+    reply = converse(
+        assistant,
+        Task("ada", "t", "Find Model Y Performance listings and a price range"),
+        model,
+        max_steps=6,
+    )
+    assert "324 532" in reply.text and "429 000" in reply.text
+    assert "couldn’t find" not in reply.text.lower() and "couldn't find" not in reply.text.lower()
+    nudge = "\n".join(
+        str(message.get("content") or "")
+        for messages, _ in model.seen
+        for message in messages
+        if message.get("role") == "user"
+    )
+    assert "already lists matching ads with prices" in nudge
+    assert "2022" not in nudge or "did not ask" in nudge
+
+
+def test_blocked_repeat_returns_listing_text_instead_of_ending() -> None:
+    from robin.capabilities.browser import Browser
+
+    class Page:
+        def __init__(self) -> None:
+            self.scrolls = 0
+
+        def location(self) -> str:
+            return "https://shop.test/"
+
+        def read(self, *, query: str = "", cursor: int = 0, region: str = ""):
+            return (
+                "URL: https://shop.test/\n\nInteractive:\n"
+                '[1] link "Helmelk 1L" (main)\n\nContent:\nHelmelk 1L 18 kr',
+                "",
+            )
+
+        def scroll(self, direction: str, ref: str = "") -> dict:
+            self.scrolls += 1
+            return {"before": 0, "after": 0, "maximum": 0}
+
+    page = Page()
+    browser = Browser("ada", page)
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (ToolCall("browser_scroll", {"direction": "down"}),)),
+        ModelTurn("", (ToolCall("browser_scroll", {"direction": "down"}),)),
+        ModelTurn("", (ToolCall("browser_scroll", {"direction": "down"}),)),
+        ModelTurn("Helmelk is 18 kr."),
+    ])
+    reply = converse(assistant, Task("ada", "t", "milk price"), model, max_steps=6)
+    assert page.scrolls == 2
+    assert "18 kr" in reply.text or any(
+        "Helmelk" in str(message.get("content") or "")
+        for messages, _ in model.seen
+        for message in messages
+    )
+    assert "could not verify the requested filters" not in reply.text
+
+
+def test_overlay_click_is_not_a_dead_click() -> None:
+    from robin.capabilities.browser import Browser
+    from robin.loop import _is_overlay_miss, _note_repeated_failure
+
+    result = (
+        'control [22] is covered by overlay "Cookie" that intercepts pointer '
+        "— target [22] still current"
+    )
+    assert _is_overlay_miss(result)
+    repeats: dict[str, int] = {}
+    _, stuck = _note_repeated_failure(repeats, "browser_click", {"target": "22"}, result)
+    assert stuck is False
+    assert repeats == {}
+
+    class Page:
+        def __init__(self) -> None:
+            self.clicks = 0
+
+        def location(self) -> str:
+            return "https://shop.test/"
+
+        def read(self):
+            return (
+                'URL: https://shop.test/\n\nInteractive:\n'
+                '[22] button "Legg i handlekurv"\n\nContent:\nHelmelk',
+                "",
+            )
+
+        def click(self, target: str, role: str = "", ref: str = "") -> None:
+            self.clicks += 1
+            raise RuntimeError(
+                'control [22] is covered by overlay "Cookie" that intercepts pointer '
+                "— target [22] still current"
+            )
+
+    page = Page()
+    browser = Browser("ada", page)
+    browser._refs["ada"] = {"22": ("button", "Legg i handlekurv")}
+    assistant = Assistant(ner=StubNer())
+    assistant.add(browser)
+    model = Scripted([
+        ModelTurn("", (ToolCall("browser_click", {"target": "22"}),)),
+        ModelTurn("", (ToolCall("browser_click", {"target": "22"}),)),
+        ModelTurn("", (ToolCall("browser_click", {"target": "22"}),)),
+        ModelTurn("The cookie banner is covering the button."),
+    ])
+    converse(assistant, Task("ada", "t", "add milk"), model, max_steps=6)
+    assert page.clicks == 3
+
+
 def test_form_field_labels_stay_targetable_after_airlock() -> None:
     from robin.airlock import Entity, VocabularyTerm
     from robin.loop import _release_labels, _release_snapshot
@@ -544,6 +868,21 @@ def test_history_collapses_numbered_booking_menus(tmp_path) -> None:
         "t",
         "assistant",
         "Access to the LOT website has been blocked due to security policies, so I'm unable to retrieve flights.",
+    )
+    text = _history(
+        assistant,
+        Task("ada", "t", "USE LOT again", allow_cloud=True),
+        assistant.vaults.get("ada", "t"),
+        (),
+        assistant.ner,
+    )
+    assert "do not retry the same host" not in text
+    assert "security policies" in text
+    store.append_turn(
+        "ada",
+        "t",
+        "assistant",
+        "A captcha or security check is blocking the page. Open the live view.",
     )
     text = _history(
         assistant,

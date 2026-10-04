@@ -193,8 +193,11 @@ def test_delayed_same_length_results_and_busy_timeout(page):
     snapshot, _ = operator.read()
     assert "Applied 2027" in snapshot
     page.locator("p").evaluate("(node) => node.setAttribute('aria-busy','true')")
-    with pytest.raises(RuntimeError, match="still loading"):
-        operator.settle(timeout_ms=500)
+    status = operator.settle(timeout_ms=500)
+    assert status.get("still_updating") is True
+    snapshot, _ = operator.read()
+    assert "Still updating" in snapshot
+    assert "2027" in snapshot
 
 
 def test_ambiguous_controls_options_and_obstruction_do_not_choose_first(page):
@@ -211,7 +214,7 @@ def test_ambiguous_controls_options_and_obstruction_do_not_choose_first(page):
     snapshot, _ = operator.read()
     with pytest.raises(RuntimeError, match="missing or ambiguous"):
         operator.select_option("Sort", "Price", ref=ref(snapshot, "Sort"))
-    with pytest.raises(RuntimeError, match="could not be clicked"):
+    with pytest.raises(RuntimeError, match="intercepts pointer"):
         operator.click("Apply", ref=ref(snapshot, "Apply"))
     assert page.evaluate("window.clicked") is None
 
@@ -384,3 +387,213 @@ def test_recovery_resets_stagnation_only_after_observed_control_change(page):
     assert len(calls) == 3
     assert page.locator("input").is_checked()
     assert "not verified" in reply.text
+
+
+def test_search_submit_filter_apply_and_results_change(page):
+    page.set_content(
+        """
+        <main>
+          <form id="search-form">
+            <label>Search <input type="search" id="q"></label>
+            <button type="submit">Search</button>
+          </form>
+          <aside>
+            <h2>Filters</h2>
+            <ul class="filter-list">
+              <li><label>Electric<input type="checkbox" id="electric"></label></li>
+            </ul>
+            <button type="button" id="apply">Apply</button>
+          </aside>
+          <p id="count">0 matches</p>
+          <div id="results" class="result-list"></div>
+        </main>
+        <script>
+        const catalog = [
+          {title: "Model Y Performance", year: "2023", km: "84 500 km", price: "324 532", electric: true},
+          {title: "Model Y Performance", year: "2024", km: "57 000 km", price: "429 000", electric: true},
+          {title: "Model Y Performance", year: "2022", km: "90 000 km", price: "199 000", electric: false}
+        ];
+        function paint(rows) {
+          document.getElementById("count").textContent = rows.length + " matches";
+          document.getElementById("results").innerHTML = rows.map((row) => (
+            '<article style="display:block;width:400px;min-height:80px">'
+            + "<h2>" + row.title + "</h2>"
+            + "<div>" + row.year + " · " + row.km + "</div>"
+            + "<div><span>" + row.price + "</span> <span>kr</span></div>"
+            + "</article>"
+          )).join("");
+        }
+        function currentRows() {
+          const query = document.getElementById("q").value.toLowerCase();
+          let rows = catalog.filter((row) => row.title.toLowerCase().includes(query));
+          if (document.getElementById("electric").checked && window.applied) {
+            rows = rows.filter((row) => row.electric);
+          }
+          return rows;
+        }
+        document.getElementById("search-form").addEventListener("submit", (event) => {
+          event.preventDefault();
+          window.applied = false;
+          paint(currentRows());
+        });
+        document.getElementById("apply").addEventListener("click", () => {
+          window.applied = true;
+          paint(currentRows());
+        });
+        </script>
+        """
+    )
+    operator = PlaywrightPage(page)
+    assistant = Assistant(ner=ReadyNer())
+    assistant.add(Browser("ada", operator))
+    steps = [
+        ("browser_read", None, None, {}),
+        ("browser_type", "Search", "searchbox", {"text": "Model Y Performance"}),
+        ("browser_set_checked", "Electric", "checkbox", {"checked": True}),
+        ("browser_click", "Apply", "button", {}),
+    ]
+    seen = []
+
+    def target_ref(snapshot, label, role):
+        found = [
+            key for key, (item_role, name) in _parse_refs(snapshot).items()
+            if role == item_role and (name == label or name.endswith(label))
+        ]
+        assert len(found) == 1, (label, role, snapshot)
+        return found[0]
+
+    class Model:
+        def complete(self, *, messages, tools):
+            seen.append(messages[-1]["content"] if messages else "")
+            if steps:
+                name, label, role, arguments = steps.pop(0)
+                if label:
+                    arguments["target"] = target_ref(messages[-1]["content"], label, role)
+                return ModelTurn("", (ToolCall(name, arguments),))
+            result = messages[-1]["content"]
+            assert "Page: results" in result
+            assert "listings changed" in result or "324 532" in result
+            assert "324 532" in result and "429 000" in result
+            assert "199 000" not in result
+            return ModelTurn("Prices range from 324 532 kr to 429 000 kr.")
+
+    reply = converse(
+        assistant,
+        Task("ada", "nav", "Find Model Y Performance listings and a price range"),
+        Model(),
+    )
+    assert "324 532" in reply.text and "429 000" in reply.text
+    typed = next(content for content in seen if "typed into" in content)
+    assert "submitted search" in typed
+    assert "324 532" in typed
+    homepage = seen[1] if len(seen) > 1 else seen[0]
+    assert "Page: home" in homepage or "Search" in homepage
+
+
+def test_filter_sidebar_does_not_hide_listing_prices(page):
+    filters = "".join(
+        f'<li><label>Filter {i}<input type="checkbox"></label></li>' for i in range(80)
+    )
+    cards = []
+    samples = (
+        ("Model Y", "Performance AWD", "2022 ∙ 87 500 km ∙ El", "328 532"),
+        ("Model Y", "Performance AWD", "2023 ∙ 84 500 km ∙ El", "324 532"),
+        ("Model Y", "Performance AWD", "2024 ∙ 57 000 km ∙ El", "429 000"),
+    )
+    for index, (title, subtitle, meta, price) in enumerate(samples, start=1):
+        cards.append(
+            f'<article style="display:block;width:480px;min-height:160px">'
+            f'<a href="/item/{index}">Open listing</a>'
+            f"<div>Previous</div><div>Next</div>"
+            f"<div>1 of 30</div><div>Paid placement</div>"
+            f"<h2>{title}</h2><div>{subtitle}</div><div>{meta}</div>"
+            f"<div><span>{price}</span> <span>kr</span></div>"
+            f"</article>"
+        )
+    page.set_content(
+        '<main>'
+        '<section aria-labelledby="search-filters">'
+        '<h2 id="search-filters">Filters</h2>'
+        f'<ul class="filter-list">{filters}</ul>'
+        "</section>"
+        "<p>224 matches</p>"
+        f'<div class="result-list">{"".join(cards)}</div>'
+        "</main>"
+    )
+    snapshot, _ = PlaywrightPage(page).read()
+    head = snapshot.split("Interactive:", 1)[0]
+    assert "224" in snapshot
+    assert "Model Y" in head
+    assert "328 532 kr" in snapshot
+    assert "324 532 kr" in snapshot
+    assert "429 000 kr" in snapshot
+    assert "Price range:" in head
+    assert "324 532" in head.split("Price range:", 1)[1]
+    assert "429 000" in head.split("Price range:", 1)[1]
+    assert snapshot.index("Model Y") < snapshot.index("Interactive:")
+    content = snapshot.split("Content:", 1)[1]
+    assert "Model Y" in content
+    assert "Filter 0" not in content.split("Model Y", 1)[0] or "328 532" in snapshot
+
+
+def test_listing_cards_appear_as_content_lines(page):
+    page.set_content(
+        '<main><h1>Dairy</h1>'
+        '<a href="/milk"><div><span>Helmelk 1L</span><span>18 kr</span></div></a>'
+        '<a href="/bread"><div><span>Kneipp</span><span>22 kr</span></div></a>'
+        '</main>'
+    )
+    snapshot, _ = PlaywrightPage(page).read()
+    content = snapshot.split("Content:", 1)[1]
+    assert "Helmelk 1L" in content and "18 kr" in content
+    assert "Kneipp" in content
+
+
+def test_cross_origin_frame_emits_unread_control(page):
+    page.set_content(
+        '<main><h1>Times</h1>'
+        '<iframe title="Timetable" src="https://widget.entur.example/"></iframe>'
+        '</main>'
+    )
+    snapshot, _ = PlaywrightPage(page).read()
+    assert 'frame "Timetable"' in snapshot or 'frame "widget.entur.example"' in snapshot
+    assert "unread" in snapshot
+    assert "text not readable" in snapshot
+    from robin.capabilities.browser import _bot_wall_note
+    assert _bot_wall_note(snapshot) == ""
+
+
+def test_filter_budget_keeps_main_listing_links(page):
+    filters = "".join(f'<label>Filter {i}<input type="checkbox"></label>' for i in range(90))
+    products = "".join(f'<a href="/p{i}">Helmelk {i}L 18 kr</a><br>' for i in range(12))
+    page.set_content(f'<aside>{filters}</aside><main><h1>Shop</h1>{products}</main>')
+    snapshot, _ = PlaywrightPage(page).read()
+    assert "Helmelk 1L" in snapshot
+    assert '[1]' in snapshot
+
+
+def test_non_blocking_dialog_keeps_main_content(page):
+    page.set_content(
+        '<main><h1>Shop</h1><a href="/milk"><div>Helmelk 1L 18 kr</div></a></main>'
+        '<div role="dialog" aria-label="Get the app" style="position:fixed;right:8px;bottom:8px;'
+        'width:160px;height:80px;background:white">'
+        '<p>Get the app</p><button>Close</button></div>'
+    )
+    snapshot, _ = PlaywrightPage(page).read()
+    assert "Helmelk 1L" in snapshot.split("Content:", 1)[1]
+    assert "Dismissible dialog" in snapshot or "Get the app" in snapshot
+
+
+def test_overlay_click_reports_blocker_and_keeps_ref(page):
+    page.set_content(
+        '<button id="buy">Legg i handlekurv</button>'
+        '<div id="wall" style="position:fixed;inset:0;z-index:10;background:white">Cookie</div>'
+    )
+    operator = PlaywrightPage(page)
+    snapshot, _ = operator.read()
+    target = ref(snapshot, "Legg i handlekurv")
+    with pytest.raises(RuntimeError, match="intercepts pointer") as raised:
+        operator.click("Legg i handlekurv", ref=target)
+    assert f"[{target}]" in str(raised.value)
+    assert "still current" in str(raised.value)
+    assert page.evaluate("window.clicked") is None
